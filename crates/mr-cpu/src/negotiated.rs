@@ -181,17 +181,39 @@ impl PadSet {
 #[derive(Debug, Default, Clone)]
 pub struct NegotiatedRouter {
     via_model: Option<ViaModel>,
+    /// Planar Chebyshev clearance radius (in cells) reserved around committed
+    /// copper during legalization to keep *other* nets away — a net's committed
+    /// track owns not just its path cells but a halo of this radius on each cell's
+    /// own layer, so foreign nets must stay at least this far from it (minimum
+    /// spacing). `0` = disabled, i.e. today's behaviour (only the path cells are
+    /// owned). The halo never overwrites a cell already owned by another group and
+    /// never claims a base-obstacle cell, so it cannot wall a foreign net off from
+    /// its own pad.
+    clearance_cells: u32,
 }
 
 impl NegotiatedRouter {
     pub fn new() -> Self {
-        Self { via_model: None }
+        Self {
+            via_model: None,
+            clearance_cells: 0,
+        }
     }
 
     /// Use an explicit [`ViaModel`] (e.g. a blind/buried stackup) instead of the
     /// default through-hole model. Builder-style; returns the configured router.
     pub fn with_via_model(mut self, vm: ViaModel) -> Self {
         self.via_model = Some(vm);
+        self
+    }
+
+    /// Set the planar Chebyshev clearance radius (in cells) reserved around
+    /// committed copper, so distinct nets keep a minimum spacing of `n` cells.
+    /// Builder-style; returns the configured router. `0` (the default) disables the
+    /// halo and reproduces the byte-identical pre-clearance behaviour. See the
+    /// [`clearance_cells`](NegotiatedRouter#structfield.clearance_cells) field.
+    pub fn with_clearance_cells(mut self, n: u32) -> Self {
+        self.clearance_cells = n;
         self
     }
 }
@@ -517,6 +539,7 @@ impl Router for NegotiatedRouter {
                 order,
                 n_cells,
                 &via_model,
+                self.clearance_cells,
             );
             let routed = committed.iter().filter(|c| c.is_some()).count();
             let total_cost: Cost = committed
@@ -564,6 +587,7 @@ impl Router for NegotiatedRouter {
                 &best_order,
                 n_cells,
                 &via_model,
+                self.clearance_cells,
             );
             let rip_routed = rip.iter().filter(|c| c.is_some()).count();
             if rip_routed > best_routed {
@@ -725,6 +749,148 @@ fn route_legal(
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
+/// Fold a committed `path` into the `owner` map, reserving a clearance halo around
+/// it so *other* groups keep a minimum spacing while siblings of the same group
+/// stay free to share. This is the single place both legalizers commit copper.
+///
+/// Exact stamping rule, applied for the committed `path` belonging to `group`:
+///
+/// 1. **Path cells.** `owner[c] = group` for every cell `c` on the path,
+///    unconditionally (matches the pre-clearance behaviour — the path always wins
+///    its own cells).
+/// 2. **Planar clearance halo.** For each path cell, on that cell's OWN layer,
+///    visit every cell `n` within Chebyshev radius `clearance_cells` (the
+///    `(2r+1)x(2r+1)` planar box). Set `owner[n] = group` ONLY IF
+///    `owner[n] == -1` (still free) AND `!base.is_obstacle(n)`. A cell already
+///    owned by a different group is never overwritten (we never break another
+///    net's claim), and a foreign net's pad / any base obstacle is never claimed
+///    (claiming it would block its owner's access to its own pad).
+/// 3. **Via keepout.** A via is detected as two consecutive path cells sharing the
+///    same `(x, y)` but differing in layer. At each such `(x, y)`, on *every* layer
+///    the via spans, stamp a halo of radius `max(clearance_cells, via_model.keepout)`
+///    under the identical "free + not-obstacle only" rule — a via pad is wider than
+///    a track, so it reserves a larger neighbourhood.
+///
+/// CRITICAL: when `clearance_cells == 0` AND `via_model.keepout == 0` this marks
+/// *exactly* the path cells and nothing else (a radius-0 box is the single centre
+/// cell, which is the path cell itself; the via halo radius is likewise 0). The
+/// default router is therefore byte-identical to the pre-clearance implementation.
+fn stamp_owner(
+    owner: &mut [i64],
+    base: &Grid,
+    dims: mr_core::Dims,
+    path: &[CellIdx],
+    group: i64,
+    clearance_cells: u32,
+    via_model: &ViaModel,
+) {
+    // Stamp a planar Chebyshev halo of radius `r` around `(cx, cy)` on `layer`,
+    // claiming only cells that are still free and not base obstacles. The centre
+    // cell is included, but the path-cell fold below already owns it.
+    let stamp_halo = |owner: &mut [i64], cx: u32, cy: u32, layer: u32, r: u32| {
+        if r == 0 {
+            return;
+        }
+        let x0 = cx.saturating_sub(r);
+        let y0 = cy.saturating_sub(r);
+        let x1 = (cx + r).min(dims.w.saturating_sub(1));
+        let y1 = (cy + r).min(dims.h.saturating_sub(1));
+        for ny in y0..=y1 {
+            for nx in x0..=x1 {
+                let n = dims.idx3(nx, ny, layer);
+                if owner[n as usize] == -1 && !base.is_obstacle(n) {
+                    owner[n as usize] = group;
+                }
+            }
+        }
+    };
+
+    // 1 + 2: own the path cells and stamp the planar clearance halo around each.
+    for &c in path {
+        owner[c as usize] = group;
+    }
+    for &c in path {
+        let (cx, cy, cl) = dims.xyz(c);
+        stamp_halo(owner, cx, cy, cl, clearance_cells);
+    }
+
+    // 3: via keepout. A via is a consecutive same-(x,y), layer-changing step. At
+    // each via (x,y) stamp the larger of the planar clearance and the via keepout
+    // on every layer the via spans (both endpoints' layers).
+    let via_r = clearance_cells.max(via_model.keepout);
+    if via_r > 0 {
+        for w in path.windows(2) {
+            let (ax, ay, al) = dims.xyz(w[0]);
+            let (bx, by, bl) = dims.xyz(w[1]);
+            if ax == bx && ay == by && al != bl {
+                stamp_halo(owner, ax, ay, al, via_r);
+                stamp_halo(owner, bx, by, bl, via_r);
+            }
+        }
+    }
+}
+
+/// Inverse of [`stamp_owner`] for the rip-up stage: free every cell in a committed
+/// `path`'s footprint (the path cells AND the same clearance / via-keepout halo)
+/// that is currently owned by `group`. Cells owned by another group (a sibling's
+/// footprint that re-owned an overlap is still `group`; a foreign group's claim is
+/// left untouched) or already free are left as-is, so freeing is idempotent and
+/// never releases a cell another group depends on. The footprint must be computed
+/// identically to `stamp_owner` so no halo cell leaks across a rip.
+fn free_owner(
+    owner: &mut [i64],
+    base: &Grid,
+    dims: mr_core::Dims,
+    path: &[CellIdx],
+    group: i64,
+    clearance_cells: u32,
+    via_model: &ViaModel,
+) {
+    let clear_halo = |owner: &mut [i64], cx: u32, cy: u32, layer: u32, r: u32| {
+        if r == 0 {
+            return;
+        }
+        let x0 = cx.saturating_sub(r);
+        let y0 = cy.saturating_sub(r);
+        let x1 = (cx + r).min(dims.w.saturating_sub(1));
+        let y1 = (cy + r).min(dims.h.saturating_sub(1));
+        for ny in y0..=y1 {
+            for nx in x0..=x1 {
+                let n = dims.idx3(nx, ny, layer);
+                // Only release cells this group still owns (it stamped only free,
+                // non-obstacle cells; clearing matches that exactly).
+                if owner[n as usize] == group && !base.is_obstacle(n) {
+                    owner[n as usize] = -1;
+                }
+            }
+        }
+    };
+
+    // Path cells: clear those still owned by `group` (siblings may have re-owned
+    // an overlap to the same `group`, so this stays idempotent).
+    for &c in path {
+        if owner[c as usize] == group {
+            owner[c as usize] = -1;
+        }
+    }
+    for &c in path {
+        let (cx, cy, cl) = dims.xyz(c);
+        clear_halo(owner, cx, cy, cl, clearance_cells);
+    }
+
+    let via_r = clearance_cells.max(via_model.keepout);
+    if via_r > 0 {
+        for w in path.windows(2) {
+            let (ax, ay, al) = dims.xyz(w[0]);
+            let (bx, by, bl) = dims.xyz(w[1]);
+            if ax == bx && ay == by && al != bl {
+                clear_halo(owner, ax, ay, al, via_r);
+                clear_halo(owner, bx, by, bl, via_r);
+            }
+        }
+    }
+}
+
 /// Commit all connection groups in the given `group_order`, returning the
 /// per-net committed path (or `None` if that net could not be placed).
 ///
@@ -749,6 +915,7 @@ fn legalize_in_order(
     group_order: &[usize],
     n_cells: usize,
     via_model: &ViaModel,
+    clearance_cells: u32,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -758,10 +925,11 @@ fn legalize_in_order(
     let mut owner: Vec<i64> = vec![-1; n_cells];
     let mut committed: Committed = vec![None; n_nets];
 
-    // Cells claimed by the group currently being committed; folded into `owner`
-    // only after the whole group commits, so sibling sub-nets never block each
-    // other. Tracked as a list (cleared per group) to avoid an O(n_cells) sweep.
-    let mut group_cells: Vec<CellIdx> = Vec::new();
+    // Net indices committed by the group currently being placed; their paths are
+    // folded into `owner` (with clearance halos) only after the whole group
+    // commits, so sibling sub-nets never block each other. Tracked as a list
+    // (cleared per group) to avoid an O(n_cells) sweep.
+    let mut group_members: Vec<usize> = Vec::new();
 
     for &g in group_order {
         let gi = g as i64;
@@ -805,18 +973,29 @@ fn legalize_in_order(
             };
 
             if let Some(path) = chosen {
-                for &c in &path {
-                    group_cells.push(c);
-                }
                 committed[i] = Some(path);
+                group_members.push(i);
             }
         }
 
-        // Fold this group's cells into the owner map and reset scratch.
-        for &c in &group_cells {
-            owner[c as usize] = gi;
+        // Fold this group's committed paths into the owner map (path cells + the
+        // clearance/via-keepout halo) only now that the whole group is placed, so
+        // a sibling's halo never blocked another sibling's route. Same-group halos
+        // are idempotent (they re-own to `gi`). Reset the per-group scratch.
+        for &i in &group_members {
+            if let Some(path) = &committed[i] {
+                stamp_owner(
+                    &mut owner,
+                    grid,
+                    dims,
+                    path,
+                    gi,
+                    clearance_cells,
+                    via_model,
+                );
+            }
         }
-        group_cells.clear();
+        group_members.clear();
     }
 
     committed
@@ -857,6 +1036,7 @@ fn ripup_legalize(
     seed_group_order: &[usize],
     n_cells: usize,
     via_model: &ViaModel,
+    clearance_cells: u32,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -895,20 +1075,24 @@ fn ripup_legalize(
         }
     }
 
-    // Free every cell currently owned by group `g` (its committed nets are
-    // un-committed by the caller separately). Reset committed entries here.
+    // Free every cell currently owned by group `g` — both the committed path cells
+    // AND their clearance / via-keepout halo (via `free_owner`, the symmetric
+    // inverse of `stamp_owner`) so no reserved cell leaks across a rip. Reset
+    // committed entries here.
     let free_group_cells =
         |owner: &mut [i64], committed: &mut Committed, group_ids: &[usize], g: usize| {
             for i in 0..committed.len() {
                 if group_ids[i] == g {
                     if let Some(path) = committed[i].take() {
-                        for &c in &path {
-                            // Only clear cells this group still owns (siblings may
-                            // share; clearing is idempotent and safe).
-                            if owner[c as usize] == g as i64 {
-                                owner[c as usize] = -1;
-                            }
-                        }
+                        free_owner(
+                            owner,
+                            grid,
+                            dims,
+                            &path,
+                            g as i64,
+                            clearance_cells,
+                            via_model,
+                        );
                     }
                 }
             }
@@ -956,9 +1140,7 @@ fn ripup_legalize(
         });
 
         if let Some((path, _)) = routed {
-            for &c in &path {
-                owner[c as usize] = gi;
-            }
+            stamp_owner(&mut owner, grid, dims, &path, gi, clearance_cells, via_model);
             committed[i] = Some(path);
             continue;
         }
@@ -1034,9 +1216,7 @@ fn ripup_legalize(
             }
         });
         if let Some((path, _)) = rerouted {
-            for &c in &path {
-                owner[c as usize] = gi;
-            }
+            stamp_owner(&mut owner, grid, dims, &path, gi, clearance_cells, via_model);
             committed[i] = Some(path);
         } else {
             // Still cannot route even after the rip: re-enqueue i once (its rip
@@ -1502,6 +1682,7 @@ mod tests {
             &[0, 1],
             n_cells,
             &via_model,
+            0,
         );
         assert!(c_ab[0].is_some(), "A commits in A-first order");
         assert!(
@@ -1521,6 +1702,7 @@ mod tests {
             &[1, 0],
             n_cells,
             &via_model,
+            0,
         );
         assert!(
             c_ba[0].is_some() && c_ba[1].is_some(),
@@ -1650,5 +1832,188 @@ mod tests {
         // The via model makes no difference on a single-layer board.
         assert_eq!(br_default.results, br_vm.results);
         assert_eq!(br_default.congestion, br_vm.congestion);
+    }
+
+    /// True iff any cell of `a` lies within the 8-neighbourhood (Chebyshev
+    /// radius one) of any cell of `b` on the same layer — i.e. the two paths touch
+    /// or sit adjacent. With `clearance_cells >= 1` two distinct nets must not.
+    fn within_one(dims: Dims, a: &[CellIdx], b: &[CellIdx]) -> bool {
+        let sb: std::collections::HashSet<_> = b.iter().copied().collect();
+        a.iter().any(|&c| {
+            let (x, y, l) = dims.xyz(c);
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let nx = x as i64 + dx;
+                    let ny = y as i64 + dy;
+                    if nx < 0 || ny < 0 || nx as u32 >= dims.w || ny as u32 >= dims.h {
+                        continue;
+                    }
+                    if sb.contains(&dims.idx3(nx as u32, ny as u32, l)) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+    }
+
+    /// Clearance halo enforces minimum spacing. Two parallel 2-point nets one row
+    /// apart route on adjacent rows with `clearance_cells = 0` (touching is fine),
+    /// but with `clearance_cells = 1` the committed copper of the two distinct nets
+    /// must share no 8-neighbourhood cell — they are forced ≥2 rows apart OR one is
+    /// dropped. We assert that on the wide-open board both still route AND their
+    /// paths are now Chebyshev-disjoint (no common 8-neighbour cell).
+    #[test]
+    fn clearance_halo_forces_spacing() {
+        // 8 wide, 5 tall, open. A runs along row 1, B along row 2 — adjacent rows.
+        let dims = Dims::new(8, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+        let a = net("a", dims.idx(0, 1), dims.idx(7, 1));
+        let b = net("b", dims.idx(0, 2), dims.idx(7, 2));
+
+        // clearance 0: today's behaviour — both route, and their straight paths sit
+        // on adjacent rows (so they DO share 8-neighbour cells).
+        let br0 = NegotiatedRouter::new()
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+        assert!(br0.unrouted.is_empty(), "clearance 0: both route: {br0:?}");
+        let (p0a, p0b) = (&br0.results[0].path, &br0.results[1].path);
+        assert!(disjoint(p0a, p0b), "clearance 0: cell-disjoint");
+        assert!(
+            within_one(dims, p0a, p0b),
+            "clearance 0: adjacent rows DO touch in the 8-neighbourhood"
+        );
+
+        // clearance 1: the halo of each committed net blocks the row next to it for
+        // the other net, so the two paths must end up ≥2 rows apart (or one drops).
+        let br1 = NegotiatedRouter::new()
+            .with_clearance_cells(1)
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+        let routed1 = br1.results.len();
+        if routed1 == 2 {
+            let (p1a, p1b) = (&br1.results[0].path, &br1.results[1].path);
+            assert!(
+                !within_one(dims, p1a, p1b),
+                "clearance 1: distinct nets must share no 8-neighbour cell: {p1a:?} {p1b:?}"
+            );
+        } else {
+            // The alternative legal outcome on a tight board: one net is dropped.
+            assert_eq!(routed1, 1, "clearance 1: at most one net dropped: {br1:?}");
+            assert_eq!(br1.unrouted.len(), 1);
+        }
+    }
+
+    /// Via keepout reserves a placed via's neighbourhood. On a 2-layer board whose
+    /// only layer-0 corridor is walled, net A must via up at a chokepoint to cross.
+    /// With `via_model.keepout = 1`, A's via reserves the cells around it on the via
+    /// layers, so a second net B cannot route through the cell adjacent to A's via
+    /// on a via layer — B is forced away (or dropped). We assert the via keepout
+    /// owns A's via neighbourhood by checking B's committed copper shares no cell of
+    /// A's via 8-neighbourhood on either via layer.
+    #[test]
+    fn via_keepout_reserves_neighbourhood() {
+        // 5 wide, 3 tall, 2 layers. Wall the WHOLE of layer 0 column x=2 so the only
+        // way past x=2 on layer 0 is to via up to layer 1, cross, and via back.
+        let dims = Dims::with_layers(5, 3, 2);
+        let mut gb = GridBuilder::new(dims, 1);
+        gb.mark_cell(2, 0);
+        gb.mark_cell(2, 1);
+        gb.mark_cell(2, 2);
+        let grid = gb.build();
+        // Sanity: layer 0 column x=2 is fully walled; layer 1 is open there.
+        for y in 0..3 {
+            assert!(grid.is_obstacle(dims.idx3(2, y, 0)));
+            assert!(!grid.is_obstacle(dims.idx3(2, y, 1)));
+        }
+
+        // A crosses the wall along row 1: it must via up near x=1/x=3 and back.
+        let a = net("a", dims.idx3(0, 1, 0), dims.idx3(4, 1, 0));
+        // B wants to also cross, along row 0.
+        let b = net("b", dims.idx3(0, 0, 0), dims.idx3(4, 0, 0));
+
+        let vm = {
+            let mut m = ViaModel::through_hole(2);
+            m.keepout = 1;
+            m
+        };
+        let br = NegotiatedRouter::new()
+            .with_via_model(vm)
+            .with_clearance_cells(0)
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+
+        // A must route (it can always via across).
+        let ra = br
+            .results
+            .iter()
+            .find(|r| r.net == "a")
+            .expect("A must route");
+        // Collect A's via (x,y) chokepoints: consecutive same-(x,y), layer-changing.
+        let mut via_neigh: std::collections::HashSet<CellIdx> = std::collections::HashSet::new();
+        for w in ra.path.windows(2) {
+            let (ax, ay, al) = dims.xyz(w[0]);
+            let (bx, by, bl) = dims.xyz(w[1]);
+            if ax == bx && ay == by && al != bl {
+                // 8-neighbourhood on BOTH via layers (excluding the via cells).
+                for &l in &[al, bl] {
+                    for dy in -1i64..=1 {
+                        for dx in -1i64..=1 {
+                            let nx = ax as i64 + dx;
+                            let ny = ay as i64 + dy;
+                            if nx < 0 || ny < 0 || nx as u32 >= dims.w || ny as u32 >= dims.h {
+                                continue;
+                            }
+                            let nc = dims.idx3(nx as u32, ny as u32, l);
+                            if !grid.is_obstacle(nc) {
+                                via_neigh.insert(nc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!via_neigh.is_empty(), "A must place at least one via: {ra:?}");
+
+        // B (if routed) must not pass through A's reserved via neighbourhood.
+        if let Some(rb) = br.results.iter().find(|r| r.net == "b") {
+            for &c in &rb.path {
+                // A's own via cells are A's; the keepout reserves the surrounding
+                // cells. B must avoid the reserved (non-A-path) neighbourhood.
+                if via_neigh.contains(&c) && !ra.path.contains(&c) {
+                    panic!("B routed through A's reserved via keepout at cell {c}: {rb:?}");
+                }
+            }
+        }
+    }
+
+    /// Regression: `clearance_cells = 0` reproduces an existing golden result. We
+    /// re-run the exact `crossing_nets_route_disjoint` scenario through the default
+    /// (clearance 0) router and an explicit `with_clearance_cells(0)` router and
+    /// assert both match the known-good disjoint outcome byte-for-byte.
+    #[test]
+    fn clearance_zero_reproduces_golden() {
+        let dims = Dims::new(5, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+        let a = net("a", dims.idx(2, 1), dims.idx(2, 3));
+        let b = net("b", dims.idx(1, 2), dims.idx(3, 2));
+
+        let br_default = NegotiatedRouter::new()
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+        let br_zero = NegotiatedRouter::new()
+            .with_clearance_cells(0)
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+
+        // Byte-identical: explicit clearance 0 == the default.
+        assert_eq!(br_default.results, br_zero.results);
+        assert_eq!(br_default.unrouted, br_zero.unrouted);
+        assert_eq!(br_default.congestion, br_zero.congestion);
+
+        // And it reproduces the golden disjoint result.
+        assert!(br_zero.unrouted.is_empty());
+        assert_eq!(br_zero.results.len(), 2);
+        assert!(disjoint(&br_zero.results[0].path, &br_zero.results[1].path));
     }
 }

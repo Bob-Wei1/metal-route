@@ -294,10 +294,10 @@ pub fn rasterize_with_layers(
         pin_points.insert(cell, (px, py));
     }
 
-    // TODO(via-keepout): when a ViaModel carries keepout > 0, stamp that clearance
-    // around via-capable cells on the layers a via passes through. For this first
-    // cut keepout defaults to 0 (treated as the existing board clearance) and no
-    // extra via reservation is made here.
+    // Via keepout is now enforced in the router's legalization fold (via
+    // `ViaModel.keepout`, see `mr_cpu::NegotiatedRouter` / `stamp_owner`), not at
+    // rasterise time — committed vias reserve their keepout halo there, so nothing
+    // extra is stamped on the base grid here.
 
     let grid = builder.build();
     let nets = decompose_connections(&srj.connections, &mapping, &srj.obstacles, &layers);

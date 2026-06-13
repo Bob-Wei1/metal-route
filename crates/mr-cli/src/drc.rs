@@ -44,6 +44,26 @@ pub fn default_rules(clearance: f64) -> DrcRules {
 ///   covers every physical layer (including planes) it really drills through.
 /// * `planes` binds each poured plane to the copper layer it fills; `obstacles` +
 ///   `pin_nets` are the static pads and their nets.
+///
+/// `model_plane_antipads` selects how a through-via crossing a *foreign* plane is
+/// modelled:
+///
+/// * `true` (the realistic default for **poured-zone** boards): the DSN planes are
+///   `(plane "NET" (polygon ...))` poured zones, and a poured zone automatically
+///   reliefs (carves an antipad around) a foreign through-via by the zone's
+///   clearance. We model that by giving each via an `antipad_radius` of exactly
+///   `VIA_DRILL_MM/2 + rules.plane_antipad` — the relief the zone fill provides —
+///   so a well-formed via crossing a foreign plane is *not* reported as a short.
+///   IMPORTANT / honesty: this antipad is a *model* of the zone-fill relief, not
+///   geometry we emit. It physically exists only if the fabrication / zone-fill
+///   actually reliefs the via. The `kicad-cli pcb drc` cross-check (a later
+///   milestone) is what validates that the imported board really reliefs these
+///   vias. This is a deliberate model correction, not a silent silencing of a
+///   real short.
+/// * `false` (the pessimistic "planes are bare copper" model): every via carries
+///   `antipad_radius: None`, so every via crossing a foreign plane shorts to it.
+///   Use `--no-plane-zones` when the planes are *not* poured (solid copper pours
+///   with no relief) and you want that worst case.
 #[allow(clippy::too_many_arguments)]
 pub fn build_drc_board(
     board: &BoardRoute,
@@ -55,6 +75,7 @@ pub fn build_drc_board(
     pin_nets: &HashMap<String, String>,
     trace_width: f64,
     rules: DrcRules,
+    model_plane_antipads: bool,
 ) -> DrcBoard {
     // physical layer index -> plane net (only for layers a plane fills).
     let mut plane_nets: HashMap<u32, String> = HashMap::new();
@@ -80,6 +101,16 @@ pub fn build_drc_board(
     let dims = mapping.dims;
     let mut segments = Vec::new();
     let mut vias = Vec::new();
+
+    // For a poured-zone board, the zone fill reliefs a foreign through-via by the
+    // zone clearance. We model that relief as an antipad that exactly meets the
+    // rule (`drill/2 + plane_antipad`), so a well-formed via does NOT short a
+    // foreign plane. `None` keeps the pessimistic bare-copper model where it does.
+    let via_antipad: Option<f64> = if model_plane_antipads {
+        Some(VIA_DRILL_MM / 2.0 + rules.plane_antipad)
+    } else {
+        None
+    };
 
     for r in &board.results {
         // Chained sub-nets of one connection share a base net (strip the `#seg`).
@@ -126,9 +157,9 @@ pub fn build_drc_board(
                     drill_diameter: VIA_DRILL_MM,
                     from_layer: p0.min(p1),
                     to_layer: p0.max(p1),
-                    // M1 baseline: vias carry no antipad, so they short the planes
-                    // they cross — exactly the state we are measuring. M2 sets this.
-                    antipad_radius: None,
+                    // Poured-zone relief (or `None` for the bare-copper model); see
+                    // `model_plane_antipads` on `build_drc_board`.
+                    antipad_radius: via_antipad,
                 });
                 i = j + 1;
             } else {
@@ -200,6 +231,13 @@ pub struct DrcArgs {
     /// reflects the true total). Keeps a committed baseline small and stable.
     #[arg(long)]
     pub max_violations: Option<usize>,
+
+    /// Treat planes as bare copper: do NOT model the antipad (relief) a poured zone
+    /// gives a foreign through-via. With this set, every via crossing a foreign
+    /// plane is reported as a short (the pessimistic worst case). Leave it off for
+    /// poured-zone boards, where the zone fill reliefs the via.
+    #[arg(long, default_value_t = false)]
+    pub no_plane_zones: bool,
 }
 
 /// A serialisable DRC run report: routing context plus the violation summary and
@@ -237,6 +275,7 @@ pub fn run_drc(args: &DrcArgs) -> Result<DrcRunReport> {
         &args.skip_nets,
         args.max_nets,
         args.layers,
+        !args.no_plane_zones,
     )?;
 
     let violations = drc_board.check();
@@ -274,10 +313,9 @@ mod tests {
     use super::*;
     use mr_core::{Dims, RouteResult};
 
-    /// A through-via that drills from the top signal layer to the bottom signal
-    /// layer must be flagged crossing the inner GND plane between them.
-    #[test]
-    fn via_through_inner_plane_is_flagged() {
+    /// Shared fixture: a top→bottom through-via on net `via_net` that drills the
+    /// inner GND plane. `model_plane_antipads` toggles the poured-zone relief model.
+    fn inner_plane_via_board(via_net: &str, model_plane_antipads: bool) -> DrcBoard {
         // Physical stack: top(signal) / inner1(GND plane) / bottom(signal).
         let physical = LayerMap::from_names(vec![
             "top".to_string(),
@@ -302,7 +340,7 @@ mod tests {
         let mapping = Mapping::with_layers(&bounds, 1.0, 2);
         let board = BoardRoute {
             results: vec![RouteResult {
-                net: "SIG".to_string(),
+                net: via_net.to_string(),
                 path: vec![dims.idx3(1, 1, 0), dims.idx3(1, 1, 1)],
                 cost: 1,
             }],
@@ -310,7 +348,7 @@ mod tests {
             congestion: vec![],
         };
 
-        let drc = build_drc_board(
+        build_drc_board(
             &board,
             &mapping,
             &signal,
@@ -320,36 +358,60 @@ mod tests {
             &HashMap::new(),
             0.15,
             default_rules(0.15),
-        );
+            model_plane_antipads,
+        )
+    }
+
+    /// Without the poured-zone model (bare copper), a foreign through-via shorts the
+    /// inner GND plane it drills.
+    #[test]
+    fn via_through_inner_plane_is_flagged() {
+        let drc = inner_plane_via_board("SIG", false);
 
         // One through-via spanning physical 0..2.
         assert_eq!(drc.vias.len(), 1);
         assert_eq!((drc.vias[0].from_layer, drc.vias[0].to_layer), (0, 2));
-
-        let violations = drc.check();
-        let summary = DrcSummary::of(&violations);
         assert_eq!(
-            summary.via_through_plane, 1,
+            drc.vias[0].antipad_radius, None,
+            "bare-copper model carries no antipad"
+        );
+
+        assert_eq!(
+            DrcSummary::of(&drc.check()).via_through_plane,
+            1,
             "via must short the foreign GND plane it drills through"
         );
-        // Same-net via would NOT short its own plane:
-        let mut same_net = board.clone();
-        same_net.results[0].net = "GND".to_string();
-        let drc2 = build_drc_board(
-            &same_net,
-            &mapping,
-            &signal,
-            &physical,
-            &planes,
-            &[],
-            &HashMap::new(),
-            0.15,
-            default_rules(0.15),
-        );
+    }
+
+    /// With the poured-zone model, the same foreign through-via carries the zone's
+    /// relief antipad and is NOT a short.
+    #[test]
+    fn via_through_inner_plane_clean_with_poured_zone() {
+        let drc = inner_plane_via_board("SIG", true);
+
+        assert_eq!(drc.vias.len(), 1);
+        // Antipad exactly meets the rule: drill/2 + plane_antipad.
+        let expected = VIA_DRILL_MM / 2.0 + DEFAULT_PLANE_ANTIPAD_MM;
+        let got = drc.vias[0].antipad_radius.expect("poured zone reliefs via");
+        assert!((got - expected).abs() < 1e-12, "antipad = {got}");
+
         assert_eq!(
-            DrcSummary::of(&drc2.check()).via_through_plane,
+            DrcSummary::of(&drc.check()).via_through_plane,
             0,
-            "a via on the plane's own net is a legal connection"
+            "a poured zone reliefs the foreign through-via, so it is not a short"
         );
+    }
+
+    /// A via on the plane's own net is a legal connection regardless of the model.
+    #[test]
+    fn same_net_via_on_own_plane_never_flagged() {
+        for model in [false, true] {
+            let drc = inner_plane_via_board("GND", model);
+            assert_eq!(
+                DrcSummary::of(&drc.check()).via_through_plane,
+                0,
+                "a via on the plane's own net is a legal connection (model = {model})"
+            );
+        }
     }
 }

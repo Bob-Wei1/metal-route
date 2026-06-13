@@ -585,6 +585,13 @@ fn board_to_ses(
                     run.push((to_raw(x), to_raw(y)));
                 } else {
                     // Layer change: a via at the shared (x, y) of path[k-1]/path[k].
+                    // We emit only the via padstack + position, tagged with its net
+                    // (it sits inside this `(net ...)` block). Plane antipads are NOT
+                    // emitted as explicit geometry: on import, KiCad's zone fill
+                    // reliefs a foreign-net via automatically (the via's net is
+                    // preserved, so each poured plane carves its own antipad). The DRC
+                    // model in `drc::build_drc_board` mirrors that relief; the
+                    // `kicad-cli` cross-check validates the two agree.
                     let (vx, vy) = mapping.cell_center(path[k]);
                     let (vrx, vry) = (to_raw(vx), to_raw(vy));
                     flush(&mut out, cur_layer, &run);
@@ -637,6 +644,11 @@ fn apply_layer_override(
 ///
 /// `skip_nets` drops any connection whose name contains one of the substrings;
 /// `max_nets` caps the number of (post-skip) original connections routed.
+///
+/// `model_plane_antipads` is forwarded to [`drc::build_drc_board`]: `true` models
+/// the poured-zone relief on foreign through-vias (the realistic default), `false`
+/// treats planes as bare copper so every crossing shorts.
+#[allow(clippy::too_many_arguments)]
 pub fn route_dsn_problem(
     ingest: DsnIngest,
     design_name: &str,
@@ -644,6 +656,7 @@ pub fn route_dsn_problem(
     skip_nets: &[String],
     max_nets: Option<usize>,
     layers: Option<u32>,
+    model_plane_antipads: bool,
 ) -> Result<(DsnReport, Vec<mr_srj::PcbTrace>, String, mr_drc::DrcBoard)> {
     let units_per_mm = ingest.units_per_mm();
     let res_unit = ingest.resolution_unit.clone();
@@ -682,7 +695,21 @@ pub fn route_dsn_problem(
         signal_layers.truncate(n);
     }
     let layer_map = LayerMap::from_names(signal_layers);
-    let via_model = ViaModel::through_hole(layer_map.len());
+    // Clearance-aware routing (M2): reserve a net-owned halo around committed copper
+    // so different nets keep the DSN's minimum spacing, and a wider keepout around
+    // vias (their 0.45 mm pad bleeds further than a track). Radii are in grid cells.
+    let clearance_mm = stats.min_clearance_mm;
+    let cells_for = |mm: f64| -> u32 {
+        if mm > 0.0 && resolution > 0.0 {
+            (mm / resolution).ceil() as u32
+        } else {
+            0
+        }
+    };
+    let clearance_cells = cells_for(clearance_mm + DEFAULT_TRACE_WIDTH);
+    let via_keepout_cells = cells_for(VIA_PAD_MM / 2.0 + clearance_mm);
+    let mut via_model = ViaModel::through_hole(layer_map.len());
+    via_model.keepout = via_keepout_cells;
     let problem = rasterize_with_layers(&srj, resolution, layer_map);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
@@ -692,6 +719,7 @@ pub fn route_dsn_problem(
     let start = std::time::Instant::now();
     let board = NegotiatedRouter::new()
         .with_via_model(via_model)
+        .with_clearance_cells(clearance_cells)
         .route(&problem.grid, &problem.nets)
         .context("router failed")?;
     let wall_s = start.elapsed().as_secs_f64();
@@ -753,6 +781,7 @@ pub fn route_dsn_problem(
         &pin_nets,
         trace_width,
         drc::default_rules(stats.min_clearance_mm),
+        model_plane_antipads,
     );
 
     let report = DsnReport {
@@ -792,6 +821,9 @@ pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
         &args.skip_nets,
         args.max_nets,
         args.layers,
+        // route-dsn assumes poured-zone planes (the realistic default); the `drc`
+        // subcommand exposes `--no-plane-zones` to opt into the bare-copper model.
+        true,
     )?;
 
     if let Some(path) = &args.out {
@@ -1046,7 +1078,7 @@ mod tests {
         let ingest = dsn_to_ingest(SYNTH_DSN).unwrap();
         assert_eq!(ingest.srj.connections.len(), 1);
         let (report, traces, ses, _drc) =
-            route_dsn_problem(ingest, "synth", Some(0.5), &[], None, None).unwrap();
+            route_dsn_problem(ingest, "synth", Some(0.5), &[], None, None, true).unwrap();
         // The SES is well-formed and names the routed net.
         assert!(ses.contains("(session"));
         assert!(ses.contains("(net \"N1\""));
@@ -1088,7 +1120,8 @@ mod tests {
         assert_eq!(ingest.srj.connections.len(), 2);
         // Skip GND -> only SIGNAL remains.
         let (report, _, _, _) =
-            route_dsn_problem(ingest, "f", Some(0.5), &["GND".to_string()], None, None).unwrap();
+            route_dsn_problem(ingest, "f", Some(0.5), &["GND".to_string()], None, None, true)
+                .unwrap();
         assert_eq!(report.original_nets, 1);
     }
 }

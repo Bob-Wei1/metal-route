@@ -1,0 +1,436 @@
+{
+  "design": "fixture",
+  "total_nets": 142,
+  "routed_nets": 108,
+  "fully_connected": 39,
+  "vias": 326,
+  "clearance_mm": 0.15,
+  "summary": {
+    "total": 1394,
+    "clearance": 1394,
+    "via_through_plane": 0,
+    "annular_ring": 0
+  },
+  "violations": [
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.205,
+        -169.38750000000002
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.13500000000000084,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.28,
+        -169.3125
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.13500000000000084,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.28,
+        -169.16250000000002
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.13500000000000084,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.28,
+        -169.01250000000002
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.13500000000000084,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.355000000000004,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.505,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.655,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.805,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        48.955,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        49.105000000000004,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        49.255,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL2"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        50.825,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10700274723202312,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        50.975,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.125,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.275,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.425,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.575,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.725,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        51.875,
+        -168.9375
+      ],
+      "nets": [
+        "GND",
+        "RAIL0"
+      ],
+      "measured": 0.10700274723202312,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        53.445,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        53.595,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        53.745000000000005,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        53.894999999999996,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        54.045,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        54.195,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        54.345,
+        -168.9375
+      ],
+      "nets": [
+        "DIRECT_ad3_mte_2x15_V+",
+        "RAIL0"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        55.915000000000006,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.10255280904565962,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.065,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.215,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.365,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.10000000000001137,
+      "required": 0.15
+    }
+  ]
+}
