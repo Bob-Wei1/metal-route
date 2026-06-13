@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # macOS arm64 so the Metal crate compiles. GPU compute is NOT guaranteed on
+    # GitHub-hosted runners, so Metal *tests* are run best-effort and never gate CI.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (CPU crates, deny warnings)
+        run: >
+          cargo clippy --all-targets
+          -p mr-core -p mr-grid -p mr-fixtures -p mr-cpu -p mr-srj
+          -p mr-ingest -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
+          -- -D warnings
+
+      - name: Test (CPU crates — the correctness gate)
+        run: >
+          cargo test
+          -p mr-core -p mr-grid -p mr-fixtures -p mr-cpu -p mr-srj
+          -p mr-ingest -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
+
+      - name: Reproducible benchmark (smoke — must run, numbers not gated)
+        run: cargo run -p mr-cli --bin metalroute -- bench --boards 3 --nets 10
+
+      - name: Metal build (compile-only; GPU may be unavailable on runners)
+        run: cargo build -p mr-metal
+
+      - name: Metal tests (best-effort, never fails CI)
+        run: cargo test -p mr-metal || echo "::warning::Metal GPU tests skipped/failed (no GPU on runner)"
