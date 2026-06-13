@@ -5,6 +5,19 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "mr-server"
+path = "src/main.rs"
+
 [dependencies]
 mr-core = { workspace = true }
 mr-srj = { workspace = true }
+mr-cpu = { workspace = true }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
