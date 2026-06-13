@@ -46,7 +46,7 @@ use mr_core::{
     BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError, OBSTACLE,
 };
 
-use crate::dijkstra::{dijkstra, reconstruct_path};
+use crate::dijkstra::{astar_buf, SearchBuf};
 
 /// Fixed-point cost scale: the base cost of stepping onto a passable cell.
 pub const SCALE: Cost = 16;
@@ -68,6 +68,107 @@ const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
 /// Per-net committed paths from one legalization pass, in input net order: `Some`
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
 type Committed = Vec<Option<Vec<CellIdx>>>;
+
+/// A rectangular search window in cell coordinates (inclusive bounds). The
+/// per-net A* search is restricted to this box so the explored area scales with a
+/// net's local region instead of the whole board — the dominant speedup for the
+/// local nets of a bed-of-nails board. A full-board window covers `0..w, 0..h`.
+#[derive(Clone, Copy)]
+struct Window {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl Window {
+    /// The whole board.
+    fn full(dims: mr_core::Dims) -> Self {
+        Window {
+            x0: 0,
+            y0: 0,
+            x1: dims.w.saturating_sub(1),
+            y1: dims.h.saturating_sub(1),
+        }
+    }
+
+    /// True when cell `c` lies inside the window.
+    #[inline]
+    fn contains(&self, dims: mr_core::Dims, c: CellIdx) -> bool {
+        let (x, y) = dims.xy(c);
+        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+}
+
+/// Build the per-net search window: the bounding box of `{src, dst}` plus every
+/// cell in `pads` (the net's own passable pads must be reachable), expanded by a
+/// margin so the net can detour locally. `margin = max(16, ceil(0.30 * max(bbox_w,
+/// bbox_h)))` cells, then clamped to the board.
+fn net_window(dims: mr_core::Dims, src: CellIdx, dst: CellIdx, pads: &[CellIdx]) -> Window {
+    let (sx, sy) = dims.xy(src);
+    let (dx, dy) = dims.xy(dst);
+    let mut x0 = sx.min(dx);
+    let mut y0 = sy.min(dy);
+    let mut x1 = sx.max(dx);
+    let mut y1 = sy.max(dy);
+    // The window must include all of the net's own pad cells.
+    for &p in pads {
+        let (px, py) = dims.xy(p);
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px);
+        y1 = y1.max(py);
+    }
+    let bbox_w = x1 - x0;
+    let bbox_h = y1 - y0;
+    let span = bbox_w.max(bbox_h);
+    // ceil(0.30 * span) == (3*span + 9) / 10.
+    let margin = 16u32.max((3 * span + 9) / 10);
+    Window {
+        x0: x0.saturating_sub(margin),
+        y0: y0.saturating_sub(margin),
+        x1: (x1 + margin).min(dims.w.saturating_sub(1)),
+        y1: (y1 + margin).min(dims.h.saturating_sub(1)),
+    }
+}
+
+/// O(1)-membership set over board cells using the same generation-stamp trick as
+/// [`crate::dijkstra::SearchBuf`]: a cell is a member iff `stamp[c] == gen`. Reset
+/// is O(1) (bump `gen`); marking the current net's pads is O(pads). Replaces the
+/// per-net `Vec::contains` / `HashSet` membership in the hot loop.
+struct PadSet {
+    stamp: Vec<u32>,
+    gen: u32,
+}
+
+impl PadSet {
+    fn new(n: usize) -> Self {
+        PadSet {
+            stamp: vec![0; n],
+            gen: 0,
+        }
+    }
+
+    /// Clear all membership in O(1) and load `pads` as the current set in
+    /// O(pads). Handles `gen` wraparound by zeroing the stamps.
+    fn load(&mut self, pads: &[CellIdx]) {
+        match self.gen.checked_add(1) {
+            Some(g) => self.gen = g,
+            None => {
+                self.stamp.iter_mut().for_each(|s| *s = 0);
+                self.gen = 1;
+            }
+        }
+        for &p in pads {
+            self.stamp[p as usize] = self.gen;
+        }
+    }
+
+    #[inline]
+    fn contains(&self, c: CellIdx) -> bool {
+        self.stamp[c as usize] == self.gen
+    }
+}
 
 /// PathFinder-style negotiated-congestion router. Default multi-net backend.
 #[derive(Debug, Default, Clone, Copy)]
@@ -129,11 +230,10 @@ impl Router for NegotiatedRouter {
         let n_cells = dims.len();
         let n_nets = nets.len();
 
-        // Per-cell membership of each net's own passable pads, for fast lookup.
-        let pad_sets: Vec<std::collections::HashSet<CellIdx>> = nets
-            .iter()
-            .map(|net| net.passable_pads.iter().copied().collect())
-            .collect();
+        // Reusable search workspace and own-pad membership set, sized once to the
+        // board and reused across every per-net search (no per-net O(n) work).
+        let mut buf = SearchBuf::new(n_cells);
+        let mut pad_set = PadSet::new(n_cells);
 
         // Connection group id per net (interned, deterministic by first appearance).
         let mut group_ids: Vec<usize> = vec![0; n_nets];
@@ -153,8 +253,31 @@ impl Router for NegotiatedRouter {
         // Current routed path per net (empty == not currently routed).
         let mut paths: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
 
-        // Reusable cost buffer for the per-net effective grid.
-        let mut work = grid.clone();
+        // Per-net search window (bbox of endpoints+pads, expanded by a margin),
+        // precomputed once: the negotiation search is restricted to this box so
+        // explored area scales with the net's local region, not the whole board.
+        let windows: Vec<Window> = nets
+            .iter()
+            .map(|net| net_window(dims, net.src, net.dst, &net.passable_pads))
+            .collect();
+
+        // Incremental rerouting (large boards only): after the first iteration,
+        // only a net that is unrouted OR whose path touches a cell that was
+        // over-used last iteration needs rerouting — a "happy" net's priced costs
+        // are unchanged (history only grows on over-used cells), so its optimal
+        // path is unchanged. This cuts later iterations from O(all nets) to
+        // O(congested nets). Gated to large net counts so the small deterministic
+        // unit tests keep their exact full-reroute behaviour.
+        let incremental = n_nets > 8;
+        // `overused` from the previous iteration (cell -> was it over-used). Empty
+        // before the first iteration (everything reroutes).
+        let mut prev_overused: Vec<bool> = vec![false; n_cells];
+        let mut prev_overused_cells: Vec<CellIdx> = Vec::new();
+
+        // Per-iteration overuse scratch, allocated once and cleared incrementally
+        // (via the touched-cell lists) so no iteration pays an O(all cells) memset.
+        let mut first_group: Vec<i64> = vec![-1; n_cells];
+        let mut overused: Vec<bool> = vec![false; n_cells];
 
         for iter in 0..MAX_ITERS {
             let pfac: u32 = 1 + iter;
@@ -162,17 +285,44 @@ impl Router for NegotiatedRouter {
             for i in 0..n_nets {
                 let net = &nets[i];
 
+                // Skip quiescent nets after the first iteration: a routed net whose
+                // path avoids every previously-over-used cell keeps its path.
+                if incremental && iter > 0 && !paths[i].is_empty() {
+                    let touches_overuse = paths[i].iter().any(|&c| prev_overused[c as usize]);
+                    if !touches_overuse {
+                        continue;
+                    }
+                }
+
                 // Remove this net's old path from `present` before pricing.
                 for &c in &paths[i] {
                     present[c as usize] = present[c as usize].saturating_sub(1);
                 }
                 paths[i].clear();
 
-                build_effective_grid(&mut work, grid, &pad_sets[i], &present, &history, pfac);
+                pad_set.load(&net.passable_pads);
 
-                let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
-                let field = dijkstra(&work, net.src, h);
-                if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+                // Route within the net's window; on failure, retry once on the
+                // full board so the occasional global net still completes.
+                let routed = route_negotiated(
+                    &mut buf, grid, &pad_set, &present, &history, pfac, net.src, net.dst,
+                    windows[i],
+                )
+                .or_else(|| {
+                    route_negotiated(
+                        &mut buf,
+                        grid,
+                        &pad_set,
+                        &present,
+                        &history,
+                        pfac,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                    )
+                });
+
+                if let Some((path, _)) = routed {
                     for &c in &path {
                         present[c as usize] = present[c as usize].saturating_add(1);
                     }
@@ -183,9 +333,10 @@ impl Router for NegotiatedRouter {
 
             // Overuse across GROUPS: a cell is over-used iff ≥2 distinct groups
             // occupy it. Track the first group seen per cell; a second distinct
-            // group flags overuse.
-            let mut first_group: Vec<i64> = vec![-1; n_cells];
-            let mut overused: Vec<bool> = vec![false; n_cells];
+            // group flags overuse. We only touch the cells the current paths cover,
+            // so the scan is O(total path length), not O(all cells): `first_group`
+            // and `overused` are cleared via the touched-cell list, not a memset.
+            let mut overused_cells: Vec<CellIdx> = Vec::new();
             let mut any_overuse = false;
             for i in 0..n_nets {
                 let g = group_ids[i] as i64;
@@ -195,19 +346,43 @@ impl Router for NegotiatedRouter {
                         *slot = g;
                     } else if *slot != g && !overused[c as usize] {
                         overused[c as usize] = true;
+                        overused_cells.push(c);
                         any_overuse = true;
                     }
                 }
             }
 
-            if !any_overuse {
-                break; // converged: cell-disjoint across groups
+            // Bump history on the over-used cells.
+            for &c in &overused_cells {
+                history[c as usize] = history[c as usize].saturating_add(SCALE);
             }
 
-            for (c, &over) in overused.iter().enumerate() {
-                if over {
-                    history[c] = history[c].saturating_add(SCALE);
+            // Clear the per-iteration scratch for the cells we touched (O(touched),
+            // not O(all cells)): `first_group` via the path cells, `overused` via
+            // the over-used list.
+            for i in 0..n_nets {
+                for &c in &paths[i] {
+                    first_group[c as usize] = -1;
                 }
+            }
+            for &c in &overused_cells {
+                overused[c as usize] = false;
+            }
+
+            // Roll this iteration's over-used set into `prev_overused` for the next
+            // iteration's quiescence test (list-based reset to avoid an O(n) clear).
+            if incremental {
+                for &c in &prev_overused_cells {
+                    prev_overused[c as usize] = false;
+                }
+                for &c in &overused_cells {
+                    prev_overused[c as usize] = true;
+                }
+                std::mem::swap(&mut prev_overused_cells, &mut overused_cells);
+            }
+
+            if !any_overuse {
+                break; // converged: cell-disjoint across groups
             }
         }
 
@@ -233,13 +408,28 @@ impl Router for NegotiatedRouter {
         // committed foreign-group nets a stranded net's natural route would cross.
         let mut alone_path: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
         {
-            let empty_occ = vec![false; n_cells];
+            // No foreign occupancy here; the alone-path is the net by itself on the
+            // base grid. Route within the window first, full board on failure.
+            let no_owner: Vec<i64> = Vec::new();
             for i in 0..n_nets {
                 let net = &nets[i];
-                build_legal_grid(&mut work, grid, &pad_sets[i], &empty_occ, net.src, net.dst);
-                let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
-                let field = dijkstra(&work, net.src, h);
-                if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+                pad_set.load(&net.passable_pads);
+                let routed = route_legal(
+                    &mut buf, grid, &pad_set, &no_owner, -1, net.src, net.dst, windows[i],
+                )
+                .or_else(|| {
+                    route_legal(
+                        &mut buf,
+                        grid,
+                        &pad_set,
+                        &no_owner,
+                        -1,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                    )
+                });
+                if let Some((path, _)) = routed {
                     alone_len[i] = unit_cost(&path);
                     alone_path[i] = path;
                 }
@@ -283,7 +473,15 @@ impl Router for NegotiatedRouter {
         let mut best: Option<(usize, Cost, Vec<usize>, Committed)> = None;
         for order in &candidates {
             let committed = legalize_in_order(
-                grid, &mut work, nets, &pad_sets, &group_ids, &paths, order, n_cells,
+                grid,
+                &mut buf,
+                &mut pad_set,
+                nets,
+                &group_ids,
+                &paths,
+                &windows,
+                order,
+                n_cells,
             );
             let routed = committed.iter().filter(|c| c.is_some()).count();
             let total_cost: Cost = committed
@@ -322,11 +520,12 @@ impl Router for NegotiatedRouter {
         let committed = if best_routed < n_nets {
             let rip = ripup_legalize(
                 grid,
-                &mut work,
+                &mut buf,
+                &mut pad_set,
                 nets,
-                &pad_sets,
                 &group_ids,
                 &alone_path,
+                &windows,
                 &best_order,
                 n_cells,
             );
@@ -363,68 +562,101 @@ impl Router for NegotiatedRouter {
     }
 }
 
-/// Overwrite `work`'s cost grid in place with net `i`'s congestion-priced view of
-/// `base`. `present` already excludes net `i`'s own occupancy (its path was
-/// decremented before this call), so `present[c]` is `occ_excl_i(c)` directly.
-fn build_effective_grid(
-    work: &mut Grid,
+/// Route one net for the negotiation phase using on-the-fly congestion pricing —
+/// no grid clone. The cost to ENTER cell `c` is
+/// `SCALE + history[c] + pfac*SCALE*present[c]`, capped strictly below [`OBSTACLE`]
+/// (`present` already excludes this net's own occupancy). A cell is blocked iff it
+/// is a base obstacle that is NOT one of the net's own pads, or it lies outside
+/// `window`. The own endpoints are forced passable. Returns the windowed shortest
+/// path and its (priced) cost, or `None`.
+#[allow(clippy::too_many_arguments)]
+fn route_negotiated(
+    buf: &mut SearchBuf,
     base: &Grid,
-    pads: &std::collections::HashSet<CellIdx>,
+    pads: &PadSet,
     present: &[u32],
     history: &[u32],
     pfac: u32,
-) {
-    for c in 0..base.dims.len() {
-        let ci = c as CellIdx;
-        let cost = if base.is_obstacle(ci) && !pads.contains(&ci) {
-            OBSTACLE
-        } else {
-            let occ = present[c];
-            let priced = (SCALE as u64)
-                .saturating_add(history[c] as u64)
-                .saturating_add((pfac as u64) * (SCALE as u64) * (occ as u64));
-            // Cap strictly below OBSTACLE so a priced cell is still passable.
-            priced.min(OBSTACLE as u64 - 1) as Cost
-        };
-        work.cost[c] = cost;
-    }
-}
-
-/// Overwrite `work` for the legalization reroute of one net: foreign-group cells
-/// (`occupied`) become hard obstacles, the net's own pads are unmasked to
-/// [`FREE_COST`], and the net's own endpoints are always kept passable.
-fn build_legal_grid(
-    work: &mut Grid,
-    base: &Grid,
-    pads: &std::collections::HashSet<CellIdx>,
-    occupied: &[bool],
     src: CellIdx,
     dst: CellIdx,
-) {
-    for (c, slot) in work.cost.iter_mut().enumerate() {
+    window: Window,
+) -> Option<(Vec<CellIdx>, Cost)> {
+    let dims = base.dims;
+    let cost_fn = |c: CellIdx| -> Cost {
+        let ci = c as usize;
+        let priced = (SCALE as u64)
+            .saturating_add(history[ci] as u64)
+            .saturating_add((pfac as u64) * (SCALE as u64) * (present[ci] as u64));
+        priced.min(OBSTACLE as u64 - 1) as Cost
+    };
+    let blocked_fn = |c: CellIdx| -> bool {
+        if !window.contains(dims, c) {
+            return true;
+        }
+        if c == src || c == dst {
+            return false;
+        }
+        base.is_obstacle(c) && !pads.contains(c)
+    };
+    let h = |c: CellIdx| manhattan_scaled(dims, c, dst);
+    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h)
+}
+
+/// Route one net for legalization / rip-up using on-the-fly costs — no grid clone.
+/// Cells owned by a group other than `own_group` are hard obstacles; cells owned by
+/// `own_group` (siblings) and free cells are passable at their base cost. The net's
+/// own pads are unmasked to [`FREE_COST`], its endpoints are always enterable, and
+/// the search is confined to `window`. `owner` may be empty to mean "no owners"
+/// (the alone-path case). Returns the windowed shortest path and its base-cost, or
+/// `None`.
+#[allow(clippy::too_many_arguments)]
+fn route_legal(
+    buf: &mut SearchBuf,
+    base: &Grid,
+    pads: &PadSet,
+    owner: &[i64],
+    own_group: i64,
+    src: CellIdx,
+    dst: CellIdx,
+    window: Window,
+) -> Option<(Vec<CellIdx>, Cost)> {
+    let dims = base.dims;
+    let has_owner = !owner.is_empty();
+    let cost_fn = |c: CellIdx| -> Cost {
         let ci = c as CellIdx;
-        *slot = if occupied[c] {
-            // Foreign-group cells are hard obstacles — even if they are this net's
-            // declared endpoints, since distinct groups may not share any cell.
-            OBSTACLE
-        } else if ci == src || ci == dst {
-            // Own endpoints must be enterable even when they are (own) pad
-            // obstacles in the base grid.
+        if ci == src || ci == dst {
             if base.is_obstacle(ci) {
                 FREE_COST
             } else {
                 base.cost_at(ci)
             }
         } else if base.is_obstacle(ci) {
-            if pads.contains(&ci) {
-                FREE_COST
-            } else {
-                OBSTACLE
-            }
+            // Reachable here only when it is one of the net's own pads (else
+            // blocked_fn rejected it); unmask to FREE_COST.
+            FREE_COST
         } else {
             base.cost_at(ci)
-        };
-    }
+        }
+    };
+    let blocked_fn = |c: CellIdx| -> bool {
+        if !window.contains(dims, c) {
+            return true;
+        }
+        // Foreign-group cells are hard obstacles, even at this net's endpoints —
+        // distinct groups may never share any cell.
+        if has_owner {
+            let o = owner[c as usize];
+            if o >= 0 && o != own_group {
+                return true;
+            }
+        }
+        if c == src || c == dst {
+            return false;
+        }
+        base.is_obstacle(c) && !pads.contains(c)
+    };
+    let h = |c: CellIdx| manhattan_scaled(dims, c, dst);
+    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h)
 }
 
 /// Commit all connection groups in the given `group_order`, returning the
@@ -442,24 +674,30 @@ fn build_legal_grid(
 #[allow(clippy::too_many_arguments)]
 fn legalize_in_order(
     grid: &Grid,
-    work: &mut Grid,
+    buf: &mut SearchBuf,
+    pad_set: &mut PadSet,
     nets: &[NetEndpoints],
-    pad_sets: &[std::collections::HashSet<CellIdx>],
     group_ids: &[usize],
     paths: &[Vec<CellIdx>],
+    windows: &[Window],
     group_order: &[usize],
     n_cells: usize,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
-    let mut occupied: Vec<bool> = vec![false; n_cells];
+    // Owning group per committed cell, or -1 for free. (Replaces the old per-call
+    // `occupied: Vec<bool>`; a cell is a foreign obstacle for net i iff its owner
+    // is a group other than i's.)
+    let mut owner: Vec<i64> = vec![-1; n_cells];
     let mut committed: Committed = vec![None; n_nets];
 
-    // Cells owned by the group currently being committed; reset per group so
-    // sibling sub-nets may overlap freely without blocking each other.
-    let mut group_cells: Vec<bool> = vec![false; n_cells];
+    // Cells claimed by the group currently being committed; folded into `owner`
+    // only after the whole group commits, so sibling sub-nets never block each
+    // other. Tracked as a list (cleared per group) to avoid an O(n_cells) sweep.
+    let mut group_cells: Vec<CellIdx> = Vec::new();
 
     for &g in group_order {
+        let gi = g as i64;
         // Members of this group, in input net order for determinism.
         for i in 0..n_nets {
             if group_ids[i] != g {
@@ -470,32 +708,45 @@ fn legalize_in_order(
             // Prefer the negotiated path if it avoids every foreign-group cell.
             // Endpoints are not exempt: distinct groups may never share any cell.
             let cur = &paths[i];
-            let clean = !cur.is_empty() && cur.iter().all(|&c| !occupied[c as usize]);
+            let clean = !cur.is_empty()
+                && cur.iter().all(|&c| {
+                    let o = owner[c as usize];
+                    o < 0 || o == gi
+                });
 
             let chosen = if clean {
                 Some(cur.clone())
             } else {
-                build_legal_grid(work, grid, &pad_sets[i], &occupied, net.src, net.dst);
-                let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
-                let field = dijkstra(work, net.src, h);
-                reconstruct_path(&field.pred, net.src, net.dst, &field.dist)
+                pad_set.load(&net.passable_pads);
+                route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
+                    .or_else(|| {
+                        route_legal(
+                            buf,
+                            grid,
+                            pad_set,
+                            &owner,
+                            gi,
+                            net.src,
+                            net.dst,
+                            Window::full(dims),
+                        )
+                    })
+                    .map(|(p, _)| p)
             };
 
             if let Some(path) = chosen {
                 for &c in &path {
-                    group_cells[c as usize] = true;
+                    group_cells.push(c);
                 }
                 committed[i] = Some(path);
             }
         }
 
-        // Fold this group's cells into the global obstacle set and reset scratch.
-        for c in 0..n_cells {
-            if group_cells[c] {
-                occupied[c] = true;
-                group_cells[c] = false;
-            }
+        // Fold this group's cells into the owner map and reset scratch.
+        for &c in &group_cells {
+            owner[c as usize] = gi;
         }
+        group_cells.clear();
     }
 
     committed
@@ -527,16 +778,30 @@ fn legalize_in_order(
 #[allow(clippy::too_many_arguments)]
 fn ripup_legalize(
     grid: &Grid,
-    work: &mut Grid,
+    buf: &mut SearchBuf,
+    pad_set: &mut PadSet,
     nets: &[NetEndpoints],
-    pad_sets: &[std::collections::HashSet<CellIdx>],
     group_ids: &[usize],
     alone_path: &[Vec<CellIdx>],
+    windows: &[Window],
     seed_group_order: &[usize],
     n_cells: usize,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
+
+    // A net needs the (expensive) full-board fallback only if its own alone-path
+    // genuinely leaves its window. Nets whose alone-path fits the window never gain
+    // anything from a full-board search (which, when it fails, explores the whole
+    // board) — so we suppress the fallback for them. Nets with an EMPTY alone-path
+    // are individually unroutable on the base grid and can never commit at all.
+    let needs_full: Vec<bool> = (0..n_nets)
+        .map(|i| {
+            !alone_path[i].is_empty()
+                && alone_path[i].iter().any(|&c| !windows[i].contains(dims, c))
+        })
+        .collect();
+    let routable: Vec<bool> = (0..n_nets).map(|i| !alone_path[i].is_empty()).collect();
 
     let mut committed: Committed = vec![None; n_nets];
     // Owning group per cell, or -1 for free. A cell is "owned by another group"
@@ -583,17 +848,42 @@ fn ripup_legalize(
         if committed[i].is_some() {
             continue;
         }
+        // Individually unroutable on the base grid: it can never commit here, and
+        // any search (especially a full-board one) would only fail expensively.
+        if !routable[i] {
+            continue;
+        }
         let net = &nets[i];
         let g = group_ids[i];
+        let gi = g as i64;
 
-        // Build the routing grid: cells owned by OTHER groups are hard obstacles.
-        build_ripup_grid(work, grid, &pad_sets[i], &owner, g, net.src, net.dst);
-        let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
-        let field = dijkstra(work, net.src, h);
+        // Route within the net's window (cells owned by OTHER groups are hard
+        // obstacles), falling back to the full board only for nets whose natural
+        // route genuinely leaves the window — so a stranded global net is never
+        // ripped-around prematurely, without the whole-board failure cost for the
+        // many purely-local nets.
+        pad_set.load(&net.passable_pads);
+        let routed = route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
+            .or_else(|| {
+                if needs_full[i] {
+                    route_legal(
+                        buf,
+                        grid,
+                        pad_set,
+                        &owner,
+                        gi,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                    )
+                } else {
+                    None
+                }
+            });
 
-        if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+        if let Some((path, _)) = routed {
             for &c in &path {
-                owner[c as usize] = g as i64;
+                owner[c as usize] = gi;
             }
             committed[i] = Some(path);
             continue;
@@ -649,11 +939,26 @@ fn ripup_legalize(
         rips_done += 1;
 
         // Re-route i now that the victim's cells are free.
-        build_ripup_grid(work, grid, &pad_sets[i], &owner, g, net.src, net.dst);
-        let field = dijkstra(work, net.src, h);
-        if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+        let rerouted = route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
+            .or_else(|| {
+                if needs_full[i] {
+                    route_legal(
+                        buf,
+                        grid,
+                        pad_set,
+                        &owner,
+                        gi,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                    )
+                } else {
+                    None
+                }
+            });
+        if let Some((path, _)) = rerouted {
             for &c in &path {
-                owner[c as usize] = g as i64;
+                owner[c as usize] = gi;
             }
             committed[i] = Some(path);
         } else {
@@ -665,43 +970,6 @@ fn ripup_legalize(
     }
 
     committed
-}
-
-/// Overwrite `work` for a rip-up reroute of one net in group `own_group`: cells
-/// owned by ANY OTHER group become hard obstacles, the net's own pads are unmasked
-/// to [`FREE_COST`], and the net's own endpoints are always kept passable. Cells
-/// owned by the net's own group (siblings) are NOT obstacles.
-fn build_ripup_grid(
-    work: &mut Grid,
-    base: &Grid,
-    pads: &std::collections::HashSet<CellIdx>,
-    owner: &[i64],
-    own_group: usize,
-    src: CellIdx,
-    dst: CellIdx,
-) {
-    let og = own_group as i64;
-    for (c, slot) in work.cost.iter_mut().enumerate() {
-        let ci = c as CellIdx;
-        let foreign = owner[c] >= 0 && owner[c] != og;
-        *slot = if foreign {
-            OBSTACLE
-        } else if ci == src || ci == dst {
-            if base.is_obstacle(ci) {
-                FREE_COST
-            } else {
-                base.cost_at(ci)
-            }
-        } else if base.is_obstacle(ci) {
-            if pads.contains(&ci) {
-                FREE_COST
-            } else {
-                OBSTACLE
-            }
-        } else {
-            base.cost_at(ci)
-        };
-    }
 }
 
 /// All permutations of `items`, generated in a deterministic order (Heap-free
@@ -1044,6 +1312,56 @@ mod tests {
         assert_eq!(uniq.len(), 24);
     }
 
+    /// A net whose optimal path must leave its bbox+margin window still routes,
+    /// via the full-board retry. We build a tall thin board with a wall that forces
+    /// a long detour far outside the src/dst bounding box, then assert the net
+    /// routes and its path actually exits the window (proving the window alone
+    /// would have failed and the full-board retry rescued it).
+    #[test]
+    fn net_routes_via_full_board_retry_when_path_leaves_window() {
+        // 40 wide, 6 tall. src=(0,0), dst=(2,2): a tiny bbox in the top-left corner,
+        // so the window (margin = max(16, ceil(0.3*2)) = 16) spans x in [0,18]. Row
+        // y=1 is walled for x in 0..=37, leaving the ONLY top<->bottom crossing at
+        // x=38,39 — far outside the window. The net must run right along y=0 to x=39,
+        // drop to y=2, then run left to dst. The windowed search alone fails; the
+        // full-board retry rescues it.
+        let dims = Dims::new(40, 6);
+        let mut gb = GridBuilder::new(dims, 1);
+        for x in 0..=37 {
+            gb.mark_cell(x, 1);
+        }
+        let grid = gb.build();
+
+        let a = net("a", dims.idx(0, 0), dims.idx(2, 2));
+
+        // The window for this net: bbox {(0,0),(2,2)} expanded by margin 16 ->
+        // x in [0,18]. The forced crossing at x=38/39 lies well outside it.
+        let win = net_window(dims, a.src, a.dst, &[]);
+        assert!(
+            win.x1 < 38,
+            "precondition: gap column is outside the window"
+        );
+
+        let br = NegotiatedRouter.route(&grid, &[a.clone()]).unwrap();
+        assert!(
+            br.unrouted.is_empty(),
+            "net must route via the full-board retry: {br:?}"
+        );
+        assert_eq!(br.results.len(), 1);
+        let path = &br.results[0].path;
+        assert_eq!(path.first().copied(), Some(a.src));
+        assert_eq!(path.last().copied(), Some(a.dst));
+        // The path must leave the window (reach the far-right gap column) — proof
+        // that the windowed search alone would have failed.
+        assert!(
+            path.iter().any(|&c| {
+                let (x, _) = dims.xy(c);
+                x > win.x1
+            }),
+            "optimal path must exit the window (reach the far gap)"
+        );
+    }
+
     /// Order-robust legalization: a board where committing net A's group first
     /// strands net B, but committing B's group first routes both. The full router
     /// must find the good order and route BOTH nets.
@@ -1067,10 +1385,6 @@ mod tests {
         // paths that collide on the centre cell (2,2). One commit order strands a
         // net; the other routes both — proving the order genuinely matters.
         let n_cells = dims.len();
-        let pad_sets: Vec<std::collections::HashSet<CellIdx>> = vec![
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-        ];
         let group_ids = vec![0usize, 1usize];
         let nets_ab = [a.clone(), b.clone()];
         let crafted = vec![
@@ -1085,16 +1399,22 @@ mod tests {
             // B: full middle column.
             vec![dims.idx(2, 1), dims.idx(2, 2), dims.idx(2, 3)],
         ];
-        let mut work = grid.clone();
+        let mut buf = SearchBuf::new(n_cells);
+        let mut pad_set = PadSet::new(n_cells);
+        let windows: Vec<Window> = nets_ab
+            .iter()
+            .map(|net| net_window(dims, net.src, net.dst, &net.passable_pads))
+            .collect();
 
         // Order [0,1] = A first: B should be stranded.
         let c_ab = legalize_in_order(
             &grid,
-            &mut work,
+            &mut buf,
+            &mut pad_set,
             &nets_ab,
-            &pad_sets,
             &group_ids,
             &crafted,
+            &windows,
             &[0, 1],
             n_cells,
         );
@@ -1107,11 +1427,12 @@ mod tests {
         // Order [1,0] = B first: both route.
         let c_ba = legalize_in_order(
             &grid,
-            &mut work,
+            &mut buf,
+            &mut pad_set,
             &nets_ab,
-            &pad_sets,
             &group_ids,
             &crafted,
+            &windows,
             &[1, 0],
             n_cells,
         );
