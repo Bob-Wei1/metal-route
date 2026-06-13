@@ -700,6 +700,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mr-drc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "mr-fixtures"
 version = "0.1.0"
 dependencies = [

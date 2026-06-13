@@ -7,6 +7,7 @@ members = [
     "crates/mr-cpu",
     "crates/mr-ingest",
     "crates/mr-srj",
+    "crates/mr-drc",
     "crates/mr-oracle",
     "crates/mr-metal",
     "crates/mr-bench",
@@ -30,6 +31,7 @@ mr-fixtures = { path = "crates/mr-fixtures" }
 mr-cpu = { path = "crates/mr-cpu" }
 mr-ingest = { path = "crates/mr-ingest" }
 mr-srj = { path = "crates/mr-srj" }
+mr-drc = { path = "crates/mr-drc" }
 mr-oracle = { path = "crates/mr-oracle" }
 mr-metal = { path = "crates/mr-metal" }
 mr-bench = { path = "crates/mr-bench" }
