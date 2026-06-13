@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
+use mr_core::{LayerMap, ViaModel};
 use mr_srj::{Bounds, Connection, Obstacle, Point, SimpleRouteJson};
 
 /// Default trace width in mm when the DSN carries no `(rule (width N))`.
@@ -221,11 +222,20 @@ struct Placement {
     rot: f64,
 }
 
-/// A representative pad size (mm) for a padstack.
-#[derive(Debug, Clone, Copy)]
+/// A representative pad geometry for a padstack: a size (mm) plus the copper
+/// layers the padstack's shapes touch.
+///
+/// `layers` is the set of layer NAMES named by the padstack's `(shape (rect
+/// LAYER ...))` / `(circle LAYER ...)` entries, in file order. A through-hole pad
+/// names every signal layer (or uses a `*` / `signal` wildcard); an SMD pad names
+/// exactly one. The wildcard layers `"signal"` / `"*"` are recorded verbatim here
+/// and expanded to the real stackup at emit time (see [`pad_layer_names`]).
+#[derive(Debug, Clone)]
 struct PadSize {
     w: f64,
     h: f64,
+    /// Layer names the padstack's shapes are defined on, in file order.
+    layers: Vec<String>,
 }
 
 /// Parse stats reported alongside the converted problem (for human output).
@@ -248,6 +258,54 @@ pub struct ParseStats {
     pub board_h_mm: f64,
     /// Minimum trace width in mm used for the problem.
     pub min_trace_width_mm: f64,
+    /// Number of distinct via padstacks declared in the DSN structure.
+    pub vias_declared: usize,
+    /// Whether the resolved [`ViaModel`] is a full through-hole model (every
+    /// adjacent step legal). `false` means a restricted blind/buried-only stack.
+    pub vias_through_hole: bool,
+}
+
+/// The complete outcome of a DSN ingest: the routing problem plus the layer
+/// stackup and via model the rasteriser and router need to honour real layer
+/// assignments and via spans.
+///
+/// `srj` carries continuous geometry (obstacles tagged with their real layer
+/// names, connection points tagged with their pad layer). `layer_map` is the
+/// ordered index ↔ name mapping for the `srj.layer_count` copper layers — layer 0
+/// is the first signal layer in DSN file order (typically `F.Cu` / top).
+/// `via_model` describes which layer transitions the router may drill and at what
+/// cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsnIngest {
+    /// The tscircuit routing problem.
+    pub srj: SimpleRouteJson,
+    /// Ordered copper layer names (index ↔ name), built from the DSN stackup.
+    pub layer_map: LayerMap,
+    /// The `(type signal)` layer names in stackup order (poured power planes
+    /// excluded). Signal nets should route only on these; vias bridge adjacent
+    /// signal layers. Equals all layers when the DSN declares no layer types.
+    pub signal_layers: Vec<String>,
+    /// The via model resolved from the DSN via padstacks / structure rules.
+    pub via_model: ViaModel,
+    /// The DSN `(resolution <unit> <divisor>)` unit (e.g. `"um"`). Needed to write
+    /// a coordinate-consistent Specctra session (`.ses`) back out.
+    pub resolution_unit: String,
+    /// The DSN resolution divisor (e.g. `10`). Raw session units per mm are
+    /// `divisor / unit_to_mm(unit)`.
+    pub resolution_divisor: f64,
+    /// Human-readable parse stats.
+    pub stats: ParseStats,
+}
+
+impl DsnIngest {
+    /// Raw DSN/SES coordinate units per millimetre, the inverse of `mm_per_raw`.
+    /// A mm value is written to the session as `round(mm * units_per_mm)`.
+    pub fn units_per_mm(&self) -> f64 {
+        // `unit_to_mm` only fails on an unsupported unit, which `dsn_to_ingest`
+        // already accepted; fall back to the um/10 convention defensively.
+        let unit_mm = unit_to_mm(&self.resolution_unit).unwrap_or(1e-3);
+        self.resolution_divisor / unit_mm
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,11 +327,16 @@ fn unit_to_mm(unit: &str) -> Result<f64> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Parse a Specctra DSN document into a [`SimpleRouteJson`] plus [`ParseStats`].
+/// Parse a Specctra DSN document into a full [`DsnIngest`]: the routing problem,
+/// the [`LayerMap`] stackup, the [`ViaModel`], and [`ParseStats`].
+///
+/// This is the richest entry point — it preserves real per-pad layer assignments
+/// and the via span model. Callers that only want the [`SimpleRouteJson`] (or the
+/// legacy `(srj, stats)` tuple) can use [`dsn_to_srj`] / [`dsn_to_srj_with_stats`].
 ///
 /// See the module docs for the conversion rules. Returns an error if required
 /// sections (resolution, board boundary) are missing or malformed.
-pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseStats)> {
+pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     let root = parse_sexpr(dsn_text).context("failed to parse DSN s-expression")?;
 
     // The root is `(pcb "name" (parser ...) (resolution ...) (structure ...) ...)`.
@@ -311,9 +374,14 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
         .child_named("structure")
         .ok_or_else(|| anyhow!("DSN missing (structure ...)"))?;
 
-    // Layer count: number of (layer NAME (type signal|power) ...) entries.
-    let layer_count = structure.children_named("layer").count() as u32;
-    let layer_count = layer_count.max(1);
+    // Ordered layer NAMES from (layer NAME (type signal|power) ...) entries, in
+    // file order. Layer 0 is the first signal layer (typically F.Cu / top); the
+    // last is the bottom. This drives both `layer_count` and the LayerMap, which
+    // is the single index <-> name authority the rest of the pipeline uses.
+    let layer_names = parse_layer_names(structure);
+    let layer_map = LayerMap::from_names(layer_names);
+    let layer_count = layer_map.len();
+    let signal_layers = parse_signal_layer_names(structure);
 
     // Board bounds from (boundary (path pcb <ap> x1 y1 x2 y2 ...)) or
     // (boundary (rect pcb x1 y1 x2 y2)).
@@ -355,27 +423,31 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
         }
     }
 
-    // Obstacles: one rect per placed pad we know the position of.
+    // Obstacles: one rect per placed pad we know the position of, tagged with the
+    // REAL layer name(s) the pad sits on (through-hole -> all layers, SMD -> one).
     let mut obstacles: Vec<Obstacle> = Vec::with_capacity(pin_pos.len());
     for ((reference, pin_id), (ax, ay, padstack)) in &pin_pos {
-        let size = pad_sizes
-            .get(padstack)
-            .copied()
-            .unwrap_or(PadSize { w: 0.0, h: 0.0 });
+        let size = match pad_sizes.get(padstack) {
+            Some(s) => s,
+            None => continue, // unknown padstack -> no geometry to mask
+        };
         // Skip zero-size pads (no geometry to mask).
         if size.w <= 0.0 || size.h <= 0.0 {
             continue;
         }
+        let layers = pad_layer_names(&size.layers, &layer_map);
+        // The obstacle's representative point layer is its first (top-most) layer.
+        let point_layer = layers.first().cloned();
         obstacles.push(Obstacle {
             kind: "rect".to_string(),
             center: Point {
                 x: *ax,
                 y: *ay,
-                layer: Some("top".to_string()),
+                layer: point_layer,
             },
             width: size.w,
             height: size.h,
-            layers: vec!["top".to_string()],
+            layers,
             connected_to: vec![format!("{reference}-{pin_id}")],
         });
     }
@@ -390,11 +462,19 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
     for (net_name, pin_refs) in &nets {
         let mut points = Vec::new();
         for (reference, pin_id) in pin_refs {
-            if let Some((ax, ay, _)) = pin_pos.get(&(reference.clone(), pin_id.clone())) {
+            if let Some((ax, ay, padstack)) = pin_pos.get(&(reference.clone(), pin_id.clone())) {
+                // The connection point's layer is its pad's actual (top-most)
+                // layer. Through-hole pins resolve to the top layer; SMD pins to
+                // whichever single layer they live on.
+                let layer = pad_sizes
+                    .get(padstack)
+                    .map(|s| pad_layer_names(&s.layers, &layer_map))
+                    .and_then(|ls| ls.into_iter().next())
+                    .or_else(|| Some(layer_map.name(0).to_string()));
                 points.push(Point {
                     x: *ax,
                     y: *ay,
-                    layer: Some("top".to_string()),
+                    layer,
                 });
             }
         }
@@ -408,6 +488,12 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
         });
     }
 
+    // Via model: read the DSN via padstacks (their layer spans) and structure
+    // rules. All-through-hole -> ViaModel::through_hole; declared blind/buried
+    // spans -> a restricted model permitting exactly those adjacent steps.
+    let (via_model, vias_declared) = parse_via_model(pcb, structure, layer_count, &layer_map);
+    let vias_through_hole = via_model == ViaModel::through_hole(layer_count);
+
     let stats = ParseStats {
         layers: layer_count,
         components: placements.len(),
@@ -417,6 +503,8 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
         board_w_mm: bounds.max_x - bounds.min_x,
         board_h_mm: bounds.max_y - bounds.min_y,
         min_trace_width_mm,
+        vias_declared,
+        vias_through_hole,
     };
 
     let srj = SimpleRouteJson {
@@ -427,7 +515,15 @@ pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseSt
         bounds,
     };
 
-    Ok((srj, stats))
+    Ok(DsnIngest {
+        srj,
+        layer_map,
+        signal_layers,
+        via_model,
+        resolution_unit: unit.to_string(),
+        resolution_divisor: divisor,
+        stats,
+    })
 }
 
 /// Translate `base_mm` (already mm) by `offset_mm` (already mm). The placement
@@ -438,14 +534,214 @@ fn to_mm_translate(base_mm: f64, offset_mm: f64) -> f64 {
     base_mm + offset_mm
 }
 
-/// Parse a DSN document into a [`SimpleRouteJson`], discarding stats.
+/// Parse a Specctra DSN document into a [`SimpleRouteJson`] plus [`ParseStats`].
+///
+/// Back-compat shim over [`dsn_to_ingest`]; drops the [`LayerMap`] / [`ViaModel`].
+/// Prefer [`dsn_to_ingest`] when you need real layer/via data.
+pub fn dsn_to_srj_with_stats(dsn_text: &str) -> Result<(SimpleRouteJson, ParseStats)> {
+    let ingest = dsn_to_ingest(dsn_text)?;
+    Ok((ingest.srj, ingest.stats))
+}
+
+/// Parse a DSN document into a [`SimpleRouteJson`], discarding everything else.
 pub fn dsn_to_srj(dsn_text: &str) -> Result<SimpleRouteJson> {
-    Ok(dsn_to_srj_with_stats(dsn_text)?.0)
+    Ok(dsn_to_ingest(dsn_text)?.srj)
 }
 
 // ---------------------------------------------------------------------------
 // Section parsers
 // ---------------------------------------------------------------------------
+
+/// Ordered copper layer names from `(structure (layer NAME (type ...)))` entries,
+/// in file order. The DSN names them top-to-bottom (F.Cu first, B.Cu last), which
+/// is exactly the index order the [`LayerMap`] / routing grid want. Empty input
+/// is left empty for [`LayerMap::from_names`] to promote to a single `"top"`.
+fn parse_layer_names(structure: &Sexpr) -> Vec<String> {
+    let mut names = Vec::new();
+    for layer in structure.children_named("layer") {
+        if let Some(name) = layer.as_list().and_then(|l| l.get(1)).and_then(|n| n.as_atom()) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The names of the `(type signal)` layers, in stackup (file) order. Power/plane
+/// layers (`(type power)`) are excluded — signal traces never route on a poured
+/// plane. Falls back to ALL layers when no `(type ...)` is declared (so a DSN
+/// without explicit types still routes on every layer, as before).
+fn parse_signal_layer_names(structure: &Sexpr) -> Vec<String> {
+    let mut signal = Vec::new();
+    let mut saw_type = false;
+    for layer in structure.children_named("layer") {
+        let Some(name) = layer.as_list().and_then(|l| l.get(1)).and_then(|n| n.as_atom()) else {
+            continue;
+        };
+        let ty = layer
+            .child_named("type")
+            .and_then(|t| t.as_list())
+            .and_then(|l| l.get(1))
+            .and_then(|n| n.as_atom());
+        if let Some(ty) = ty {
+            saw_type = true;
+            if ty == "signal" {
+                signal.push(name.to_string());
+            }
+        }
+    }
+    if !saw_type || signal.is_empty() {
+        parse_layer_names(structure)
+    } else {
+        signal
+    }
+}
+
+/// Resolve a padstack's declared shape layers to the REAL stackup layer names a
+/// pad obstacle should occupy, in top-to-bottom (grid index) order.
+///
+/// - A padstack naming layers present in the [`LayerMap`] keeps exactly those,
+///   re-sorted into stackup index order (so e.g. `[B.Cu, F.Cu]` becomes
+///   `[F.Cu, B.Cu]`).
+/// - A through-hole wildcard (`signal`, `*`, `all`, or naming every layer) spans
+///   the whole stack -> every layer name.
+/// - If nothing resolves (unknown / empty), we fall back to the top layer name,
+///   preserving the historical single-`top` behaviour for that pad.
+fn pad_layer_names(declared: &[String], layer_map: &LayerMap) -> Vec<String> {
+    let count = layer_map.len();
+    let all = || (0..count).map(|i| layer_map.name(i).to_string()).collect::<Vec<_>>();
+
+    // Through-hole wildcard span.
+    let is_wildcard = |s: &str| {
+        let s = s.to_ascii_lowercase();
+        s == "signal" || s == "*" || s == "all" || s == "@1" || s.is_empty()
+    };
+    if declared.iter().any(|d| is_wildcard(d)) {
+        return all();
+    }
+
+    // Collect the indices of declared layers that exist in the stackup.
+    let mut indices: Vec<u32> = declared
+        .iter()
+        .filter_map(|d| layer_map.index_of(d))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    if indices.is_empty() {
+        // Nothing recognised: fall back to the top layer name (legacy behaviour).
+        return vec![layer_map.name(0).to_string()];
+    }
+    // A padstack that names every layer is a through-hole pad spanning the stack.
+    if indices.len() as u32 == count {
+        return all();
+    }
+    indices
+        .into_iter()
+        .map(|i| layer_map.name(i).to_string())
+        .collect()
+}
+
+/// Resolve the board's [`ViaModel`] from the DSN via padstacks and structure
+/// rules, returning the model plus the count of distinct via padstacks declared.
+///
+/// DSN declares the usable vias in `(structure (via "ps1" "ps2" ...))`; each named
+/// padstack lives in the library with shapes on the layers it touches. We map each
+/// via padstack to its `[lo, hi]` layer span:
+///
+/// - If every declared via spans the full stack (top..bottom) — the common case,
+///   e.g. an 8-layer through-hole bed-of-nails board — we return
+///   [`ViaModel::through_hole`]: every adjacent step legal.
+/// - If blind/buried spans are declared, we return
+///   [`ViaModel::with_allowed_steps`] permitting exactly the adjacent steps those
+///   spans cover (a span `[lo, hi]` contributes the steps `lo..hi`).
+/// - When no vias are declared, or spans are ambiguous, we default to through-hole.
+fn parse_via_model(
+    pcb: &Sexpr,
+    structure: &Sexpr,
+    layer_count: u32,
+    layer_map: &LayerMap,
+) -> (ViaModel, usize) {
+    // Names of via padstacks the structure says may be placed.
+    let via_names: Vec<String> = structure
+        .child_named("via")
+        .and_then(|v| v.as_list())
+        .map(|items| {
+            items
+                .iter()
+                .skip(1)
+                .filter_map(|n| n.as_atom())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Padstack name -> layer names it touches, for via padstacks (incl. plated
+    // shapes; we reuse the same library shape parsing).
+    let library = pcb.child_named("library");
+    let via_span = |name: &str| -> Option<(u32, u32)> {
+        let lib = library?;
+        for ps in lib.children_named("padstack") {
+            let items = ps.as_list()?;
+            if items.get(1).and_then(|n| n.as_atom()) != Some(name) {
+                continue;
+            }
+            let mut idxs: Vec<u32> = Vec::new();
+            let mut wildcard = false;
+            for shape in ps.children_named("shape") {
+                let inner = shape
+                    .child_named("circle")
+                    .or_else(|| shape.child_named("rect"));
+                if let Some(layer) = inner.and_then(shape_layer) {
+                    let l = layer.to_ascii_lowercase();
+                    if l == "signal" || l == "*" || l == "all" {
+                        wildcard = true;
+                    } else if let Some(i) = layer_map.index_of(&layer) {
+                        idxs.push(i);
+                    }
+                }
+            }
+            if wildcard {
+                return Some((0, layer_count.saturating_sub(1)));
+            }
+            if idxs.is_empty() {
+                return None;
+            }
+            return Some((*idxs.iter().min().unwrap(), *idxs.iter().max().unwrap()));
+        }
+        None
+    };
+
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for name in &via_names {
+        if let Some(span) = via_span(name) {
+            spans.push(span);
+        }
+    }
+    let declared = via_names.len();
+
+    // No resolvable spans, or every span is full-stack -> through-hole.
+    let full = (0u32, layer_count.saturating_sub(1));
+    let all_through = !spans.is_empty() && spans.iter().all(|&s| s == full);
+    if spans.is_empty() || all_through {
+        return (ViaModel::through_hole(layer_count), declared);
+    }
+
+    // Restricted stack: permit exactly the adjacent steps the declared spans cover.
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    for &(lo, hi) in &spans {
+        for s in lo..hi {
+            let step = (s, s + 1);
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+    }
+    steps.sort_unstable();
+    (
+        ViaModel::with_allowed_steps(layer_count, ViaModel::DEFAULT_STEP_COST, steps),
+        declared,
+    )
+}
 
 /// Bounding box of the board boundary polygon / rect, in mm.
 fn parse_bounds(structure: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<Bounds> {
@@ -510,7 +806,21 @@ fn parse_rule_width(pcb: &Sexpr, structure: &Sexpr, to_mm: &impl Fn(f64) -> f64)
     find(structure).or_else(|| find(pcb))
 }
 
-/// Padstack name -> representative pad size (mm). Uses the first shape found.
+/// The layer atom named by a `(circle LAYER ...)` / `(rect LAYER ...)` shape.
+fn shape_layer(shape_inner: &Sexpr) -> Option<String> {
+    shape_inner
+        .as_list()?
+        .get(1)
+        .and_then(|n| n.as_atom())
+        .map(str::to_string)
+}
+
+/// Padstack name -> representative pad size (mm) + the layers it touches.
+///
+/// Size uses the first sizeable shape found. Layers are the set of distinct layer
+/// names across ALL of the padstack's shapes, in file order: an SMD padstack names
+/// one layer, a through-hole padstack names every signal layer (or a `signal` /
+/// `*` wildcard). Wildcards are recorded verbatim and expanded at emit time.
 fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<String, PadSize>> {
     let mut sizes = HashMap::new();
     let library = match pcb.child_named("library") {
@@ -523,44 +833,57 @@ fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<S
             Some(n) => n.to_string(),
             None => continue,
         };
-        // Find the first (shape (circle ...)|(rect ...)) we can size.
-        let mut size: Option<PadSize> = None;
+        // Find the first sizeable shape, and collect every shape's layer name.
+        let mut size: Option<(f64, f64)> = None;
+        let mut layers: Vec<String> = Vec::new();
         for shape in ps.children_named("shape") {
             if let Some(circle) = shape.child_named("circle") {
                 // (circle LAYER dia [x y]).
-                let nums: Vec<f64> = circle
-                    .as_list()
-                    .unwrap()
-                    .iter()
-                    .skip(2)
-                    .filter_map(|n| n.as_atom())
-                    .filter_map(|s| s.parse::<f64>().ok())
-                    .collect();
-                if let Some(&dia) = nums.first() {
-                    let d = to_mm(dia);
-                    size = Some(PadSize { w: d, h: d });
-                    break;
+                if let Some(layer) = shape_layer(circle) {
+                    if !layers.contains(&layer) {
+                        layers.push(layer);
+                    }
+                }
+                if size.is_none() {
+                    let nums: Vec<f64> = circle
+                        .as_list()
+                        .unwrap()
+                        .iter()
+                        .skip(2)
+                        .filter_map(|n| n.as_atom())
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .collect();
+                    if let Some(&dia) = nums.first() {
+                        let d = to_mm(dia);
+                        size = Some((d, d));
+                    }
                 }
             } else if let Some(rect) = shape.child_named("rect") {
                 // (rect LAYER x1 y1 x2 y2).
-                let nums: Vec<f64> = rect
-                    .as_list()
-                    .unwrap()
-                    .iter()
-                    .skip(2)
-                    .filter_map(|n| n.as_atom())
-                    .filter_map(|s| s.parse::<f64>().ok())
-                    .collect();
-                if nums.len() >= 4 {
-                    let w = to_mm((nums[2] - nums[0]).abs());
-                    let h = to_mm((nums[3] - nums[1]).abs());
-                    size = Some(PadSize { w, h });
-                    break;
+                if let Some(layer) = shape_layer(rect) {
+                    if !layers.contains(&layer) {
+                        layers.push(layer);
+                    }
+                }
+                if size.is_none() {
+                    let nums: Vec<f64> = rect
+                        .as_list()
+                        .unwrap()
+                        .iter()
+                        .skip(2)
+                        .filter_map(|n| n.as_atom())
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .collect();
+                    if nums.len() >= 4 {
+                        let w = to_mm((nums[2] - nums[0]).abs());
+                        let h = to_mm((nums[3] - nums[1]).abs());
+                        size = Some((w, h));
+                    }
                 }
             }
         }
-        if let Some(s) = size {
-            sizes.insert(name, s);
+        if let Some((w, h)) = size {
+            sizes.insert(name, PadSize { w, h, layers });
         }
     }
     Ok(sizes)
@@ -938,5 +1261,194 @@ mod tests {
         let dsn =
             r#"(pcb "x" (structure (layer F.Cu (type signal)) (boundary (rect pcb 0 0 1 1))))"#;
         assert!(dsn_to_srj(dsn).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-layer ingest: real layer assignment + via model (Track D)
+    // -----------------------------------------------------------------------
+
+    /// A 2-layer board with three padstacks:
+    /// - `ps_smd_top`: a rect on F.Cu only (an SMD pad on the top layer).
+    /// - `ps_smd_bot`: a rect on B.Cu only (an SMD pad on the bottom layer).
+    /// - `ps_th`: circles on BOTH F.Cu and B.Cu (a through-hole pad spanning the
+    ///   stack), reused as the via padstack declared in `(structure (via ...))`.
+    const MULTILAYER: &str = r#"
+    (pcb "ml.dsn"
+      (resolution mm 1000)
+      (structure
+        (layer F.Cu (type signal))
+        (layer B.Cu (type signal))
+        (boundary (rect pcb 0 0 20000 20000))
+        (via "ps_th")
+        (rule (width 150))
+      )
+      (placement
+        (component "img_t" (place T 5000 5000 front 0))
+        (component "img_b" (place B 15000 5000 front 0))
+        (component "img_h" (place H 10000 10000 front 0))
+      )
+      (library
+        (image "img_t" (pin "ps_smd_top" 1 0 0))
+        (image "img_b" (pin "ps_smd_bot" 1 0 0))
+        (image "img_h" (pin "ps_th" 1 0 0))
+        (padstack "ps_smd_top" (shape (rect F.Cu -500 -250 500 250)))
+        (padstack "ps_smd_bot" (shape (rect B.Cu -500 -250 500 250)))
+        (padstack "ps_th"
+          (shape (circle F.Cu 600 0 0))
+          (shape (circle B.Cu 600 0 0))
+        )
+      )
+      (network
+        (net "N1" (pins T-1 B-1 H-1))
+      )
+    )
+    "#;
+
+    #[test]
+    fn multilayer_layer_map_is_file_ordered() {
+        let ingest = dsn_to_ingest(MULTILAYER).unwrap();
+        // Two signal layers, named in DSN file order: F.Cu (top, index 0), B.Cu.
+        assert_eq!(ingest.srj.layer_count, 2);
+        assert_eq!(ingest.layer_map.len(), 2);
+        assert_eq!(ingest.layer_map.name(0), "F.Cu");
+        assert_eq!(ingest.layer_map.name(1), "B.Cu");
+        assert_eq!(ingest.layer_map.index_of("B.Cu"), Some(1));
+    }
+
+    #[test]
+    fn smd_pad_lands_on_its_real_layer() {
+        let ingest = dsn_to_ingest(MULTILAYER).unwrap();
+        // The bottom SMD pad B-1 must occupy ONLY B.Cu, and its point.layer is B.Cu.
+        let b = ingest
+            .srj
+            .obstacles
+            .iter()
+            .find(|o| o.connected_to == vec!["B-1".to_string()])
+            .expect("B-1 obstacle present");
+        assert_eq!(b.layers, vec!["B.Cu".to_string()]);
+        assert_eq!(b.center.layer.as_deref(), Some("B.Cu"));
+
+        // The top SMD pad T-1 occupies only F.Cu.
+        let t = ingest
+            .srj
+            .obstacles
+            .iter()
+            .find(|o| o.connected_to == vec!["T-1".to_string()])
+            .unwrap();
+        assert_eq!(t.layers, vec!["F.Cu".to_string()]);
+        assert_eq!(t.center.layer.as_deref(), Some("F.Cu"));
+    }
+
+    #[test]
+    fn through_hole_pad_spans_all_layers() {
+        let ingest = dsn_to_ingest(MULTILAYER).unwrap();
+        // The through-hole pad H-1 names both layers -> spans both, top-first.
+        let h = ingest
+            .srj
+            .obstacles
+            .iter()
+            .find(|o| o.connected_to == vec!["H-1".to_string()])
+            .expect("H-1 obstacle present");
+        assert_eq!(h.layers, vec!["F.Cu".to_string(), "B.Cu".to_string()]);
+        // Its representative point sits on the top-most layer.
+        assert_eq!(h.center.layer.as_deref(), Some("F.Cu"));
+    }
+
+    #[test]
+    fn connection_point_layers_follow_their_pad() {
+        let ingest = dsn_to_ingest(MULTILAYER).unwrap();
+        let n1 = &ingest.srj.connections[0];
+        assert_eq!(n1.name, "N1");
+        // Points are listed in net order: T-1 (F.Cu), B-1 (B.Cu), H-1 (F.Cu top).
+        let layers: Vec<Option<&str>> = n1
+            .points_to_connect
+            .iter()
+            .map(|p| p.layer.as_deref())
+            .collect();
+        assert_eq!(layers, vec![Some("F.Cu"), Some("B.Cu"), Some("F.Cu")]);
+    }
+
+    #[test]
+    fn all_through_hole_via_model_matches_through_hole() {
+        let ingest = dsn_to_ingest(MULTILAYER).unwrap();
+        // The only declared via (ps_th) spans top..bottom -> through-hole model.
+        assert_eq!(ingest.via_model, ViaModel::through_hole(2));
+        assert_eq!(ingest.stats.vias_declared, 1);
+        assert!(ingest.stats.vias_through_hole);
+        // Every adjacent step legal (the through-hole semantics).
+        assert!(ingest.via_model.is_step_legal(0, 1));
+    }
+
+    #[test]
+    fn no_declared_vias_defaults_to_through_hole() {
+        // A board with layers but no (structure (via ...)) still yields a usable
+        // through-hole model over the declared layer count.
+        let dsn = r#"
+        (pcb "nv.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (layer In1.Cu (type signal))
+            (layer B.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+          )
+          (placement)
+          (library)
+          (network)
+        )
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.layer_map.len(), 3);
+        assert_eq!(ingest.via_model, ViaModel::through_hole(3));
+        assert_eq!(ingest.stats.vias_declared, 0);
+        assert!(ingest.stats.vias_through_hole);
+    }
+
+    #[test]
+    fn blind_buried_via_spans_restrict_steps() {
+        // A 4-layer board declaring only a buried 2-3 via (In1.Cu..In2.Cu) ->
+        // a restricted model: only the (1,2) adjacent step is drillable.
+        let dsn = r#"
+        (pcb "bb.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (layer In1.Cu (type signal))
+            (layer In2.Cu (type signal))
+            (layer B.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "ps_buried")
+          )
+          (placement)
+          (library
+            (padstack "ps_buried"
+              (shape (circle In1.Cu 400 0 0))
+              (shape (circle In2.Cu 400 0 0))
+            )
+          )
+          (network)
+        )
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert!(!ingest.stats.vias_through_hole);
+        let v = &ingest.via_model;
+        // Only the inner 1-2 step (In1.Cu..In2.Cu) is legal.
+        assert!(v.is_step_legal(1, 2));
+        assert!(!v.is_step_legal(0, 1), "top step not drilled");
+        assert!(!v.is_step_legal(2, 3), "bottom step not drilled");
+    }
+
+    #[test]
+    fn through_hole_wildcard_padstack_spans_stack() {
+        // A padstack using the `signal` wildcard layer should span the full stack.
+        let ingest = pad_layer_names(
+            &["signal".to_string()],
+            &LayerMap::from_names(vec![
+                "F.Cu".into(),
+                "In1.Cu".into(),
+                "B.Cu".into(),
+            ]),
+        );
+        assert_eq!(ingest, vec!["F.Cu", "In1.Cu", "B.Cu"]);
     }
 }

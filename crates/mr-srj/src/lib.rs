@@ -36,7 +36,7 @@
 
 use std::collections::HashMap;
 
-use mr_core::{BoardRoute, CellIdx, Dims, Grid, NetEndpoints};
+use mr_core::{BoardRoute, CellIdx, Dims, Grid, LayerMap, NetEndpoints};
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -121,11 +121,20 @@ pub struct Mapping {
 }
 
 impl Mapping {
-    /// Build the mapping for `bounds` at the given `resolution`.
+    /// Build a single-layer mapping for `bounds` at the given `resolution`.
     ///
     /// Dimensions are `ceil(span / resolution)`, floored at 1 on each axis so a
-    /// zero- or negative-area bounds still yields a 1×1 grid.
+    /// zero- or negative-area bounds still yields a 1×1 grid. Use
+    /// [`Mapping::with_layers`] for a multi-layer board; this remains single-layer
+    /// so every existing 2D caller is byte-identical.
     pub fn new(bounds: &Bounds, resolution: f64) -> Self {
+        Self::with_layers(bounds, resolution, 1)
+    }
+
+    /// Build a mapping for `bounds` at `resolution` over `layers` stacked planes.
+    /// The planar (x, y) sizing is identical to [`Mapping::new`]; only the layer
+    /// axis grows. `layers == 1` is byte-identical to [`Mapping::new`].
+    pub fn with_layers(bounds: &Bounds, resolution: f64, layers: u32) -> Self {
         let span_x = (bounds.max_x - bounds.min_x).max(0.0);
         let span_y = (bounds.max_y - bounds.min_y).max(0.0);
         let w = ((span_x / resolution).ceil() as u32).max(1);
@@ -134,11 +143,13 @@ impl Mapping {
             origin_x: bounds.min_x,
             origin_y: bounds.min_y,
             resolution,
-            dims: Dims::new(w, h),
+            dims: Dims::with_layers(w, h, layers),
         }
     }
 
-    /// Continuous centre of cell `cell`.
+    /// Continuous centre of cell `cell`. The layer is ignored — every layer shares
+    /// the same planar geometry — so a cell and its via-neighbour on another layer
+    /// map to the same continuous `(x, y)`.
     pub fn cell_center(&self, cell: CellIdx) -> (f64, f64) {
         let (x, y) = self.dims.xy(cell);
         (
@@ -147,10 +158,23 @@ impl Mapping {
         )
     }
 
-    /// Cell containing continuous point `(x, y)`, clamped into the grid.
+    /// Layer of `cell` (0 == top). Always 0 for a single-layer mapping.
+    pub fn cell_layer(&self, cell: CellIdx) -> u32 {
+        self.dims.layer_of(cell)
+    }
+
+    /// Cell on layer 0 containing continuous point `(x, y)`, clamped into the grid.
+    /// See [`Mapping::point_to_cell_layer`] to target a specific layer.
     pub fn point_to_cell(&self, point: (f64, f64)) -> CellIdx {
+        self.point_to_cell_layer(point, 0)
+    }
+
+    /// Cell on `layer` containing continuous point `(x, y)`, clamped into the grid.
+    /// The layer is clamped to the last valid layer.
+    pub fn point_to_cell_layer(&self, point: (f64, f64), layer: u32) -> CellIdx {
         let (cx, cy) = self.point_to_xy(point);
-        self.dims.idx(cx, cy)
+        let l = layer.min(self.dims.layers.saturating_sub(1));
+        self.dims.idx3(cx, cy, l)
     }
 
     /// Cell `(x, y)` containing a continuous point, clamped into the grid.
@@ -178,6 +202,10 @@ pub struct RasterizedProblem {
     pub grid: Grid,
     pub nets: Vec<NetEndpoints>,
     pub mapping: Mapping,
+    /// The board's ordered layer names (index ↔ name). For a single-layer problem
+    /// this is `["top"]`. Pass it to [`to_solution_layered`] so emitted vertices
+    /// and vias carry the right layer names.
+    pub layers: LayerMap,
     /// Exact continuous `(x, y)` of every connection endpoint, keyed by the cell
     /// it rasterised to. Used by [`to_solution`] to snap each trace's first/last
     /// vertex back to the exact port coordinate so connectivity checks
@@ -191,18 +219,40 @@ pub struct RasterizedProblem {
 /// See the module docs for the dimension, obstacle-overlap, and k-point
 /// decomposition rules.
 pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
-    let mapping = Mapping::new(&srj.bounds, resolution);
+    // The board's layer axis. `layer_count == 1` yields `["top"]`, so every
+    // single-layer construction below collapses onto layer 0 and is byte-identical
+    // to the pre-layers path.
+    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count))
+}
+
+/// (B3) Rasterise with an explicit [`LayerMap`] — use this when the layer *names*
+/// are not the standard `top`/`inner_N`/`bottom` (e.g. a Specctra DSN's `F.Cu` /
+/// `B.Cu` stackup), so each [`Point`]/[`Obstacle`]'s named layer resolves to the
+/// right grid plane instead of collapsing onto layer 0. The grid is built with
+/// `layers.len()` planes; `rasterize` is the standard-naming special case.
+pub fn rasterize_with_layers(
+    srj: &SimpleRouteJson,
+    resolution: f64,
+    layers: LayerMap,
+) -> RasterizedProblem {
+    let layer_count = layers.len();
+    let mapping = Mapping::with_layers(&srj.bounds, resolution, layer_count);
     let mut builder = GridBuilder::new(mapping.dims, 1);
 
-    // Collect every connection endpoint as a continuous (x, y). These are the
-    // pad centres we must connect. The pad each endpoint sits in IS marked as an
+    // Collect every connection endpoint as `(x, y, layer)`. These are the pad
+    // centres we must connect; the resolved layer is the named `Point.layer`
+    // (default "top" / layer 0). The pad each endpoint sits in IS marked as an
     // obstacle in the base grid (correct DRC model: all pads are obstacles); the
     // router later unmasks each net's own pad cells via `passable_pads` so a net
     // may escape its own pads but cannot run through a foreign net's pad.
-    let endpoints: Vec<(f64, f64)> = srj
+    let endpoints: Vec<(f64, f64, u32)> = srj
         .connections
         .iter()
-        .flat_map(|conn| conn.points_to_connect.iter().map(|p| (p.x, p.y)))
+        .flat_map(|conn| {
+            conn.points_to_connect
+                .iter()
+                .map(|p| (p.x, p.y, point_layer(p, &layers)))
+        })
         .collect();
 
     for obs in &srj.obstacles {
@@ -221,26 +271,65 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         if x1 < x0 || y1 < y0 {
             continue;
         }
-        builder.mark_rect(x0, y0, x1, y1);
+        // Place the obstacle on each layer it names; an empty or unknown layer
+        // list falls back to ALL layers (so a single-layer "top" fixture blocks
+        // layer 0 exactly as before).
+        for layer in obstacle_layers(obs, &layers) {
+            builder.mark_rect_layer(x0, y0, x1, y1, layer);
+        }
     }
 
     // Record each endpoint's exact continuous coordinate so `to_solution` can
-    // snap traces back to the port. Endpoint cells stay obstacles in the base
-    // grid; the router unmasks each net's own pad cells per net.
+    // snap traces back to the port, keyed by the endpoint's own (layered) cell.
+    // Endpoint cells stay obstacles in the base grid; the router unmasks each
+    // net's own pad cells per net.
     let mut pin_points: HashMap<CellIdx, (f64, f64)> = HashMap::new();
-    for &(px, py) in &endpoints {
-        let cell = mapping.point_to_cell((px, py));
+    for &(px, py, layer) in &endpoints {
+        let cell = mapping.point_to_cell_layer((px, py), layer);
         pin_points.insert(cell, (px, py));
     }
 
+    // TODO(via-keepout): when a ViaModel carries keepout > 0, stamp that clearance
+    // around via-capable cells on the layers a via passes through. For this first
+    // cut keepout defaults to 0 (treated as the existing board clearance) and no
+    // extra via reservation is made here.
+
     let grid = builder.build();
-    let nets = decompose_connections(&srj.connections, &mapping, &srj.obstacles);
+    let nets = decompose_connections(&srj.connections, &mapping, &srj.obstacles, &layers);
 
     RasterizedProblem {
         grid,
         nets,
         mapping,
+        layers,
         pin_points,
+    }
+}
+
+/// Resolve a [`Point`]'s grid layer from its optional named `layer`, defaulting to
+/// layer 0 ("top") when absent or unknown.
+fn point_layer(p: &Point, layers: &LayerMap) -> u32 {
+    p.layer
+        .as_deref()
+        .and_then(|name| layers.index_of(name))
+        .unwrap_or(0)
+}
+
+/// The grid layers an [`Obstacle`] occupies. Each named layer maps via the
+/// [`LayerMap`]; an empty list, or a list of only unknown names, falls back to
+/// ALL layers. Returned ascending and deduplicated.
+fn obstacle_layers(obs: &Obstacle, layers: &LayerMap) -> Vec<u32> {
+    let mut out: Vec<u32> = obs
+        .layers
+        .iter()
+        .filter_map(|name| layers.index_of(name))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        (0..layers.len()).collect()
+    } else {
+        out
     }
 }
 
@@ -250,6 +339,7 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// ascending [`CellIdx`] order, deduplicated, for deterministic serialisation.
 fn pad_cells_for_point(
     point: (f64, f64),
+    layer: u32,
     mapping: &Mapping,
     obstacles: &[Obstacle],
 ) -> Vec<CellIdx> {
@@ -270,14 +360,16 @@ fn pad_cells_for_point(
         if x1 < x0 || y1 < y0 {
             continue;
         }
+        // Unmask the pad only on the endpoint's own layer: the net escapes through
+        // its pad on the layer it connects, not on every layer the pad spans.
         for y in y0..=y1 {
             for x in x0..=x1 {
-                cells.push(mapping.dims.idx(x, y));
+                cells.push(mapping.dims.idx3(x, y, layer));
             }
         }
     }
-    // Always include the endpoint's own rasterised cell.
-    cells.push(mapping.point_to_cell((px, py)));
+    // Always include the endpoint's own rasterised (layered) cell.
+    cells.push(mapping.point_to_cell_layer((px, py), layer));
     cells.sort_unstable();
     cells.dedup();
     cells
@@ -300,6 +392,7 @@ fn decompose_connections(
     connections: &[Connection],
     mapping: &Mapping,
     obstacles: &[Obstacle],
+    layers: &LayerMap,
 ) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
@@ -309,17 +402,22 @@ fn decompose_connections(
         }
         let segments = pts.len() - 1;
         for (seg, win) in pts.windows(2).enumerate() {
-            let src = mapping.point_to_cell((win[0].x, win[0].y));
-            let dst = mapping.point_to_cell((win[1].x, win[1].y));
+            let src_layer = point_layer(&win[0], layers);
+            let dst_layer = point_layer(&win[1], layers);
+            let src = mapping.point_to_cell_layer((win[0].x, win[0].y), src_layer);
+            let dst = mapping.point_to_cell_layer((win[1].x, win[1].y), dst_layer);
             let net = if segments == 1 {
                 conn.name.clone()
             } else {
                 format!("{}#{}", conn.name, seg)
             };
-            // Union of the src and dst pad cells, sorted + deduped.
-            let mut passable_pads = pad_cells_for_point((win[0].x, win[0].y), mapping, obstacles);
+            // Union of the src and dst pad cells (each on its endpoint's layer),
+            // sorted + deduped.
+            let mut passable_pads =
+                pad_cells_for_point((win[0].x, win[0].y), src_layer, mapping, obstacles);
             passable_pads.extend(pad_cells_for_point(
                 (win[1].x, win[1].y),
+                dst_layer,
                 mapping,
                 obstacles,
             ));
@@ -376,17 +474,12 @@ impl PcbTrace {
     }
 }
 
-/// (B4) De-rasterise a routed board into a tscircuit solution soup.
+/// (B4) De-rasterise a routed board into a *single-layer* tscircuit solution soup.
 ///
-/// Each [`mr_core::RouteResult`] becomes one [`PcbTrace`] whose route is the
-/// sequence of wire vertices at the continuous cell centres of its path. This is
-/// single-layer for now: every vertex is on `layer` and no vias are emitted.
-///
-/// The first and last vertex of every trace are snapped to the *exact* port
-/// coordinate via `pin_points` (keyed by the endpoint cell) so the harness'
-/// connectivity check (`distance(port, vertex) < 0.01`) matches. Interior
-/// vertices stay at cell centres; an endpoint cell missing from `pin_points`
-/// falls back to its cell centre.
+/// Backward-compatible entry point: every vertex is emitted on `layer` and no vias
+/// are produced. Prefer [`to_solution_layered`] for multi-layer boards — this just
+/// delegates to it with a one-element [`LayerMap`] named `layer`, so a single-layer
+/// path produces byte-identical output to before vias existed.
 pub fn to_solution(
     board: &BoardRoute,
     mapping: &Mapping,
@@ -394,37 +487,110 @@ pub fn to_solution(
     trace_width: f64,
     layer: &str,
 ) -> Vec<PcbTrace> {
+    let layers = LayerMap::from_names(vec![layer.to_string()]);
+    to_solution_layered(board, mapping, pin_points, trace_width, &layers)
+}
+
+/// (B4) De-rasterise a routed board into a tscircuit solution soup, emitting vias
+/// wherever a path changes layers.
+///
+/// Each [`mr_core::RouteResult`] becomes one [`PcbTrace`]. Walking the path:
+///
+/// * Consecutive cells with the *same* planar `(x, y)` but a *different* layer form
+///   a vertical (via) run. A maximal contiguous vertical run collapses into ONE
+///   [`RoutePoint::Via`] from the run's first layer to its last, named via the
+///   [`LayerMap`].
+/// * Every planar move emits a [`RoutePoint::Wire`] vertex on its cell's layer.
+///
+/// The first and last *planar* vertex of every trace are snapped to the exact port
+/// coordinate via `pin_points` (keyed by the endpoint cell) so the harness'
+/// connectivity check (`distance(port, vertex) < 0.01`) matches. Interior vertices
+/// stay at cell centres; an endpoint cell missing from `pin_points` falls back to
+/// its cell centre.
+///
+/// A purely single-layer path emits only `Wire` points on layer 0's name and no
+/// vias — byte-identical to [`to_solution`]'s historical output.
+pub fn to_solution_layered(
+    board: &BoardRoute,
+    mapping: &Mapping,
+    pin_points: &HashMap<CellIdx, (f64, f64)>,
+    trace_width: f64,
+    layers: &LayerMap,
+) -> Vec<PcbTrace> {
     board
         .results
         .iter()
         .map(|result| {
-            let last = result.path.len().saturating_sub(1);
-            let route = result
-                .path
-                .iter()
-                .enumerate()
-                .map(|(i, &cell)| {
-                    // Snap the first/last vertex to the exact port coordinate;
-                    // interior vertices stay at the cell centre.
-                    let (x, y) = if i == 0 || i == last {
-                        pin_points
-                            .get(&cell)
-                            .copied()
-                            .unwrap_or_else(|| mapping.cell_center(cell))
-                    } else {
-                        mapping.cell_center(cell)
-                    };
-                    RoutePoint::Wire {
-                        x,
-                        y,
-                        width: trace_width,
-                        layer: layer.to_string(),
-                    }
-                })
-                .collect();
+            let route = trace_route(result, mapping, pin_points, trace_width, layers);
             PcbTrace::new(route)
         })
         .collect()
+}
+
+/// Build the [`RoutePoint`] route for one path, collapsing vertical (via) runs.
+fn trace_route(
+    result: &mr_core::RouteResult,
+    mapping: &Mapping,
+    pin_points: &HashMap<CellIdx, (f64, f64)>,
+    trace_width: f64,
+    layers: &LayerMap,
+) -> Vec<RoutePoint> {
+    let path = &result.path;
+    let last = path.len().saturating_sub(1);
+    let mut route: Vec<RoutePoint> = Vec::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        let cell = path[i];
+        // Emit a Wire vertex for this cell on its layer. Snap the trace's first
+        // and last planar vertex to the exact port coordinate; interior vertices
+        // stay at the cell centre.
+        let (x, y) = if i == 0 || i == last {
+            pin_points
+                .get(&cell)
+                .copied()
+                .unwrap_or_else(|| mapping.cell_center(cell))
+        } else {
+            mapping.cell_center(cell)
+        };
+        route.push(RoutePoint::Wire {
+            x,
+            y,
+            width: trace_width,
+            layer: layers.name(mapping.dims.layer_of(cell)).to_string(),
+        });
+
+        // Detect a maximal vertical run starting at `i`: consecutive cells sharing
+        // this cell's planar (x, y) but changing layer. Collapse the whole run into
+        // ONE via from the wire we just emitted to the run's final layer, and skip
+        // straight to that final cell (its same-(x,y) intermediates carry no wires).
+        let (cx, cy) = mapping.dims.xy(cell);
+        let mut j = i;
+        while j + 1 < path.len() {
+            let (nx, ny) = mapping.dims.xy(path[j + 1]);
+            if nx == cx && ny == cy && path[j + 1] != path[j] {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j > i {
+            let (vx, vy) = mapping.cell_center(cell);
+            let from_layer = mapping.dims.layer_of(path[i]);
+            let to_layer = mapping.dims.layer_of(path[j]);
+            route.push(RoutePoint::Via {
+                x: vx,
+                y: vy,
+                from_layer: layers.name(from_layer).to_string(),
+                to_layer: layers.name(to_layer).to_string(),
+            });
+            // Resume after the run's last cell; that cell's wire is the via's
+            // landing and is not re-emitted.
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    route
 }
 
 #[cfg(test)]
@@ -461,8 +627,8 @@ mod tests {
     fn rasterize_dims_and_net_count() {
         let srj: SimpleRouteJson = serde_json::from_str(SAMPLE).unwrap();
         let prob = rasterize(&srj, 1.0);
-        // 10/1 = 10 cells per axis.
-        assert_eq!(prob.mapping.dims, Dims::new(10, 10));
+        // 10/1 = 10 cells per axis; SAMPLE declares layerCount 2.
+        assert_eq!(prob.mapping.dims, Dims::with_layers(10, 10, 2));
         // VCC -> 1 net, GND (3 points) -> 2 nets. Total 3.
         assert_eq!(prob.nets.len(), 3);
     }
@@ -484,14 +650,18 @@ mod tests {
         assert!(!prob.grid.is_obstacle(d.idx(3, 5)));
         assert!(!prob.grid.is_obstacle(d.idx(4, 6)));
         assert!(!prob.grid.is_obstacle(d.idx(0, 0)));
-        // Exactly the 2x2 block.
+        // The obstacle names no layers, so it blocks BOTH of SAMPLE's 2 layers:
+        // a 2x2 block on each layer = 8 cells. The same block is present on
+        // layer 1 at the same planar (x, y).
+        assert!(prob.grid.is_obstacle(d.idx3(4, 4, 1)));
+        assert!(prob.grid.is_obstacle(d.idx3(5, 5, 1)));
         let count = prob
             .grid
             .cost
             .iter()
             .filter(|&&c| c == mr_core::OBSTACLE)
             .count();
-        assert_eq!(count, 4);
+        assert_eq!(count, 4 * 2);
     }
 
     #[test]
@@ -612,6 +782,229 @@ mod tests {
         assert!(json.contains("\"route_type\":\"via\""), "json: {json}");
         assert!(json.contains("\"from_layer\":\"top\""), "json: {json}");
         assert!(json.contains("\"to_layer\":\"bottom\""), "json: {json}");
+    }
+
+    /// Track B: an obstacle declared on "bottom" only blocks bottom-layer cells,
+    /// never the top layer at the same (x, y).
+    #[test]
+    fn rasterize_obstacle_layer_isolated() {
+        let blob = r#"{
+            "layerCount": 2,
+            "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+            "obstacles": [
+                { "type": "rect", "layers": ["bottom"], "center": {"x": 5, "y": 5},
+                  "width": 2, "height": 2 }
+            ],
+            "connections": []
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        let d = prob.mapping.dims;
+        assert_eq!(d.layers, 2);
+        // Rect spans cells x=4..=5, y=4..=5 on the bottom layer (index 1).
+        for y in 4..=5 {
+            for x in 4..=5 {
+                assert!(prob.grid.is_obstacle(d.idx3(x, y, 1)), "bottom blocked");
+                assert!(!prob.grid.is_obstacle(d.idx3(x, y, 0)), "top free");
+            }
+        }
+        // Exactly the 2x2 block on one layer.
+        let count = prob
+            .grid
+            .cost
+            .iter()
+            .filter(|&&c| c == mr_core::OBSTACLE)
+            .count();
+        assert_eq!(count, 4);
+    }
+
+    /// Track B: a src Point on "top" resolves to a layer-0 cell; on "bottom" it
+    /// resolves to the bottom-layer cell at the same planar (x, y).
+    #[test]
+    fn rasterize_src_resolves_endpoint_layer() {
+        let blob = r#"{
+            "layerCount": 2,
+            "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+            "obstacles": [],
+            "connections": [
+                { "name": "a", "pointsToConnect": [
+                    {"x": 1, "y": 1, "layer": "top"},
+                    {"x": 9, "y": 9, "layer": "bottom"} ] }
+            ]
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        let d = prob.mapping.dims;
+        let net = &prob.nets[0];
+        assert_eq!(net.src, d.idx3(1, 1, 0), "top -> layer 0");
+        assert_eq!(net.dst, d.idx3(9, 9, 1), "bottom -> layer 1");
+    }
+
+    /// Track B: an obstacle with no `layers` (or unknown names) blocks ALL layers,
+    /// so a single-layer "top" fixture is unaffected.
+    #[test]
+    fn rasterize_obstacle_no_layers_blocks_all() {
+        let blob = r#"{
+            "layerCount": 3,
+            "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+            "obstacles": [
+                { "type": "rect", "center": {"x": 5, "y": 5}, "width": 2, "height": 2 }
+            ],
+            "connections": []
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        let d = prob.mapping.dims;
+        for l in 0..3 {
+            assert!(prob.grid.is_obstacle(d.idx3(4, 4, l)), "layer {l} blocked");
+        }
+        // 2x2 block on each of 3 layers.
+        let count = prob
+            .grid
+            .cost
+            .iter()
+            .filter(|&&c| c == mr_core::OBSTACLE)
+            .count();
+        assert_eq!(count, 4 * 3);
+    }
+
+    /// Track C: a 2-layer path with exactly one layer transition emits exactly one
+    /// Via (with correct from/to names) and Wires on the right layers.
+    #[test]
+    fn to_solution_layered_emits_one_via() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 10.0,
+            min_y: 0.0,
+            max_y: 10.0,
+        };
+        let mapping = Mapping::with_layers(&bounds, 1.0, 2);
+        let d = mapping.dims;
+        let layers = LayerMap::standard(2); // ["top","bottom"]
+                                             // Move on top to (2,0), via down to bottom, then on bottom to (4,0).
+        let path = vec![
+            d.idx3(0, 0, 0),
+            d.idx3(1, 0, 0),
+            d.idx3(2, 0, 0),
+            d.idx3(2, 0, 1), // via step
+            d.idx3(3, 0, 1),
+            d.idx3(4, 0, 1),
+        ];
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: "n".into(),
+                path,
+                cost: 5,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+        };
+        let pins = HashMap::new();
+        let traces = to_solution_layered(&board, &mapping, &pins, 0.2, &layers);
+        let route = &traces[0].route;
+        // 3 top wires + 1 via + 2 bottom wires = 6.
+        assert_eq!(route.len(), 6, "route: {route:?}");
+        let vias: Vec<_> = route
+            .iter()
+            .filter(|p| matches!(p, RoutePoint::Via { .. }))
+            .collect();
+        assert_eq!(vias.len(), 1, "exactly one via");
+        match vias[0] {
+            RoutePoint::Via {
+                x,
+                y,
+                from_layer,
+                to_layer,
+            } => {
+                assert_eq!((*x, *y), (2.5, 0.5), "via at the shared cell centre");
+                assert_eq!(from_layer, "top");
+                assert_eq!(to_layer, "bottom");
+            }
+            _ => unreachable!(),
+        }
+        // Wires before the via are on "top"; after are on "bottom".
+        let layers_of: Vec<&str> = route
+            .iter()
+            .filter_map(|p| match p {
+                RoutePoint::Wire { layer, .. } => Some(layer.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(layers_of, vec!["top", "top", "top", "bottom", "bottom"]);
+    }
+
+    /// Track C: a multi-layer via run (top -> bottom across 3 layers) collapses to
+    /// a single Via spanning the full run.
+    #[test]
+    fn to_solution_layered_collapses_multilayer_via_run() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 4.0,
+            min_y: 0.0,
+            max_y: 4.0,
+        };
+        let mapping = Mapping::with_layers(&bounds, 1.0, 3);
+        let d = mapping.dims;
+        let layers = LayerMap::standard(3); // ["top","inner1","bottom"]
+        let path = vec![
+            d.idx3(0, 0, 0),
+            d.idx3(0, 0, 1), // via run start
+            d.idx3(0, 0, 2), // via run end (same x,y)
+            d.idx3(1, 0, 2),
+        ];
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: "n".into(),
+                path,
+                cost: 4,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+        };
+        let traces = to_solution_layered(&board, &mapping, &HashMap::new(), 0.1, &layers);
+        let route = &traces[0].route;
+        let vias: Vec<_> = route
+            .iter()
+            .filter_map(|p| match p {
+                RoutePoint::Via {
+                    from_layer,
+                    to_layer,
+                    ..
+                } => Some((from_layer.as_str(), to_layer.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vias, vec![("top", "bottom")], "one via spanning the run");
+    }
+
+    /// Track C: a single-layer path through `to_solution` is unchanged — all Wire,
+    /// layer "top", no vias (guards byte-identical legacy output).
+    #[test]
+    fn to_solution_single_layer_unchanged() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 10.0,
+            min_y: 0.0,
+            max_y: 10.0,
+        };
+        let mapping = Mapping::new(&bounds, 1.0);
+        let d = mapping.dims;
+        let path = vec![d.idx(0, 0), d.idx(1, 0), d.idx(2, 0)];
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: "n".into(),
+                path,
+                cost: 2,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+        };
+        let traces = to_solution(&board, &mapping, &HashMap::new(), 0.2, "top");
+        assert_eq!(traces[0].route.len(), 3);
+        assert!(traces[0]
+            .route
+            .iter()
+            .all(|p| matches!(p, RoutePoint::Wire { layer, .. } if layer == "top")));
     }
 
     #[test]

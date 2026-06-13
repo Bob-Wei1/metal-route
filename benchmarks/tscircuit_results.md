@@ -32,6 +32,76 @@ instances are only routable across layers (the harness's own reference solver
 falls back to vias on them). Our router is single-layer, so those cap below 100%.
 Multi-layer + vias is the next lever (design.md "Phase 5").
 
+## Phase 5: multi-layer routing + vias (landed)
+
+The router is no longer 2D-only. The grid carries a layer axis (`Dims.layers`,
+flat index `(l*h+y)*w+x` — identical to `y*w+x` at `layers==1`, so every
+single-layer result is byte-identical and the offline fixture suite stays 100%).
+The negotiated router takes vertical (via) steps between adjacent layers, gated and
+priced by a `ViaModel` (through-hole by default; blind/buried spans honoured when a
+DSN declares them). Vias are emitted in the solution soup as `route_type:"via"`
+points (`from_layer`/`to_layer`), and `route`/`route-dsn` accept `--layers N`.
+
+**Layer policy.** A problem routes on its declared `layerCount` by default (so
+single-layer `traces`/`keyboards` are unchanged and benchmark-legal); `--layers`
+overrides the budget for real boards. DSN ingest preserves the real stackup names
+(`F.Cu`/`B.Cu`/…) and per-pad layer assignment instead of collapsing to `top`.
+
+**Reproducible in-repo demonstrations** (no external assets):
+
+- Unit/integration: `cargo test --workspace` (158 tests). Key end-to-end test
+  `single_layer_wall_blocks_but_second_layer_vias_through` (mr-cli): a net walled
+  off on `top` is **0/1 routable on one layer → 1/1 with a top↔bottom via detour**
+  once `--layers 2` is granted.
+- CLI, single board walled on `top`:
+  ```
+  route --input wall.json --resolution 1.0            # routed 0/1, grid 10x6x1L
+  route --input wall.json --resolution 1.0 --layers 2 # routed 1/1, grid 10x6x2L, 2 vias
+  ```
+  Emitted route: `top` → via↓(3.5,3.5) → `bottom` → via↑(6.5,3.5) → `top`.
+- CLI, 2-layer DSN with a net spanning a top pad to a bottom pad:
+  ```
+  RESULT route-dsn nets=1 routed=1 conn=100.0% vias=1 wall=0.000s grid=40x40x2L
+  ```
+  (DSN parsed `layers=2`, pads placed on F.Cu/B.Cu, one via bridges them.)
+
+### Headline: multi-layer lift on a real 8-layer bed-of-nails fixture
+
+The committed `test5.dsn` is *partially routed* (its `(wiring)` carries 175
+protected power-plane traces + 174 fanout vias), so it is not a clean from-scratch
+measurement. Instead we generate a **fresh, unrouted** fixture from the same DUT
+(`H-PCB52832-A1.kicad_pcb`) with the bed-of-nails tool and route its signal nets:
+
+```
+bon generate H-PCB52832-A1.kicad_pcb -o fixture_fresh -i ad3_mte_2x15
+bon route fixture_fresh --export-only          # writes fixture.dsn: 8 layers,
+                                               # poured planes + fanout vias, signal unrouted
+route-dsn --input fixture_fresh/fixture.dsn --resolution 0.2 \
+          --layers N --skip-nets=GND --skip-nets=3V3 --skip-nets=-5VA --skip-nets=+5VA
+```
+
+Board: 8 layers, 76 components, 323 pads, 55 signal nets → **142 two-point
+segments**, grid 650 × 758 (492.7k cells/layer) at 0.2 mm.
+
+| `--layers` | connectivity | vias | wall-clock |
+|-----------:|-------------:|-----:|-----------:|
+| 1 (baseline) | **21.1%** (30/142) | 0 | 47.6 s |
+| 2 | **100%** (142/142) | 210 | 0.85 s |
+| 8 | **100%** (142/142) | 222 | 0.83 s |
+
+The lever lands exactly as designed: single-layer caps at 21% — the crossings have
+nowhere to go — while two layers reach **100%**. Multi-layer is also *faster*: on one
+layer the negotiated router burns all 60 iterations + the rip-up budget fighting
+unwinnable crossings (47 s); with vias available, nets route on the first pass
+(<1 s). The 8-layer grid is 8× the cells but costs no more wall-clock because the
+windowed A* explores locally and the thrash is gone. The 8-layer solution spreads
+wire across F.Cu/In1.Cu/In2.Cu (≈18.0k/10.3k/1.1k vertices) with all vias on short
+adjacent spans — it escapes to inner layers only where a crossing demands it, and
+three layers already suffice for this sparse fixture.
+
+(`test5.dsn`'s single-layer **18.4%** below was an earlier, differently-seeded
+fixture instance; the fresh board's 21.1% is the like-for-like single-layer point.)
+
 ## Real board: bed-of-nails fixture (the clean rig)
 
 `metalroute route-dsn` parses a Specctra `.dsn` → `SimpleRouteJson` → routes with

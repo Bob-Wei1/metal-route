@@ -24,20 +24,52 @@ pub type CellIdx = u32;
 /// Sentinel cost marking an impassable cell.
 pub const OBSTACLE: Cost = Cost::MAX;
 
+/// Serde default for [`Dims::layers`]: grids deserialised from pre-layer JSON have
+/// no `layers` field and must read back as single-layer.
+fn one_layer() -> u32 {
+    1
+}
+
 /// Grid dimensions plus the *only* sanctioned cell ↔ coordinate mapping.
+///
+/// The grid is `layers` stacked `w × h` planes. The canonical flat mapping is
+/// `idx3(x, y, l) = (l*h + y)*w + x`; for `l == 0` this is exactly the historical
+/// 2D mapping `y*w + x`, so every single-layer (`layers == 1`) call site is
+/// byte-identical to before layers existed. The planar [`Dims::idx`] / [`Dims::xy`]
+/// helpers operate on layer 0 / strip the layer respectively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Dims {
     pub w: u32,
     pub h: u32,
+    /// Number of stacked copper planes. Defaults to 1 (single-layer).
+    #[serde(default = "one_layer")]
+    pub layers: u32,
 }
 
 impl Dims {
+    /// A single-layer grid. Layer count defaults to 1 so every existing 2D caller
+    /// is unchanged.
     pub fn new(w: u32, h: u32) -> Self {
-        Self { w, h }
+        Self { w, h, layers: 1 }
     }
 
-    /// Number of cells.
+    /// A multi-layer grid of `layers` stacked `w × h` planes.
+    pub fn with_layers(w: u32, h: u32, layers: u32) -> Self {
+        Self {
+            w,
+            h,
+            layers: layers.max(1),
+        }
+    }
+
+    /// Number of cells across every layer.
     pub fn len(&self) -> usize {
+        self.w as usize * self.h as usize * self.layers as usize
+    }
+
+    /// Number of cells in a single `w × h` plane.
+    #[inline]
+    pub fn plane(&self) -> usize {
         self.w as usize * self.h as usize
     }
 
@@ -45,16 +77,42 @@ impl Dims {
         self.len() == 0
     }
 
-    /// Canonical row-major index of `(x, y)`. Caller guarantees in-bounds.
+    /// Canonical row-major index of `(x, y)` on layer 0. Caller guarantees
+    /// in-bounds. Equivalent to `idx3(x, y, 0)`.
     #[inline]
     pub fn idx(&self, x: u32, y: u32) -> CellIdx {
         y * self.w + x
     }
 
-    /// Inverse of [`Dims::idx`]: `(x, y)` of a cell index.
+    /// Canonical flat index of `(x, y, layer)`: `(layer*h + y)*w + x`. Caller
+    /// guarantees in-bounds.
+    #[inline]
+    pub fn idx3(&self, x: u32, y: u32, layer: u32) -> CellIdx {
+        (layer * self.h + y) * self.w + x
+    }
+
+    /// Inverse of [`Dims::idx`]: planar `(x, y)` of a cell index, with the layer
+    /// stripped. Single-layer callers are unaffected.
     #[inline]
     pub fn xy(&self, i: CellIdx) -> (u32, u32) {
-        (i % self.w, i / self.w)
+        let plane = self.w * self.h;
+        let r = i % plane;
+        (r % self.w, r / self.w)
+    }
+
+    /// Inverse of [`Dims::idx3`]: `(x, y, layer)` of a cell index.
+    #[inline]
+    pub fn xyz(&self, i: CellIdx) -> (u32, u32, u32) {
+        let plane = self.w * self.h;
+        let layer = i / plane;
+        let r = i % plane;
+        (r % self.w, r / self.w, layer)
+    }
+
+    /// Layer of a cell index.
+    #[inline]
+    pub fn layer_of(&self, i: CellIdx) -> u32 {
+        i / (self.w * self.h)
     }
 
     pub fn in_bounds(&self, x: u32, y: u32) -> bool {
@@ -65,25 +123,191 @@ impl Dims {
         (i as usize) < self.len()
     }
 
-    /// 4-connected neighbours of `i`, returned in ascending [`CellIdx`] order so
-    /// that iteration order is identical everywhere (anchors the tie-break).
+    /// 4-connected *same-layer* neighbours of `i`, returned in ascending
+    /// [`CellIdx`] order so that iteration order is identical everywhere (anchors
+    /// the tie-break). Layer-crossing moves are vias — see [`Dims::via_neighbors`].
     pub fn neighbors4(&self, i: CellIdx) -> Vec<CellIdx> {
-        let (x, y) = self.xy(i);
+        let (x, y, l) = self.xyz(i);
         let mut v = Vec::with_capacity(4);
         if y > 0 {
-            v.push(self.idx(x, y - 1));
+            v.push(self.idx3(x, y - 1, l));
         }
         if x > 0 {
-            v.push(self.idx(x - 1, y));
+            v.push(self.idx3(x - 1, y, l));
         }
         if x + 1 < self.w {
-            v.push(self.idx(x + 1, y));
+            v.push(self.idx3(x + 1, y, l));
         }
         if y + 1 < self.h {
-            v.push(self.idx(x, y + 1));
+            v.push(self.idx3(x, y + 1, l));
         }
         v.sort_unstable();
         v
+    }
+
+    /// The adjacent-layer neighbours of `i` at the same `(x, y)` — the cells a via
+    /// step may reach. Empty for a single-layer grid. Returned in ascending
+    /// [`CellIdx`] order (lower layer first).
+    pub fn via_neighbors(&self, i: CellIdx) -> Vec<CellIdx> {
+        if self.layers <= 1 {
+            return Vec::new();
+        }
+        let (x, y, l) = self.xyz(i);
+        let mut v = Vec::with_capacity(2);
+        if l > 0 {
+            v.push(self.idx3(x, y, l - 1));
+        }
+        if l + 1 < self.layers {
+            v.push(self.idx3(x, y, l + 1));
+        }
+        v
+    }
+}
+
+/// The ordered names of a board's copper layers, index ↔ name. Layer 0 is the top
+/// copper, `len()-1` the bottom; inner layers sit between. This is the single place
+/// that maps the routing grid's integer layer axis to the layer *names* the
+/// tscircuit/DSN world speaks in (`"top"`, `"inner1"`, …, `"bottom"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerMap {
+    names: Vec<String>,
+}
+
+impl LayerMap {
+    /// Build from an explicit ordered list of layer names (e.g. parsed from a DSN
+    /// stackup). Empty input is promoted to a single `"top"` layer.
+    pub fn from_names(mut names: Vec<String>) -> Self {
+        if names.is_empty() {
+            names.push("top".to_string());
+        }
+        Self { names }
+    }
+
+    /// The standard tscircuit naming for `count` layers: `["top"]`,
+    /// `["top","bottom"]`, or `["top","inner1",…,"inner{n-2}","bottom"]`.
+    pub fn standard(count: u32) -> Self {
+        let count = count.max(1);
+        if count == 1 {
+            return Self::from_names(vec!["top".to_string()]);
+        }
+        let mut names = Vec::with_capacity(count as usize);
+        names.push("top".to_string());
+        for i in 1..count - 1 {
+            names.push(format!("inner{i}"));
+        }
+        names.push("bottom".to_string());
+        Self { names }
+    }
+
+    /// Number of layers.
+    pub fn len(&self) -> u32 {
+        self.names.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Name of layer `idx`, or `"top"` if out of range (defensive).
+    pub fn name(&self, idx: u32) -> &str {
+        self.names
+            .get(idx as usize)
+            .map(String::as_str)
+            .unwrap_or("top")
+    }
+
+    /// Index of a named layer, if present.
+    pub fn index_of(&self, name: &str) -> Option<u32> {
+        self.names.iter().position(|n| n == name).map(|i| i as u32)
+    }
+}
+
+/// The fabrication class of a via span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViaClass {
+    /// Spans the full stackup (top ↔ bottom).
+    Through,
+    /// Touches exactly one outer layer (top or bottom) but not both.
+    Blind,
+    /// Entirely between inner layers.
+    Buried,
+}
+
+/// Which layer transitions a via may make, what each adjacent step costs, and the
+/// keepout a placed via requires. The router treats a layer change as a vertical
+/// A* step between adjacent layers; this model gates which steps are legal and
+/// prices them. Contiguous vertical runs are later classified into a [`ViaClass`]
+/// span for output and DRC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViaModel {
+    /// Total layers the model is defined over.
+    pub layers: u32,
+    /// Cost of a single adjacent-layer step, in the same fixed-point units as a
+    /// router's planar step cost. A via that crosses `k` layers pays `k` steps.
+    pub step_cost: Cost,
+    /// Keepout radius (in cells) a placed via reserves around itself on the layers
+    /// it passes through. `0` means "use the board clearance".
+    pub keepout: u32,
+    /// Legal adjacent steps as inclusive `(lo, hi)` layer pairs with `hi == lo+1`.
+    /// `None` means every adjacent step is legal (the through-hole default).
+    allowed_steps: Option<Vec<(u32, u32)>>,
+}
+
+impl ViaModel {
+    /// Default via cost: roughly ten planar steps at the negotiated router's
+    /// `SCALE` of 16. Vias are cheap enough to use but never free.
+    pub const DEFAULT_STEP_COST: Cost = 160;
+
+    /// Through-hole model over `layers`: every adjacent step legal, default cost,
+    /// no extra keepout.
+    pub fn through_hole(layers: u32) -> Self {
+        Self {
+            layers: layers.max(1),
+            step_cost: Self::DEFAULT_STEP_COST,
+            keepout: 0,
+            allowed_steps: None,
+        }
+    }
+
+    /// A model permitting only the given inclusive adjacent `(lo, hi)` steps
+    /// (`hi == lo+1`). Steps outside the set are forbidden — this is how blind /
+    /// buried-only stackups are expressed.
+    pub fn with_allowed_steps(layers: u32, step_cost: Cost, steps: Vec<(u32, u32)>) -> Self {
+        Self {
+            layers: layers.max(1),
+            step_cost,
+            keepout: 0,
+            allowed_steps: Some(steps),
+        }
+    }
+
+    /// Whether a single step between `a` and `b` is a legal via move: the layers
+    /// must be adjacent and (if a restricted set is configured) listed.
+    pub fn is_step_legal(&self, a: u32, b: u32) -> bool {
+        if a.abs_diff(b) != 1 || a >= self.layers || b >= self.layers {
+            return false;
+        }
+        match &self.allowed_steps {
+            None => true,
+            Some(steps) => {
+                let lo = a.min(b);
+                let hi = a.max(b);
+                steps.iter().any(|&(s, e)| s == lo && e == hi)
+            }
+        }
+    }
+
+    /// Classify a via that spans `[lo, hi]` (inclusive layer indices) over a stack
+    /// of `layers`.
+    pub fn classify_span(lo: u32, hi: u32, layers: u32) -> ViaClass {
+        let touches_top = lo == 0;
+        let touches_bottom = hi == layers.saturating_sub(1);
+        match (touches_top, touches_bottom) {
+            (true, true) => ViaClass::Through,
+            (false, false) => ViaClass::Buried,
+            _ => ViaClass::Blind,
+        }
     }
 }
 
@@ -253,6 +477,108 @@ mod tests {
         assert!(n.windows(2).all(|w| w[0] < w[1]), "neighbours must ascend");
         // corner has exactly two neighbours
         assert_eq!(d.neighbors4(d.idx(0, 0)).len(), 2);
+    }
+
+    #[test]
+    fn idx3_equals_idx_on_layer0() {
+        // The 3D mapping must reduce to the historical 2D mapping on layer 0 so
+        // single-layer call sites are byte-identical.
+        let d = Dims::with_layers(13, 5, 4);
+        for y in 0..5 {
+            for x in 0..13 {
+                assert_eq!(d.idx3(x, y, 0), d.idx(x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn idx3_xyz_roundtrip_across_layers() {
+        let d = Dims::with_layers(7, 3, 5);
+        assert_eq!(d.len(), 7 * 3 * 5);
+        for i in 0..d.len() as u32 {
+            let (x, y, l) = d.xyz(i);
+            assert!(x < 7 && y < 3 && l < 5, "{i} -> ({x},{y},{l}) oob");
+            assert_eq!(d.idx3(x, y, l), i);
+            assert_eq!(d.xy(i), (x, y), "xy must strip the layer");
+            assert_eq!(d.layer_of(i), l);
+        }
+    }
+
+    #[test]
+    fn neighbors4_stay_on_layer() {
+        let d = Dims::with_layers(4, 4, 3);
+        let c = d.idx3(2, 2, 1);
+        let n = d.neighbors4(c);
+        assert_eq!(
+            n,
+            vec![
+                d.idx3(2, 1, 1),
+                d.idx3(1, 2, 1),
+                d.idx3(3, 2, 1),
+                d.idx3(2, 3, 1)
+            ]
+        );
+        assert!(n.iter().all(|&v| d.layer_of(v) == 1));
+        assert!(n.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn via_neighbors_cross_layers_only() {
+        // Single layer: no vias.
+        assert!(Dims::new(4, 4).via_neighbors(5).is_empty());
+        let d = Dims::with_layers(4, 4, 3);
+        // Middle layer reaches both neighbours, same (x,y).
+        let mid = d.idx3(1, 1, 1);
+        assert_eq!(d.via_neighbors(mid), vec![d.idx3(1, 1, 0), d.idx3(1, 1, 2)]);
+        // Top layer reaches only up.
+        assert_eq!(d.via_neighbors(d.idx3(1, 1, 0)), vec![d.idx3(1, 1, 1)]);
+        // Bottom layer reaches only down.
+        assert_eq!(d.via_neighbors(d.idx3(1, 1, 2)), vec![d.idx3(1, 1, 1)]);
+    }
+
+    #[test]
+    fn layermap_standard_naming() {
+        assert_eq!(LayerMap::standard(1).name(0), "top");
+        let two = LayerMap::standard(2);
+        assert_eq!((two.name(0), two.name(1)), ("top", "bottom"));
+        let four = LayerMap::standard(4);
+        assert_eq!(
+            (four.name(0), four.name(1), four.name(2), four.name(3)),
+            ("top", "inner1", "inner2", "bottom")
+        );
+        assert_eq!(four.index_of("inner2"), Some(2));
+        assert_eq!(four.index_of("nope"), None);
+    }
+
+    #[test]
+    fn viamodel_through_hole_legal_steps_and_classes() {
+        let v = ViaModel::through_hole(8);
+        assert!(v.is_step_legal(0, 1));
+        assert!(v.is_step_legal(7, 6));
+        assert!(!v.is_step_legal(0, 2), "non-adjacent is not a single step");
+        assert!(!v.is_step_legal(7, 8), "out of range");
+        assert_eq!(ViaModel::classify_span(0, 7, 8), ViaClass::Through);
+        assert_eq!(ViaModel::classify_span(0, 2, 8), ViaClass::Blind);
+        assert_eq!(ViaModel::classify_span(5, 7, 8), ViaClass::Blind);
+        assert_eq!(ViaModel::classify_span(3, 5, 8), ViaClass::Buried);
+    }
+
+    #[test]
+    fn viamodel_restricted_steps_forbid_others() {
+        // Blind/buried-only stack: only the 1-2 step is drilled.
+        let v = ViaModel::with_allowed_steps(4, 100, vec![(1, 2)]);
+        assert!(v.is_step_legal(1, 2));
+        assert!(v.is_step_legal(2, 1));
+        assert!(!v.is_step_legal(0, 1));
+        assert!(!v.is_step_legal(2, 3));
+    }
+
+    #[test]
+    fn dims_deserialises_without_layers_as_single_layer() {
+        // Pre-layer JSON has no `layers` field.
+        let d: Dims = serde_json::from_str(r#"{"w":4,"h":3}"#).unwrap();
+        assert_eq!(d, Dims::new(4, 3));
+        assert_eq!(d.layers, 1);
     }
 
     #[test]

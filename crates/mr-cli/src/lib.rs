@@ -18,19 +18,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bench;
-use mr_core::Router;
+use std::collections::HashMap;
+
+use mr_core::{BoardRoute, CellIdx, LayerMap, Router, ViaModel};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
-use mr_ingest::dsn::{dsn_to_srj_with_stats, ParseStats};
-use mr_srj::{rasterize, to_solution, SimpleRouteJson};
+use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
+use mr_srj::{rasterize_with_layers, to_solution_layered, Mapping, RoutePoint, SimpleRouteJson};
 
 /// The ~2× speedup threshold the M2 go/no-go gate uses.
 pub const GO_NO_GO_THRESHOLD: f32 = 2.0;
 
 /// Default trace width (continuous units) for emitted `pcb_trace` wires.
 const DEFAULT_TRACE_WIDTH: f64 = 0.15;
-
-/// Default routing layer name for emitted wires (single-layer for now).
-const DEFAULT_LAYER: &str = "top";
 
 /// `metalroute` — a PCB autorouter CLI.
 #[derive(Debug, Parser)]
@@ -128,6 +127,12 @@ pub struct RouteArgs {
     #[arg(long, value_enum, default_value_t = RouterKind::default())]
     pub router: RouterKind,
 
+    /// Number of copper layers to route on. Defaults to the problem's declared
+    /// `layerCount`. An override lets you grant extra layers to a board that
+    /// declares fewer (only the `negotiated` backend places vias between layers).
+    #[arg(long)]
+    pub layers: Option<u32>,
+
     /// Output path for the solution soup JSON. Defaults to stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -162,14 +167,16 @@ pub struct Summary {
     pub grid_w: u32,
     /// Grid height in cells.
     pub grid_h: u32,
+    /// Number of copper layers routed on.
+    pub grid_layers: u32,
 }
 
 impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "routed {}/{} nets, total cost {}, grid {}x{}",
-            self.routed, self.total, self.total_cost, self.grid_w, self.grid_h
+            "routed {}/{} nets, total cost {}, grid {}x{}x{}L",
+            self.routed, self.total, self.total_cost, self.grid_w, self.grid_h, self.grid_layers
         )
     }
 }
@@ -226,6 +233,7 @@ pub fn route_problem(
     srj: &SimpleRouteJson,
     resolution: Option<f64>,
     router: RouterKind,
+    layers: Option<u32>,
 ) -> Result<(Vec<mr_srj::PcbTrace>, Summary)> {
     let resolution = resolution.unwrap_or_else(|| default_resolution(srj));
     anyhow::ensure!(
@@ -233,22 +241,31 @@ pub fn route_problem(
         "resolution must be a finite positive number, got {resolution}"
     );
 
-    let problem = rasterize(srj, resolution);
+    // Effective layer count: the override if given, else the problem's declaration.
+    // Standard tscircuit naming (top/inner_N/bottom) applies for SimpleRouteJson.
+    let layer_count = layers.unwrap_or(srj.layer_count).max(1);
+    let layer_map = LayerMap::standard(layer_count);
+    let problem = rasterize_with_layers(srj, resolution, layer_map);
     let total = problem.nets.len();
 
+    // Only the negotiated backend places vias; give it a through-hole model over
+    // the routed stackup. Lee/Ripup route per-layer with no layer changes.
+    let via_model = ViaModel::through_hole(problem.mapping.dims.layers);
     let board = match router {
         RouterKind::Lee => LeeRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
-        RouterKind::Negotiated => NegotiatedRouter::new().route(&problem.grid, &problem.nets),
+        RouterKind::Negotiated => NegotiatedRouter::new()
+            .with_via_model(via_model)
+            .route(&problem.grid, &problem.nets),
     }
     .context("router failed")?;
 
-    let traces = to_solution(
+    let traces = to_solution_layered(
         &board,
         &problem.mapping,
         &problem.pin_points,
         DEFAULT_TRACE_WIDTH,
-        DEFAULT_LAYER,
+        &problem.layers,
     );
 
     let summary = Summary {
@@ -257,6 +274,7 @@ pub fn route_problem(
         total_cost: board.total_cost(),
         grid_w: problem.mapping.dims.w,
         grid_h: problem.mapping.dims.h,
+        grid_layers: problem.mapping.dims.layers,
     };
 
     Ok((traces, summary))
@@ -271,7 +289,7 @@ pub fn run_route(args: &RouteArgs) -> Result<Summary> {
         .with_context(|| format!("failed to read input file {}", args.input.display()))?;
     let srj = parse_srj(&bytes)?;
 
-    let (traces, summary) = route_problem(&srj, args.resolution, args.router)?;
+    let (traces, summary) = route_problem(&srj, args.resolution, args.router, args.layers)?;
 
     let json = serde_json::to_string_pretty(&traces).context("failed to serialise solution")?;
 
@@ -337,6 +355,16 @@ pub struct RouteDsnArgs {
     /// Cap the number of original nets routed (for quick smoke tests).
     #[arg(long)]
     pub max_nets: Option<usize>,
+
+    /// Number of signal layers to route on. Defaults to all `(type signal)`
+    /// layers in the DSN stackup; a smaller value uses the top-N signal layers.
+    #[arg(long)]
+    pub layers: Option<u32>,
+
+    /// Also write a Specctra session (`.ses`) of the routed copper to this path,
+    /// ready to import back onto the source board (`bon route DIR --import-ses`).
+    #[arg(long)]
+    pub ses: Option<PathBuf>,
 }
 
 /// Resolution policy for `route-dsn`: honour a finite positive override, else
@@ -375,10 +403,14 @@ pub struct DsnReport {
     pub grid_w: u32,
     /// Grid height in cells.
     pub grid_h: u32,
+    /// Number of copper layers routed on.
+    pub grid_layers: u32,
     /// Total two-point nets submitted (after k-point decomposition + filtering).
     pub total_nets: usize,
     /// Two-point nets that produced a routed trace.
     pub routed_nets: usize,
+    /// Number of vias placed across all routed traces (layer changes).
+    pub vias: usize,
     /// Original (pre-decomposition) connections that routed fully (all segments).
     pub fully_connected: usize,
     /// Original connections submitted (after skip/cap filtering).
@@ -409,14 +441,176 @@ impl DsnReport {
     /// The scrape-friendly one-line `RESULT` summary.
     pub fn result_line(&self) -> String {
         format!(
-            "RESULT route-dsn nets={} routed={} conn={:.1}% wall={:.3}s grid={}x{}",
+            "RESULT route-dsn nets={} routed={} conn={:.1}% vias={} wall={:.3}s grid={}x{}x{}L",
             self.total_nets,
             self.routed_nets,
             self.connectivity_pct(),
+            self.vias,
             self.wall_s,
             self.grid_w,
             self.grid_h,
+            self.grid_layers,
         )
+    }
+}
+
+/// Drop interior points that are collinear with their neighbours, so a straight
+/// cell-by-cell run collapses to its two endpoints (and each corner is kept).
+/// Turns thousands of unit-step vertices into a handful of real segments.
+fn simplify_collinear(pts: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let mut out = vec![pts[0]];
+    for i in 1..pts.len() - 1 {
+        let a = *out.last().unwrap();
+        let b = pts[i];
+        let c = pts[i + 1];
+        // Cross product of (b-a) and (c-b); zero ⇒ b lies on the a→c line.
+        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        if cross != 0 {
+            out.push(b);
+        }
+    }
+    out.push(*pts.last().unwrap());
+    out
+}
+
+/// Build a Specctra session (`.ses`) from a routed board, ready to import back
+/// onto the source KiCad PCB (e.g. `bon route DIR --import-ses`).
+///
+/// Coordinates are the inverse of the DSN ingest: a continuous-mm value becomes
+/// `round(mm * units_per_mm)` in the DSN's own raw units, and the y-sign carried
+/// through ingest is preserved (the importer re-negates it into KiCad's y-down
+/// frame). Tracks are grouped under their base net name (the `#seg`
+/// decomposition suffix is stripped); a path's layer changes become `(via ...)`
+/// entries between `(wire ...)` runs. Via dimensions are encoded in the padstack
+/// name (`Via[..]_<size_um>:<drill_um>_um`) per the importer's convention.
+#[allow(clippy::too_many_arguments)]
+fn board_to_ses(
+    design_name: &str,
+    board: &BoardRoute,
+    mapping: &Mapping,
+    layers: &LayerMap,
+    pin_points: &HashMap<CellIdx, (f64, f64)>,
+    units_per_mm: f64,
+    unit: &str,
+    divisor: f64,
+    trace_width_mm: f64,
+) -> String {
+    let dims = mapping.dims;
+    let to_raw = |mm: f64| (mm * units_per_mm).round() as i64;
+    let width_raw = to_raw(trace_width_mm);
+    // Signal via: 0.45 mm pad / 0.2 mm drill (bon's default), encoded for the
+    // importer's `Via[..]_<size_um>:<drill_um>_um` regex.
+    const VIA_NAME: &str = "Via[0-7]_450:200_um";
+    let via_pad_raw = to_raw(0.45);
+
+    // Endpoint vertices snap to the exact port; interior vertices use cell centres.
+    let point = |cell: CellIdx, endpoint: bool| -> (f64, f64) {
+        if endpoint {
+            if let Some(p) = pin_points.get(&cell) {
+                return *p;
+            }
+        }
+        mapping.cell_center(cell)
+    };
+
+    // Group routed segments by base net name, preserving first-seen order.
+    let mut nets: Vec<(String, Vec<&[CellIdx]>)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for r in &board.results {
+        let base = r.net.split('#').next().unwrap_or(&r.net).to_string();
+        let i = *index.entry(base.clone()).or_insert_with(|| {
+            nets.push((base.clone(), Vec::new()));
+            nets.len() - 1
+        });
+        nets[i].1.push(r.path.as_slice());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("(session \"{design_name}.ses\"\n"));
+    out.push_str(&format!("  (base_design \"{design_name}.dsn\")\n"));
+    out.push_str("  (routes\n");
+    out.push_str(&format!("    (resolution {unit} {divisor})\n"));
+    out.push_str("    (library_out\n");
+    out.push_str(&format!(
+        "      (padstack \"{VIA_NAME}\" (shape (circle F.Cu {via_pad_raw})))\n"
+    ));
+    out.push_str("    )\n");
+    out.push_str("    (network_out\n");
+
+    for (net, paths) in &nets {
+        out.push_str(&format!("      (net \"{net}\"\n"));
+        for path in paths {
+            if path.is_empty() {
+                continue;
+            }
+            let last = path.len() - 1;
+            let mut cur_layer = dims.layer_of(path[0]);
+            let p0 = point(path[0], true);
+            let mut run: Vec<(i64, i64)> = vec![(to_raw(p0.0), to_raw(p0.1))];
+            let mut flush = |out: &mut String, layer: u32, run: &[(i64, i64)]| {
+                let run = simplify_collinear(run);
+                if run.len() < 2 {
+                    return;
+                }
+                out.push_str(&format!(
+                    "        (wire (path {} {width_raw}",
+                    layers.name(layer)
+                ));
+                for (x, y) in &run {
+                    out.push_str(&format!(" {x} {y}"));
+                }
+                out.push_str(") (type route))\n");
+            };
+            for k in 1..path.len() {
+                let l = dims.layer_of(path[k]);
+                if l == cur_layer {
+                    let (x, y) = point(path[k], k == last);
+                    run.push((to_raw(x), to_raw(y)));
+                } else {
+                    // Layer change: a via at the shared (x, y) of path[k-1]/path[k].
+                    let (vx, vy) = mapping.cell_center(path[k]);
+                    let (vrx, vry) = (to_raw(vx), to_raw(vy));
+                    flush(&mut out, cur_layer, &run);
+                    out.push_str(&format!("        (via \"{VIA_NAME}\" {vrx} {vry})\n"));
+                    cur_layer = l;
+                    let (x, y) = point(path[k], k == last);
+                    run = vec![(to_raw(x), to_raw(y))];
+                }
+            }
+            flush(&mut out, cur_layer, &run);
+        }
+        out.push_str("      )\n");
+    }
+
+    out.push_str("    )\n  )\n)\n");
+    out
+}
+
+/// Count the vias (layer-change points) across a routed solution soup.
+fn count_vias(traces: &[mr_srj::PcbTrace]) -> usize {
+    traces
+        .iter()
+        .flat_map(|t| t.route.iter())
+        .filter(|p| matches!(p, RoutePoint::Via { .. }))
+        .count()
+}
+
+/// Restrict a parsed stackup to the top `n` layers, rebuilding a through-hole via
+/// model over them. `None` (or `n >= len`) keeps the full stackup and its model.
+fn apply_layer_override(
+    layer_map: LayerMap,
+    via_model: ViaModel,
+    n: Option<u32>,
+) -> (LayerMap, ViaModel) {
+    match n {
+        Some(n) if n >= 1 && n < layer_map.len() => {
+            let names: Vec<String> = (0..n).map(|i| layer_map.name(i).to_string()).collect();
+            (LayerMap::from_names(names), ViaModel::through_hole(n))
+        }
+        _ => (layer_map, via_model),
     }
 }
 
@@ -426,12 +620,22 @@ impl DsnReport {
 /// `skip_nets` drops any connection whose name contains one of the substrings;
 /// `max_nets` caps the number of (post-skip) original connections routed.
 pub fn route_dsn_problem(
-    mut srj: SimpleRouteJson,
-    stats: ParseStats,
+    ingest: DsnIngest,
+    design_name: &str,
     resolution: Option<f64>,
     skip_nets: &[String],
     max_nets: Option<usize>,
-) -> Result<(DsnReport, Vec<mr_srj::PcbTrace>)> {
+    layers: Option<u32>,
+) -> Result<(DsnReport, Vec<mr_srj::PcbTrace>, String)> {
+    let units_per_mm = ingest.units_per_mm();
+    let res_unit = ingest.resolution_unit.clone();
+    let res_divisor = ingest.resolution_divisor;
+    let DsnIngest {
+        mut srj,
+        signal_layers,
+        stats,
+        ..
+    } = ingest;
     // Filter connections: drop skipped substrings, then cap.
     if !skip_nets.is_empty() {
         srj.connections
@@ -448,13 +652,25 @@ pub fn route_dsn_problem(
         "resolution must be finite and positive, got {resolution}"
     );
 
-    let problem = rasterize(&srj, resolution);
+    // Route signal nets on the SIGNAL layers only (never on a poured power plane);
+    // vias bridge adjacent signal layers as through-vias. `--layers` caps how many
+    // signal layers are used. The via model is through-hole over those layers.
+    let mut signal_layers = signal_layers;
+    if let Some(n) = layers {
+        let n = (n as usize).clamp(1, signal_layers.len().max(1));
+        signal_layers.truncate(n);
+    }
+    let layer_map = LayerMap::from_names(signal_layers);
+    let via_model = ViaModel::through_hole(layer_map.len());
+    let problem = rasterize_with_layers(&srj, resolution, layer_map);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
     let grid_h = problem.mapping.dims.h;
+    let grid_layers = problem.mapping.dims.layers;
 
     let start = std::time::Instant::now();
     let board = NegotiatedRouter::new()
+        .with_via_model(via_model)
         .route(&problem.grid, &problem.nets)
         .context("router failed")?;
     let wall_s = start.elapsed().as_secs_f64();
@@ -482,12 +698,26 @@ pub fn route_dsn_problem(
         }
     }
 
-    let traces = to_solution(
+    let trace_width = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
+    let traces = to_solution_layered(
         &board,
         &problem.mapping,
         &problem.pin_points,
-        srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH),
-        DEFAULT_LAYER,
+        trace_width,
+        &problem.layers,
+    );
+    let vias = count_vias(&traces);
+
+    let ses = board_to_ses(
+        design_name,
+        &board,
+        &problem.mapping,
+        &problem.layers,
+        &problem.pin_points,
+        units_per_mm,
+        &res_unit,
+        res_divisor,
+        trace_width,
     );
 
     let report = DsnReport {
@@ -495,14 +725,16 @@ pub fn route_dsn_problem(
         resolution,
         grid_w,
         grid_h,
+        grid_layers,
         total_nets,
         routed_nets,
+        vias,
         fully_connected,
         original_nets,
         wall_s,
     };
 
-    Ok((report, traces))
+    Ok((report, traces, ses))
 }
 
 /// Execute the `route-dsn` subcommand: read + parse the DSN, route it, optionally
@@ -510,15 +742,32 @@ pub fn route_dsn_problem(
 pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
     let text = std::fs::read_to_string(&args.input)
         .with_context(|| format!("failed to read DSN file {}", args.input.display()))?;
-    let (srj, stats) = dsn_to_srj_with_stats(&text).context("failed to convert DSN to problem")?;
+    let ingest = dsn_to_ingest(&text).context("failed to convert DSN to problem")?;
 
-    let (report, traces) =
-        route_dsn_problem(srj, stats, args.resolution, &args.skip_nets, args.max_nets)?;
+    let design_name = args
+        .input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "fixture".to_string());
+
+    let (report, traces, ses) = route_dsn_problem(
+        ingest,
+        &design_name,
+        args.resolution,
+        &args.skip_nets,
+        args.max_nets,
+        args.layers,
+    )?;
 
     if let Some(path) = &args.out {
         let json = serde_json::to_string_pretty(&traces).context("failed to serialise solution")?;
         std::fs::write(path, json)
             .with_context(|| format!("failed to write output file {}", path.display()))?;
+    }
+
+    if let Some(path) = &args.ses {
+        std::fs::write(path, &ses)
+            .with_context(|| format!("failed to write SES file {}", path.display()))?;
     }
 
     Ok(report)
@@ -543,7 +792,7 @@ mod tests {
     #[test]
     fn route_problem_routes_two_nets() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
-        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Ripup).unwrap();
+        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Ripup, None).unwrap();
 
         // Two 2-point connections -> two nets, both routable on this open board.
         assert_eq!(summary.total, 2);
@@ -559,10 +808,67 @@ mod tests {
         }
     }
 
+    /// A net whose only corridor is walled off on the top layer. The wall sits on
+    /// `"top"` only, so on a single layer the net cannot route; granting a second
+    /// layer lets the negotiated router via down, cross, and via back up.
+    const TWO_LAYER_WALL: &str = r#"{
+        "layerCount": 1,
+        "minTraceWidth": 0.1,
+        "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 6 },
+        "obstacles": [
+            { "type": "rect", "layers": ["top"], "center": {"x": 5, "y": 3}, "width": 2, "height": 6 }
+        ],
+        "connections": [
+            { "name": "SIG", "pointsToConnect": [
+                {"x": 1, "y": 3, "layer": "top"},
+                {"x": 9, "y": 3, "layer": "top"}
+            ] }
+        ]
+    }"#;
+
+    #[test]
+    fn single_layer_wall_blocks_but_second_layer_vias_through() {
+        let srj = parse_srj(TWO_LAYER_WALL.as_bytes()).unwrap();
+
+        // Declared single layer: the top-layer wall is impassable.
+        let (traces1, s1) = route_problem(&srj, Some(1.0), RouterKind::Negotiated, None).unwrap();
+        assert_eq!(s1.grid_layers, 1);
+        assert_eq!(s1.routed, 0, "net must be unroutable on one layer");
+        assert_eq!(count_vias(&traces1), 0);
+
+        // Grant a second layer: the net routes and must change layers (>=2 vias:
+        // down before the wall, back up after).
+        let (traces2, s2) =
+            route_problem(&srj, Some(1.0), RouterKind::Negotiated, Some(2)).unwrap();
+        assert_eq!(s2.grid_layers, 2);
+        assert_eq!(s2.routed, 1, "net should route once a second layer exists");
+        assert!(
+            count_vias(&traces2) >= 2,
+            "a top->bottom->top detour needs at least two vias, got {}",
+            count_vias(&traces2)
+        );
+        // The emitted via names must come from the standard stackup.
+        let via = traces2
+            .iter()
+            .flat_map(|t| &t.route)
+            .find_map(|p| match p {
+                RoutePoint::Via { from_layer, to_layer, .. } => Some((from_layer.clone(), to_layer.clone())),
+                _ => None,
+            })
+            .expect("at least one via");
+        assert!(
+            matches!(
+                (via.0.as_str(), via.1.as_str()),
+                ("top", "bottom") | ("bottom", "top")
+            ),
+            "via should span top<->bottom, got {via:?}"
+        );
+    }
+
     #[test]
     fn route_problem_lee_backend_also_routes() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
-        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Lee).unwrap();
+        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Lee, None).unwrap();
         assert_eq!(summary.routed, 2);
         assert!(!traces.is_empty());
     }
@@ -571,7 +877,7 @@ mod tests {
     fn default_resolution_targets_reasonable_grid() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
         // span 10 / 64 -> small cells; grid should be well-formed and non-trivial.
-        let (_traces, summary) = route_problem(&srj, None, RouterKind::Ripup).unwrap();
+        let (_traces, summary) = route_problem(&srj, None, RouterKind::Ripup, None).unwrap();
         assert!(summary.grid_w >= 10 && summary.grid_h >= 10);
     }
 
@@ -590,8 +896,8 @@ mod tests {
     #[test]
     fn rejects_non_positive_resolution() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
-        assert!(route_problem(&srj, Some(0.0), RouterKind::Ripup).is_err());
-        assert!(route_problem(&srj, Some(-1.0), RouterKind::Ripup).is_err());
+        assert!(route_problem(&srj, Some(0.0), RouterKind::Ripup, None).is_err());
+        assert!(route_problem(&srj, Some(-1.0), RouterKind::Ripup, None).is_err());
     }
 
     #[test]
@@ -621,11 +927,12 @@ mod tests {
             total_cost: 42,
             grid_w: 10,
             grid_h: 8,
+            grid_layers: 1,
         };
         let text = s.to_string();
         assert!(!text.contains('\n'));
         assert!(text.contains("2/3"));
-        assert!(text.contains("10x8"));
+        assert!(text.contains("10x8x1L"));
     }
 
     #[test]
@@ -689,9 +996,13 @@ mod tests {
 
     #[test]
     fn route_dsn_round_trip_routes_synthetic_board() {
-        let (srj, stats) = dsn_to_srj_with_stats(SYNTH_DSN).unwrap();
-        assert_eq!(srj.connections.len(), 1);
-        let (report, traces) = route_dsn_problem(srj, stats, Some(0.5), &[], None).unwrap();
+        let ingest = dsn_to_ingest(SYNTH_DSN).unwrap();
+        assert_eq!(ingest.srj.connections.len(), 1);
+        let (report, traces, ses) =
+            route_dsn_problem(ingest, "synth", Some(0.5), &[], None, None).unwrap();
+        // The SES is well-formed and names the routed net.
+        assert!(ses.contains("(session"));
+        assert!(ses.contains("(net \"N1\""));
         assert_eq!(report.total_nets, 1);
         assert_eq!(report.routed_nets, 1, "open board net should route");
         assert_eq!(report.fully_connected, 1);
@@ -726,11 +1037,11 @@ mod tests {
           )
         )
         "#;
-        let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
-        assert_eq!(srj.connections.len(), 2);
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.srj.connections.len(), 2);
         // Skip GND -> only SIGNAL remains.
-        let (report, _) =
-            route_dsn_problem(srj, stats, Some(0.5), &["GND".to_string()], None).unwrap();
+        let (report, _, _) =
+            route_dsn_problem(ingest, "f", Some(0.5), &["GND".to_string()], None, None).unwrap();
         assert_eq!(report.original_nets, 1);
     }
 }

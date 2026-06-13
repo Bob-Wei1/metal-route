@@ -162,12 +162,23 @@ impl SearchBuf {
 /// - `heuristic(c)` is an admissible remaining-cost estimate to the goal (return
 ///   `0` for plain Dijkstra). Priority is `dist + heuristic`.
 ///
+/// Layer changes (vias) are driven by `via_step(u, v)`: for each adjacent-layer
+/// cell `v` at the same `(x, y)` as the cell `u` being expanded (see
+/// [`mr_core::Dims::via_neighbors`]), it returns `Some(cost)` when a via step
+/// `u -> v` is legal and what it costs to take, or `None` when no via may be
+/// drilled there. Unlike a planar move the via's price is the returned `cost`
+/// itself (NOT `cost_fn(v)`); `blocked_fn(v)` is still honoured first so a via
+/// can never land on a foreign pad or an out-of-window cell. On a single-layer
+/// grid `via_neighbors` is empty, so the search is byte-identical to the planar
+/// case regardless of `via_step`.
+///
 /// Tie-break matches [`dijkstra`] exactly: the heap is keyed `(Reverse(prio),
 /// Reverse(cell))` (lowest priority then lowest cell index first), and
 /// predecessors are first-writer-wins on strict improvement. Returns the path
 /// `src..=dst` and its summed enter-cost, or `None` when `dst` is unreachable.
 /// Work is O(explored), not O(n).
-pub(crate) fn astar_buf<C, B, H>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn astar_buf<C, B, H, V>(
     buf: &mut SearchBuf,
     dims: Dims,
     src: CellIdx,
@@ -175,11 +186,13 @@ pub(crate) fn astar_buf<C, B, H>(
     cost_fn: C,
     blocked_fn: B,
     heuristic: H,
+    via_step: V,
 ) -> Option<(Vec<CellIdx>, Cost)>
 where
     C: Fn(CellIdx) -> Cost,
     B: Fn(CellIdx) -> bool,
     H: Fn(CellIdx) -> Cost,
+    V: Fn(CellIdx, CellIdx) -> Option<Cost>,
 {
     buf.begin();
 
@@ -203,8 +216,10 @@ where
         }
         // Inline the 4-neighbour enumeration in ascending CellIdx order (up, left,
         // right, down) to avoid allocating + sorting a Vec on every expansion — the
-        // single hottest op in the negotiation loop.
-        let (x, y) = dims.xy(u);
+        // single hottest op in the negotiation loop. The neighbours stay on `u`'s
+        // own layer `l` (via `idx3`); on a single-layer grid `l == 0` and `idx3`
+        // reduces to the historical `idx`, so this path is byte-identical there.
+        let (x, y, l) = dims.xyz(u);
         let mut relax = |v: CellIdx| {
             if blocked_fn(v) {
                 return;
@@ -219,16 +234,36 @@ where
             }
         };
         if y > 0 {
-            relax(dims.idx(x, y - 1));
+            relax(dims.idx3(x, y - 1, l));
         }
         if x > 0 {
-            relax(dims.idx(x - 1, y));
+            relax(dims.idx3(x - 1, y, l));
         }
         if x + 1 < dims.w {
-            relax(dims.idx(x + 1, y));
+            relax(dims.idx3(x + 1, y, l));
         }
         if y + 1 < dims.h {
-            relax(dims.idx(x, y + 1));
+            relax(dims.idx3(x, y + 1, l));
+        }
+        // Via (layer-changing) moves AFTER the four planar ones. `via_neighbors`
+        // is empty on a single-layer grid (so this is a no-op there) and otherwise
+        // returns the adjacent-layer cells at the same (x, y), lower layer first.
+        // A via step is priced by `via_step` itself (its returned cost), not by
+        // `cost_fn(v)`, but still honours `blocked_fn(v)` first so it can never
+        // land on a foreign pad or an out-of-window cell. Tie-break / first-writer
+        // semantics are identical to the planar relax.
+        for v in dims.via_neighbors(u) {
+            if blocked_fn(v) {
+                continue;
+            }
+            if let Some(step) = via_step(u, v) {
+                let nd = du.saturating_add(step);
+                if nd < buf.dist_of(v) {
+                    buf.set(v, nd, u);
+                    let np = nd.saturating_add(heuristic(v));
+                    heap.push((Reverse(np), Reverse(v)));
+                }
+            }
         }
     }
 
@@ -326,6 +361,8 @@ mod tests {
                 |c| grid.cost_at(c),
                 |c| grid.is_obstacle(c),
                 h,
+                // Single-layer grid: no via neighbours, so this is never called.
+                |_, _| None,
             );
 
             match (ref_path, got) {

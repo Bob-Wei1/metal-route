@@ -43,7 +43,8 @@
 use std::collections::HashMap;
 
 use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError, OBSTACLE,
+    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError, ViaModel,
+    OBSTACLE,
 };
 
 use crate::dijkstra::{astar_buf, SearchBuf};
@@ -171,12 +172,27 @@ impl PadSet {
 }
 
 /// PathFinder-style negotiated-congestion router. Default multi-net backend.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NegotiatedRouter;
+///
+/// `via_model` gates and prices layer changes. When `None` (the default), a
+/// [`ViaModel::through_hole`] over the grid's layer count is synthesised at route
+/// time, so a multi-layer board uses unrestricted through-hole vias unless the
+/// caller supplies a restricted model via [`NegotiatedRouter::with_via_model`]. On
+/// a single-layer board the model is inert (no via neighbours exist).
+#[derive(Debug, Default, Clone)]
+pub struct NegotiatedRouter {
+    via_model: Option<ViaModel>,
+}
 
 impl NegotiatedRouter {
     pub fn new() -> Self {
-        Self
+        Self { via_model: None }
+    }
+
+    /// Use an explicit [`ViaModel`] (e.g. a blind/buried stackup) instead of the
+    /// default through-hole model. Builder-style; returns the configured router.
+    pub fn with_via_model(mut self, vm: ViaModel) -> Self {
+        self.via_model = Some(vm);
+        self
     }
 }
 
@@ -197,15 +213,22 @@ fn unit_cost(path: &[CellIdx]) -> Cost {
     path.len().saturating_sub(1) as Cost
 }
 
-/// Manhattan distance between two cells, scaled by [`SCALE`]. Admissible for the
-/// per-cell cost model (every step costs at least `SCALE`), so it is a valid A*
-/// heuristic that keeps Dijkstra optimal while pruning the frontier.
-fn manhattan_scaled(dims: mr_core::Dims, a: CellIdx, b: CellIdx) -> Cost {
+/// Manhattan distance between two cells, scaled by [`SCALE`], plus the layer
+/// distance priced at the cheapest legal via step (`min_via_cost`). Admissible
+/// for the 3D per-cell cost model: every planar step costs at least `SCALE` and
+/// every layer change costs at least `min_via_cost`, so reaching `b` from `a`
+/// requires at least `|dx|+|dy|` planar steps and `|layer(a)-layer(b)|` via
+/// steps. The estimate therefore never overestimates and keeps A* optimal while
+/// pruning the frontier. On a single-layer grid the layer term is always 0.
+fn manhattan_scaled(dims: mr_core::Dims, a: CellIdx, b: CellIdx, min_via_cost: Cost) -> Cost {
     let (ax, ay) = dims.xy(a);
     let (bx, by) = dims.xy(b);
     let dx = ax.abs_diff(bx);
     let dy = ay.abs_diff(by);
-    (dx + dy).saturating_mul(SCALE)
+    let dl = dims.layer_of(a).abs_diff(dims.layer_of(b));
+    (dx + dy)
+        .saturating_mul(SCALE)
+        .saturating_add(dl.saturating_mul(min_via_cost))
 }
 
 impl Router for NegotiatedRouter {
@@ -229,6 +252,14 @@ impl Router for NegotiatedRouter {
         let dims = grid.dims;
         let n_cells = dims.len();
         let n_nets = nets.len();
+
+        // Effective via model: the caller's, or a through-hole model over the grid's
+        // layer count. On a single-layer grid it is inert (no via neighbours exist),
+        // so the search stays byte-identical to the planar router.
+        let via_model = self
+            .via_model
+            .clone()
+            .unwrap_or_else(|| ViaModel::through_hole(dims.layers));
 
         // Reusable search workspace and own-pad membership set, sized once to the
         // board and reused across every per-net search (no per-net O(n) work).
@@ -306,7 +337,7 @@ impl Router for NegotiatedRouter {
                 // full board so the occasional global net still completes.
                 let routed = route_negotiated(
                     &mut buf, grid, &pad_set, &present, &history, pfac, net.src, net.dst,
-                    windows[i],
+                    windows[i], &via_model,
                 )
                 .or_else(|| {
                     route_negotiated(
@@ -319,6 +350,7 @@ impl Router for NegotiatedRouter {
                         net.src,
                         net.dst,
                         Window::full(dims),
+                        &via_model,
                     )
                 });
 
@@ -416,6 +448,7 @@ impl Router for NegotiatedRouter {
                 pad_set.load(&net.passable_pads);
                 let routed = route_legal(
                     &mut buf, grid, &pad_set, &no_owner, -1, net.src, net.dst, windows[i],
+                    &via_model,
                 )
                 .or_else(|| {
                     route_legal(
@@ -427,6 +460,7 @@ impl Router for NegotiatedRouter {
                         net.src,
                         net.dst,
                         Window::full(dims),
+                        &via_model,
                     )
                 });
                 if let Some((path, _)) = routed {
@@ -482,6 +516,7 @@ impl Router for NegotiatedRouter {
                 &windows,
                 order,
                 n_cells,
+                &via_model,
             );
             let routed = committed.iter().filter(|c| c.is_some()).count();
             let total_cost: Cost = committed
@@ -528,6 +563,7 @@ impl Router for NegotiatedRouter {
                 &windows,
                 &best_order,
                 n_cells,
+                &via_model,
             );
             let rip_routed = rip.iter().filter(|c| c.is_some()).count();
             if rip_routed > best_routed {
@@ -580,15 +616,22 @@ fn route_negotiated(
     src: CellIdx,
     dst: CellIdx,
     window: Window,
+    via_model: &ViaModel,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
-    let cost_fn = |c: CellIdx| -> Cost {
+    // Price to ENTER cell `c`: planar base `SCALE`, plus permanent history and the
+    // present-congestion penalty, capped below OBSTACLE. Vias reuse this same
+    // congestion (history + present of the destination cell) but substitute the
+    // planar `SCALE` base with the via's `step_cost` so layer changes also
+    // negotiate congestion — see `via_priced` below.
+    let priced_with_base = |c: CellIdx, base_cost: u64| -> Cost {
         let ci = c as usize;
-        let priced = (SCALE as u64)
+        let priced = base_cost
             .saturating_add(history[ci] as u64)
             .saturating_add((pfac as u64) * (SCALE as u64) * (present[ci] as u64));
         priced.min(OBSTACLE as u64 - 1) as Cost
     };
+    let cost_fn = |c: CellIdx| -> Cost { priced_with_base(c, SCALE as u64) };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
             return true;
@@ -598,8 +641,21 @@ fn route_negotiated(
         }
         base.is_obstacle(c) && !pads.contains(c)
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, c, dst);
-    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h)
+    // A via step `u -> v` (adjacent layers, same x,y) is allowed iff the model
+    // permits that layer transition; it is priced like a cell but with the via's
+    // `step_cost` as the base instead of the planar `SCALE`, so vias negotiate the
+    // destination cell's congestion exactly as planar moves do. `blocked_fn` is
+    // applied to `v` by `astar_buf` first, so an out-of-window / foreign-pad target
+    // already blocks the via.
+    let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
+        if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v)) {
+            Some(priced_with_base(v, via_model.step_cost as u64))
+        } else {
+            None
+        }
+    };
+    let h = |c: CellIdx| manhattan_scaled(dims, c, dst, via_model.step_cost);
+    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
 /// Route one net for legalization / rip-up using on-the-fly costs — no grid clone.
@@ -619,6 +675,7 @@ fn route_legal(
     src: CellIdx,
     dst: CellIdx,
     window: Window,
+    via_model: &ViaModel,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
     let has_owner = !owner.is_empty();
@@ -655,8 +712,17 @@ fn route_legal(
         }
         base.is_obstacle(c) && !pads.contains(c)
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, c, dst);
-    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h)
+    // A via step is legal per the model; it costs the via's `step_cost` (foreign
+    // owners / endpoints are already rejected by `blocked_fn` on the destination).
+    let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
+        if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v)) {
+            Some(via_model.step_cost)
+        } else {
+            None
+        }
+    };
+    let h = |c: CellIdx| manhattan_scaled(dims, c, dst, via_model.step_cost);
+    astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
 /// Commit all connection groups in the given `group_order`, returning the
@@ -682,6 +748,7 @@ fn legalize_in_order(
     windows: &[Window],
     group_order: &[usize],
     n_cells: usize,
+    via_model: &ViaModel,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -718,20 +785,23 @@ fn legalize_in_order(
                 Some(cur.clone())
             } else {
                 pad_set.load(&net.passable_pads);
-                route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
-                    .or_else(|| {
-                        route_legal(
-                            buf,
-                            grid,
-                            pad_set,
-                            &owner,
-                            gi,
-                            net.src,
-                            net.dst,
-                            Window::full(dims),
-                        )
-                    })
-                    .map(|(p, _)| p)
+                route_legal(
+                    buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i], via_model,
+                )
+                .or_else(|| {
+                    route_legal(
+                        buf,
+                        grid,
+                        pad_set,
+                        &owner,
+                        gi,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                        via_model,
+                    )
+                })
+                .map(|(p, _)| p)
             };
 
             if let Some(path) = chosen {
@@ -786,6 +856,7 @@ fn ripup_legalize(
     windows: &[Window],
     seed_group_order: &[usize],
     n_cells: usize,
+    via_model: &ViaModel,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -863,7 +934,9 @@ fn ripup_legalize(
         // ripped-around prematurely, without the whole-board failure cost for the
         // many purely-local nets.
         pad_set.load(&net.passable_pads);
-        let routed = route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
+        let routed = route_legal(
+            buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i], via_model,
+        )
             .or_else(|| {
                 if needs_full[i] {
                     route_legal(
@@ -875,6 +948,7 @@ fn ripup_legalize(
                         net.src,
                         net.dst,
                         Window::full(dims),
+                        via_model,
                     )
                 } else {
                     None
@@ -939,7 +1013,9 @@ fn ripup_legalize(
         rips_done += 1;
 
         // Re-route i now that the victim's cells are free.
-        let rerouted = route_legal(buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i])
+        let rerouted = route_legal(
+            buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i], via_model,
+        )
             .or_else(|| {
                 if needs_full[i] {
                     route_legal(
@@ -951,6 +1027,7 @@ fn ripup_legalize(
                         net.src,
                         net.dst,
                         Window::full(dims),
+                        via_model,
                     )
                 } else {
                     None
@@ -1051,7 +1128,7 @@ mod tests {
             "precondition: naive paths collide at centre"
         );
 
-        let br = NegotiatedRouter
+        let br = NegotiatedRouter::new()
             .route(&grid, &[a.clone(), b.clone()])
             .unwrap();
         assert!(br.unrouted.is_empty(), "both nets must route: {br:?}");
@@ -1091,7 +1168,7 @@ mod tests {
             passable_pads: Vec::new(),
         };
 
-        let br = NegotiatedRouter.route(&grid, &[net_a, net_b]).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &[net_a, net_b]).unwrap();
         assert!(br.unrouted.is_empty(), "both nets must route: {br:?}");
         assert_eq!(br.results.len(), 2);
 
@@ -1118,7 +1195,7 @@ mod tests {
             net("a", dims.idx(0, 1), dims.idx(2, 1)),
             net("b", dims.idx(0, 1), dims.idx(2, 1)),
         ];
-        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(
             br.results.len() + br.unrouted.len(),
             2,
@@ -1138,8 +1215,8 @@ mod tests {
             net("b", dims.idx(4, 0), dims.idx(0, 4)),
             net("c", dims.idx(0, 2), dims.idx(4, 2)),
         ];
-        let br1 = NegotiatedRouter.route(&grid, &nets).unwrap();
-        let br2 = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br1 = NegotiatedRouter::new().route(&grid, &nets).unwrap();
+        let br2 = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(br1.results, br2.results);
         assert_eq!(br1.unrouted, br2.unrouted);
         assert_eq!(br1.congestion, br2.congestion);
@@ -1157,7 +1234,7 @@ mod tests {
             net("X#0", dims.idx(0, 0), dims.idx(1, 0)),
             net("X#1", dims.idx(1, 0), dims.idx(2, 0)),
         ];
-        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert!(br.unrouted.is_empty(), "both sub-nets must route: {br:?}");
         assert_eq!(br.results.len(), 2);
         let mid = dims.idx(1, 0);
@@ -1199,7 +1276,7 @@ mod tests {
             "precondition: greedy paths are in mutual conflict"
         );
 
-        let br = NegotiatedRouter
+        let br = NegotiatedRouter::new()
             .route(&grid, &[a.clone(), b.clone()])
             .unwrap();
         assert!(
@@ -1239,7 +1316,7 @@ mod tests {
             net("c", dims.idx(2, 1), dims.idx(5, 3)),
         ];
 
-        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert!(
             br.unrouted.is_empty(),
             "rip-up must route all three nets: {br:?}"
@@ -1280,11 +1357,11 @@ mod tests {
             net("a", dims.idx(0, 1), dims.idx(2, 1)),
             net("b", dims.idx(0, 1), dims.idx(2, 1)),
         ];
-        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(br.results.len() + br.unrouted.len(), 2);
         assert_eq!(br.unrouted.len(), 1, "single corridor fits only one net");
         // Determinism across repeated runs (rip-up tie-breaks must be stable).
-        let br2 = NegotiatedRouter.route(&grid, &nets).unwrap();
+        let br2 = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(br.results, br2.results);
         assert_eq!(br.unrouted, br2.unrouted);
     }
@@ -1342,7 +1419,7 @@ mod tests {
             "precondition: gap column is outside the window"
         );
 
-        let br = NegotiatedRouter.route(&grid, &[a.clone()]).unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
         assert!(
             br.unrouted.is_empty(),
             "net must route via the full-board retry: {br:?}"
@@ -1406,6 +1483,9 @@ mod tests {
             .map(|net| net_window(dims, net.src, net.dst, &net.passable_pads))
             .collect();
 
+        // Single-layer board: the via model is inert (no via neighbours exist).
+        let via_model = ViaModel::through_hole(dims.layers);
+
         // Order [0,1] = A first: B should be stranded.
         let c_ab = legalize_in_order(
             &grid,
@@ -1417,6 +1497,7 @@ mod tests {
             &windows,
             &[0, 1],
             n_cells,
+            &via_model,
         );
         assert!(c_ab[0].is_some(), "A commits in A-first order");
         assert!(
@@ -1435,6 +1516,7 @@ mod tests {
             &windows,
             &[1, 0],
             n_cells,
+            &via_model,
         );
         assert!(
             c_ba[0].is_some() && c_ba[1].is_some(),
@@ -1443,7 +1525,7 @@ mod tests {
 
         // The full router must pick the good order and route BOTH nets even though
         // first-appearance order [A, B] alone would strand B.
-        let br = NegotiatedRouter
+        let br = NegotiatedRouter::new()
             .route(&grid, &[a.clone(), b.clone()])
             .unwrap();
         assert!(
@@ -1457,5 +1539,105 @@ mod tests {
             disjoint(pa, pb),
             "paths must be cell-disjoint: {pa:?} {pb:?}"
         );
+    }
+
+    /// A 2-layer board whose ONLY planar corridor on layer 0 is fully walled off
+    /// between src and dst. The net is unroutable on layer 0 alone but routes by
+    /// via-ing up to layer 1, crossing the (open) wall column there, and via-ing
+    /// back down. The path must therefore touch BOTH layers.
+    #[test]
+    fn vias_route_around_a_full_layer0_wall() {
+        // 3 wide, 1 tall, 2 layers. A wall at (1,0) on layer 0 splits the single
+        // row into two halves; there is no layer-0 path from (0,0) to (2,0).
+        // `GridBuilder::mark_cell` marks layer 0 only, so layer 1 is fully open.
+        let dims = Dims::with_layers(3, 1, 2);
+        let mut gb = GridBuilder::new(dims, 1);
+        gb.mark_cell(1, 0); // wall on layer 0 at x=1
+        let grid = gb.build();
+
+        // Precondition: layer 0 alone has no path (the wall is the whole corridor).
+        assert!(grid.is_obstacle(dims.idx3(1, 0, 0)));
+        assert!(!grid.is_obstacle(dims.idx3(1, 0, 1)), "layer 1 must be open");
+
+        let a = net("a", dims.idx3(0, 0, 0), dims.idx3(2, 0, 0));
+        let br = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
+        assert!(
+            br.unrouted.is_empty(),
+            "net must route by changing layers: {br:?}"
+        );
+        assert_eq!(br.results.len(), 1);
+
+        let path = &br.results[0].path;
+        assert_eq!(path.first().copied(), Some(a.src));
+        assert_eq!(path.last().copied(), Some(a.dst));
+        // The path uses both layers (a via up, cross, a via back down).
+        assert!(
+            path.iter().any(|&c| dims.layer_of(c) == 0),
+            "path must touch layer 0: {path:?}"
+        );
+        assert!(
+            path.iter().any(|&c| dims.layer_of(c) == 1),
+            "path must via onto layer 1 to cross the wall: {path:?}"
+        );
+        // Every step is either a same-layer 4-neighbour or a same-(x,y) via step.
+        for w in path.windows(2) {
+            let planar = dims.neighbors4(w[0]).contains(&w[1]);
+            let via = dims.via_neighbors(w[0]).contains(&w[1]);
+            assert!(planar || via, "illegal step {} -> {}", w[0], w[1]);
+        }
+    }
+
+    /// Same wall as above, but a restricted [`ViaModel`] forbids the only layer
+    /// transition (0<->1). With no legal via and no layer-0 corridor, the net is
+    /// unroutable.
+    #[test]
+    fn forbidden_via_step_leaves_net_unrouted() {
+        let dims = Dims::with_layers(3, 1, 2);
+        let mut gb = GridBuilder::new(dims, 1);
+        gb.mark_cell(1, 0);
+        let grid = gb.build();
+
+        // Two layers but the model permits NO adjacent step (empty allow-list), so
+        // the 0<->1 transition is illegal and the wall cannot be bypassed.
+        let vm = ViaModel::with_allowed_steps(2, ViaModel::DEFAULT_STEP_COST, Vec::new());
+        let a = net("a", dims.idx3(0, 0, 0), dims.idx3(2, 0, 0));
+        let br = NegotiatedRouter::new()
+            .with_via_model(vm)
+            .route(&grid, &[a.clone()])
+            .unwrap();
+        assert_eq!(br.results.len(), 0, "no route exists without a legal via");
+        assert_eq!(br.unrouted, vec!["a".to_string()]);
+    }
+
+    /// `layers == 1` regression: a known single-layer board must route exactly as
+    /// it did before vias existed (same path cost). Vias add nothing because
+    /// `via_neighbors` is empty on a single-layer grid.
+    #[test]
+    fn single_layer_routes_identically_with_vias_available() {
+        // 5x5 open grid, straight Manhattan net: the optimal cost is the bbox
+        // Manhattan distance (4) regardless of which monotone path is taken.
+        let dims = Dims::new(5, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+        let a = net("a", dims.idx(0, 0), dims.idx(4, 0));
+
+        // Default router (synthesises a through-hole model over 1 layer) and an
+        // explicit through-hole model must both produce the same single-layer route.
+        let br_default = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
+        let br_vm = NegotiatedRouter::new()
+            .with_via_model(ViaModel::through_hole(1))
+            .route(&grid, &[a.clone()])
+            .unwrap();
+
+        assert!(br_default.unrouted.is_empty());
+        assert_eq!(br_default.results.len(), 1);
+        assert_eq!(br_default.results[0].cost, 4, "straight 5-wide run costs 4");
+        // Every cell stays on layer 0 (there is no other layer).
+        assert!(br_default.results[0]
+            .path
+            .iter()
+            .all(|&c| dims.layer_of(c) == 0));
+        // The via model makes no difference on a single-layer board.
+        assert_eq!(br_default.results, br_vm.results);
+        assert_eq!(br_default.congestion, br_vm.congestion);
     }
 }

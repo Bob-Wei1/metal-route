@@ -3,5 +3,6 @@
 Cargo.lock.bak
 .DS_Store
 
-# tscircuit benchmark harness (cloned, not vendored)
+# tscircuit benchmark harness (cloned, not vendored) + generated fixtures
 /.bench/
+/bench/
