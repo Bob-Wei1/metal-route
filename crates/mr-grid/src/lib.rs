@@ -51,6 +51,17 @@ impl GridBuilder {
         self
     }
 
+    /// Clear a single cell back to passable (the inverse of [`Self::mark_cell`]).
+    /// Out-of-bounds is ignored. Used to guarantee a routing endpoint is never
+    /// left on an obstacle even when an obstacle rect overlaps it.
+    pub fn clear_cell(&mut self, x: u32, y: u32) -> &mut Self {
+        if self.dims.in_bounds(x, y) {
+            let i = self.dims.idx(x, y) as usize;
+            self.blocked[i] = false;
+        }
+        self
+    }
+
     /// Mark an inclusive cell rectangle `[x0,x1] × [y0,y1]` as obstacles.
     /// Coordinates are clamped to the grid; order of corners does not matter.
     pub fn mark_rect(&mut self, x0: u32, y0: u32, x1: u32, y1: u32) -> &mut Self {

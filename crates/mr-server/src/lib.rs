@@ -107,7 +107,17 @@ pub fn choose_resolution(srj: &SimpleRouteJson, override_res: Option<f64>) -> f6
     if max_span <= 0.0 {
         return MIN_RESOLUTION;
     }
-    (max_span / TARGET_CELLS_PER_AXIS).max(MIN_RESOLUTION)
+    let mut res = (max_span / TARGET_CELLS_PER_AXIS).max(MIN_RESOLUTION);
+    // Real boards pack 0.1mm traces between ~0.38mm pads pitched ~0.8mm apart;
+    // the bounds-derived cell is far too coarse to fit a trace between pads.
+    // Cap it at ~2 trace widths so routing has room, while keeping the
+    // bounds-based ceiling so a large board never explodes into a huge grid.
+    if let Some(w) = srj.min_trace_width {
+        if w.is_finite() && w > 0.0 {
+            res = res.min((w * 2.0).max(MIN_RESOLUTION));
+        }
+    }
+    res
 }
 
 /// `POST /solve` handler.
@@ -128,7 +138,17 @@ async fn solve(
         Err(e) => return router_error_response(e),
     };
 
-    let solution_soup = to_solution(&board, &problem.mapping, DEFAULT_TRACE_WIDTH, DEFAULT_LAYER);
+    let trace_width = req
+        .simple_route_json
+        .min_trace_width
+        .unwrap_or(DEFAULT_TRACE_WIDTH);
+    let solution_soup = to_solution(
+        &board,
+        &problem.mapping,
+        &problem.pin_points,
+        trace_width,
+        DEFAULT_LAYER,
+    );
     (StatusCode::OK, Json(SolveResponse { solution_soup })).into_response()
 }
 

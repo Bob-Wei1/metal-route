@@ -34,15 +34,22 @@
 //! `"<conn.name>#1"`, …; a plain two-point connection keeps the bare `conn.name`.
 //! Connections with fewer than two points produce no nets.
 
+use std::collections::HashMap;
+
 use mr_core::{BoardRoute, CellIdx, Dims, Grid, NetEndpoints};
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
 /// A 2-D point in continuous tscircuit coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// The real harness attaches extra fields (`layer`, `pcb_port_id`); `layer` is
+/// captured for completeness and any other unknown fields are ignored by serde.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
+    #[serde(default)]
+    pub layer: Option<String>,
 }
 
 /// Axis-aligned problem bounds in continuous coordinates.
@@ -59,13 +66,20 @@ pub struct Bounds {
 ///
 /// `kind` mirrors the JSON `type` field (always `"rect"` today) but is kept as a
 /// `String` so unknown shapes still round-trip rather than failing to parse.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Obstacle {
     #[serde(rename = "type")]
     pub kind: String,
     pub center: Point,
     pub width: f64,
     pub height: f64,
+    /// Layers this obstacle sits on (e.g. `["top"]`). Empty if unspecified.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// IDs of the pads/elements this obstacle is electrically connected to
+    /// (the harness emits `connectedTo`). Empty if unspecified.
+    #[serde(default, rename = "connectedTo")]
+    pub connected_to: Vec<String>,
 }
 
 /// One named connection: a list of pads/points that must all be electrically
@@ -82,6 +96,10 @@ pub struct Connection {
 #[serde(rename_all = "camelCase")]
 pub struct SimpleRouteJson {
     pub layer_count: u32,
+    /// Minimum trace width in continuous units (the harness emits `minTraceWidth`).
+    /// Drives both the emitted wire width and the rasterisation resolution.
+    #[serde(default)]
+    pub min_trace_width: Option<f64>,
     #[serde(default)]
     pub obstacles: Vec<Obstacle>,
     #[serde(default)]
@@ -160,6 +178,12 @@ pub struct RasterizedProblem {
     pub grid: Grid,
     pub nets: Vec<NetEndpoints>,
     pub mapping: Mapping,
+    /// Exact continuous `(x, y)` of every connection endpoint, keyed by the cell
+    /// it rasterised to. Used by [`to_solution`] to snap each trace's first/last
+    /// vertex back to the exact port coordinate so connectivity checks
+    /// (`distance < 0.01`) pass. If two endpoints collide into one cell only one
+    /// survives — the resolution is chosen fine enough that this does not happen.
+    pub pin_points: HashMap<CellIdx, (f64, f64)>,
 }
 
 /// (B3) Rasterise a continuous tscircuit problem into a cell-space problem.
@@ -170,12 +194,31 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     let mapping = Mapping::new(&srj.bounds, resolution);
     let mut builder = GridBuilder::new(mapping.dims, 1);
 
+    // Collect every connection endpoint as a continuous (x, y). These are the
+    // pad centres we must connect; the pad each one sits in is also present in
+    // `obstacles`, and marking it would box the endpoint in inside its own pad.
+    let endpoints: Vec<(f64, f64)> = srj
+        .connections
+        .iter()
+        .flat_map(|conn| conn.points_to_connect.iter().map(|p| (p.x, p.y)))
+        .collect();
+
     for obs in &srj.obstacles {
         // Continuous box covered by the rect.
         let min_x = obs.center.x - obs.width / 2.0;
         let max_x = obs.center.x + obs.width / 2.0;
         let min_y = obs.center.y - obs.height / 2.0;
         let max_y = obs.center.y + obs.height / 2.0;
+
+        // Skip pads we must connect into: if any endpoint lies within this
+        // rect's continuous box, marking it would trap that endpoint. Decoy /
+        // other-net pads contain no endpoint and stay obstacles.
+        if endpoints
+            .iter()
+            .any(|&(px, py)| px >= min_x && px <= max_x && py >= min_y && py <= max_y)
+        {
+            continue;
+        }
 
         // Lower cell holds the box minimum; upper cell is the last cell whose
         // square overlaps the box. A box edge that lands exactly on a cell
@@ -189,6 +232,17 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         builder.mark_rect(x0, y0, x1, y1);
     }
 
+    // Belt-and-suspenders: explicitly clear the exact cell of every endpoint, so
+    // an endpoint is never on an obstacle even if a non-skipped obstacle (e.g. a
+    // neighbouring pad) happens to overlap it. Also record each endpoint's exact
+    // continuous coordinate so `to_solution` can snap traces back to the port.
+    let mut pin_points: HashMap<CellIdx, (f64, f64)> = HashMap::new();
+    for &(px, py) in &endpoints {
+        let (cx, cy) = mapping.point_to_xy((px, py));
+        builder.clear_cell(cx, cy);
+        pin_points.insert(mapping.dims.idx(cx, cy), (px, py));
+    }
+
     let grid = builder.build();
     let nets = decompose_connections(&srj.connections, &mapping);
 
@@ -196,6 +250,7 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         grid,
         nets,
         mapping,
+        pin_points,
     }
 }
 
@@ -274,9 +329,16 @@ impl PcbTrace {
 /// Each [`mr_core::RouteResult`] becomes one [`PcbTrace`] whose route is the
 /// sequence of wire vertices at the continuous cell centres of its path. This is
 /// single-layer for now: every vertex is on `layer` and no vias are emitted.
+///
+/// The first and last vertex of every trace are snapped to the *exact* port
+/// coordinate via `pin_points` (keyed by the endpoint cell) so the harness'
+/// connectivity check (`distance(port, vertex) < 0.01`) matches. Interior
+/// vertices stay at cell centres; an endpoint cell missing from `pin_points`
+/// falls back to its cell centre.
 pub fn to_solution(
     board: &BoardRoute,
     mapping: &Mapping,
+    pin_points: &HashMap<CellIdx, (f64, f64)>,
     trace_width: f64,
     layer: &str,
 ) -> Vec<PcbTrace> {
@@ -284,11 +346,22 @@ pub fn to_solution(
         .results
         .iter()
         .map(|result| {
+            let last = result.path.len().saturating_sub(1);
             let route = result
                 .path
                 .iter()
-                .map(|&cell| {
-                    let (x, y) = mapping.cell_center(cell);
+                .enumerate()
+                .map(|(i, &cell)| {
+                    // Snap the first/last vertex to the exact port coordinate;
+                    // interior vertices stay at the cell centre.
+                    let (x, y) = if i == 0 || i == last {
+                        pin_points
+                            .get(&cell)
+                            .copied()
+                            .unwrap_or_else(|| mapping.cell_center(cell))
+                    } else {
+                        mapping.cell_center(cell)
+                    };
                     RoutePoint::Wire {
                         x,
                         y,
@@ -427,7 +500,8 @@ mod tests {
             unrouted: vec![],
             congestion: vec![],
         };
-        let traces = to_solution(&board, &mapping, 0.2, "top");
+        let pins = HashMap::new();
+        let traces = to_solution(&board, &mapping, &pins, 0.2, "top");
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].kind, "pcb_trace");
         assert_eq!(traces[0].route.len(), 3);
@@ -465,7 +539,8 @@ mod tests {
             unrouted: vec![],
             congestion: vec![],
         };
-        let traces = to_solution(&board, &mapping, 0.1, "top");
+        let pins = HashMap::new();
+        let traces = to_solution(&board, &mapping, &pins, 0.1, "top");
         let json = serde_json::to_string(&traces).unwrap();
         assert!(json.contains("\"type\":\"pcb_trace\""), "json: {json}");
         assert!(json.contains("\"route_type\":\"wire\""), "json: {json}");
@@ -516,5 +591,145 @@ mod tests {
         assert_eq!(mapping.dims, Dims::new(1, 1));
         // Any point clamps to cell 0.
         assert_eq!(mapping.point_to_cell((100.0, -100.0)), 0);
+    }
+
+    /// (a) Parse the real-harness shape: `minTraceWidth`, obstacle `layers` /
+    /// `connectedTo`, and per-point `layer` / `pcb_port_id` (unknown fields are
+    /// ignored, not rejected).
+    #[test]
+    fn parses_real_harness_fields() {
+        let blob = r#"{
+            "minTraceWidth": 0.1,
+            "layerCount": 1,
+            "bounds": { "minX": 0, "maxX": 5, "minY": 0, "maxY": 5 },
+            "obstacles": [
+                { "type": "rect", "layers": ["top"], "center": {"x": 2, "y": 2},
+                  "width": 0.38, "height": 0.38, "connectedTo": ["pcb_smtpad_3"] }
+            ],
+            "connections": [
+                { "name": "source_trace_0", "pointsToConnect": [
+                    {"x": 1, "y": 1, "layer": "top", "pcb_port_id": "pcb_port_15"},
+                    {"x": 4, "y": 4, "layer": "top", "pcb_port_id": "pcb_port_16"} ] }
+            ]
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        assert_eq!(srj.min_trace_width, Some(0.1));
+        assert_eq!(srj.obstacles[0].layers, vec!["top".to_string()]);
+        assert_eq!(
+            srj.obstacles[0].connected_to,
+            vec!["pcb_smtpad_3".to_string()]
+        );
+        let p = &srj.connections[0].points_to_connect[0];
+        assert_eq!(p.x, 1.0);
+        assert_eq!(p.layer.as_deref(), Some("top"));
+    }
+
+    /// (b) An endpoint that sits at the centre of its own pad obstacle must NOT
+    /// be left boxed in: rasterising must clear the endpoint cell (the pad it
+    /// connects into is skipped) so the router has a passable start/end.
+    #[test]
+    fn rasterize_does_not_box_in_endpoint_inside_pad() {
+        // A 0.4mm pad centred on the endpoint at (5,5), pad spans several cells
+        // at res 0.1; the endpoint would be on an obstacle without the skip.
+        let blob = r#"{
+            "minTraceWidth": 0.1,
+            "layerCount": 1,
+            "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+            "obstacles": [
+                { "type": "rect", "center": {"x": 5, "y": 5}, "width": 0.4, "height": 0.4,
+                  "connectedTo": ["pcb_smtpad_0"] }
+            ],
+            "connections": [
+                { "name": "n", "pointsToConnect": [ {"x": 5, "y": 5}, {"x": 9, "y": 9} ] }
+            ]
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        let prob = rasterize(&srj, 0.1);
+        let src = prob.nets[0].src;
+        assert!(
+            !prob.grid.is_obstacle(src),
+            "endpoint inside its own pad must not be an obstacle"
+        );
+        // The skipped pad leaves the whole pad area passable.
+        let (cx, cy) = prob.mapping.point_to_xy((5.0, 5.0));
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let (x, y) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+                assert!(
+                    !prob.grid.is_obstacle(prob.mapping.dims.idx(x, y)),
+                    "pad cell ({x},{y}) should be cleared"
+                );
+            }
+        }
+    }
+
+    /// A non-connected (decoy) pad must remain an obstacle even when another
+    /// net's endpoint lives elsewhere.
+    #[test]
+    fn rasterize_keeps_decoy_pad_obstacle() {
+        let blob = r#"{
+            "layerCount": 1,
+            "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+            "obstacles": [
+                { "type": "rect", "center": {"x": 5, "y": 5}, "width": 1, "height": 1 }
+            ],
+            "connections": [
+                { "name": "n", "pointsToConnect": [ {"x": 1, "y": 1}, {"x": 9, "y": 9} ] }
+            ]
+        }"#;
+        let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        // Decoy pad at (5,5) contains no endpoint -> still blocked.
+        assert!(prob.grid.is_obstacle(prob.mapping.dims.idx(5, 5)));
+    }
+
+    /// (c) `to_solution` snaps the first and last vertex to the exact port
+    /// coordinate carried in `pin_points`, while interior vertices stay at cell
+    /// centres.
+    #[test]
+    fn to_solution_snaps_endpoints_to_exact_ports() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 10.0,
+            min_y: 0.0,
+            max_y: 10.0,
+        };
+        let mapping = Mapping::new(&bounds, 1.0);
+        let d = mapping.dims;
+        let path = vec![d.idx(0, 0), d.idx(1, 0), d.idx(2, 0)];
+        // Exact ports offset from the cell centres (0.5,0.5) / (2.5,0.5).
+        let mut pins = HashMap::new();
+        pins.insert(d.idx(0, 0), (0.12, 0.34));
+        pins.insert(d.idx(2, 0), (2.87, 0.65));
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: "n".into(),
+                path,
+                cost: 2,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+        };
+        let traces = to_solution(&board, &mapping, &pins, 0.1, "top");
+        let r = &traces[0].route;
+        match &r[0] {
+            RoutePoint::Wire { x, y, .. } => {
+                assert_eq!((*x, *y), (0.12, 0.34));
+            }
+            _ => panic!("wire expected"),
+        }
+        // Interior vertex stays at the cell centre (1.5, 0.5).
+        match &r[1] {
+            RoutePoint::Wire { x, y, .. } => {
+                assert_eq!((*x, *y), (1.5, 0.5));
+            }
+            _ => panic!("wire expected"),
+        }
+        match &r[2] {
+            RoutePoint::Wire { x, y, .. } => {
+                assert_eq!((*x, *y), (2.87, 0.65));
+            }
+            _ => panic!("wire expected"),
+        }
     }
 }

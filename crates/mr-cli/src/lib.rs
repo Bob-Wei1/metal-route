@@ -237,7 +237,13 @@ pub fn route_problem(
     }
     .context("router failed")?;
 
-    let traces = to_solution(&board, &problem.mapping, DEFAULT_TRACE_WIDTH, DEFAULT_LAYER);
+    let traces = to_solution(
+        &board,
+        &problem.mapping,
+        &problem.pin_points,
+        DEFAULT_TRACE_WIDTH,
+        DEFAULT_LAYER,
+    );
 
     let summary = Summary {
         routed: board.results.len(),
