@@ -1,0 +1,12 @@
+[package]
+name = "mr-srj"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mr-core = { workspace = true }
+mr-grid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
