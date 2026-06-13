@@ -73,7 +73,14 @@ fn route_to_stdout_emits_pcb_traces_and_summary() {
 fn route_to_file_writes_solution() {
     let input = write_sample();
     let mut out = std::env::temp_dir();
-    out.push(format!("mr_cli_out_{}.json", std::process::id()));
+    out.push(format!(
+        "mr_cli_out_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
 
     let output = Command::new(BIN)
         .args(["route", "--input"])

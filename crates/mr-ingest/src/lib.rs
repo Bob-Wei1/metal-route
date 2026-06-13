@@ -36,6 +36,16 @@
 //!   [`BoardIr::outline`] is always empty from this source.
 //!
 //! These are flagged so a later wave can pick a richer ingest path.
+//!
+//! # Specctra DSN ingest ([`dsn`])
+//!
+//! The [`dsn`] module is a self-contained path that parses a Specctra `.dsn`
+//! S-expression file (component placement + per-pad geometry + netlist, all in
+//! one file) directly into an [`mr_srj::SimpleRouteJson`] routing problem. Unlike
+//! the `pnp` source above it carries everything the router needs, so it is the
+//! preferred "bed-of-nails test rig" ingest path.
+
+pub mod dsn;
 
 use mr_core as _; // contract crate; BoardIr is intentionally self-contained for now.
 use serde::{Deserialize, Serialize};

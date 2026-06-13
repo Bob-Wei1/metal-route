@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use mr_cli::{bench::run_bench, run_handoff, run_project, run_route, Cli, Command};
+use mr_cli::{bench::run_bench, run_handoff, run_project, run_route, run_route_dsn, Cli, Command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -40,6 +40,43 @@ fn main() -> Result<()> {
                 out.status_ok,
                 out.stdout.len()
             );
+        }
+        Command::RouteDsn(args) => {
+            let r = run_route_dsn(args)?;
+            // Human-readable report (stderr so it never pollutes a piped solution).
+            eprintln!(
+                "DSN parsed: layers={} components={} pads={} nets={} (skipped {} <2-pin), board {:.2}x{:.2} mm, min_trace_width {:.3} mm",
+                r.stats.layers,
+                r.stats.components,
+                r.stats.pads,
+                r.stats.nets,
+                r.stats.nets_skipped_small,
+                r.stats.board_w_mm,
+                r.stats.board_h_mm,
+                r.stats.min_trace_width_mm,
+            );
+            eprintln!(
+                "Routing {} original net(s) at resolution {:.4} mm -> grid {}x{} ({} cells)",
+                r.original_nets,
+                r.resolution,
+                r.grid_w,
+                r.grid_h,
+                (r.grid_w as u64) * (r.grid_h as u64),
+            );
+            eprintln!(
+                "Routed {}/{} two-point nets (connectivity {:.1}%), {} original net(s) fully connected",
+                r.routed_nets,
+                r.total_nets,
+                r.connectivity_pct(),
+                r.fully_connected,
+            );
+            eprintln!(
+                "Wall-clock {:.3} s ({:.0} nets/sec)",
+                r.wall_s,
+                r.nets_per_sec(),
+            );
+            // Scrape-friendly one-liner on stdout.
+            println!("{}", r.result_line());
         }
     }
     Ok(())

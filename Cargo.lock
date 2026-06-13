@@ -675,6 +675,7 @@ dependencies = [
  "mr-bridge",
  "mr-core",
  "mr-cpu",
+ "mr-ingest",
  "mr-srj",
  "serde",
  "serde_json",
@@ -716,7 +717,9 @@ dependencies = [
 name = "mr-ingest"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "mr-core",
+ "mr-srj",
  "serde",
  "serde_json",
 ]
