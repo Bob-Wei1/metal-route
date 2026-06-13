@@ -7,3 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 mr-core = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+mr-fixtures = { workspace = true }
+mr-cpu = { workspace = true }
+
+[[bench]]
+name = "route"
+harness = false
