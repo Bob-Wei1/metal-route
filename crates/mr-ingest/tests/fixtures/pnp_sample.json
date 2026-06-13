@@ -1,0 +1,189 @@
+{
+  "schema": "wn.kicad_cruncher.pnp.v1",
+  "source": {
+    "path": "/Users/embedder/Documents/bed-of-nails/tests/fixtures/external/datum/datum.kicad_pcb",
+    "name": "datum.kicad_pcb",
+    "stem": "datum"
+  },
+  "variant": null,
+  "units": "mm",
+  "position_mode": "component-center",
+  "placement_count": 7,
+  "placements": [
+    {
+      "designator": "FID1",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask2mm",
+      "center_x": 40.0,
+      "center_y": 25.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask2mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID2",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 30.0,
+      "center_y": 30.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID3",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 50.0,
+      "center_y": 30.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID4",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 30.0,
+      "center_y": 15.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID5",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 50.0,
+      "center_y": 15.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID6",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 5.0,
+      "center_y": 5.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    },
+    {
+      "designator": "FID7",
+      "comment": "Fiducial",
+      "layer": "top",
+      "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+      "center_x": 75.0,
+      "center_y": 5.0,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": "Fiducial Marker",
+      "parameters": {
+        "Description": "Fiducial Marker",
+        "ki_fp_filters": "Fiducial*"
+      },
+      "canonical_fields": {
+        "description": "Fiducial Marker",
+        "footprint": "Fiducial:Fiducial_1mm_Mask3mm",
+        "value": "Fiducial"
+      },
+      "field_sources": {
+        "description": "parameter:Description",
+        "footprint": "intrinsic:footprint",
+        "value": "intrinsic:value"
+      }
+    }
+  ]
+}

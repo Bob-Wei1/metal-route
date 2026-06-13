@@ -1,0 +1,47 @@
+{
+  "schema": "wn.kicad_cruncher.pnp.v1",
+  "source": {
+    "path": "synthetic/multilayer.kicad_pcb",
+    "name": "multilayer.kicad_pcb",
+    "stem": "multilayer"
+  },
+  "variant": null,
+  "units": "mm",
+  "position_mode": "component-center",
+  "placement_count": 3,
+  "placements": [
+    {
+      "designator": "U1",
+      "comment": "MCU",
+      "layer": "top",
+      "footprint": "Package_QFP:LQFP-48",
+      "center_x": 10.0,
+      "center_y": -20.0,
+      "rotation": 90.0,
+      "units": "mm",
+      "description": "Microcontroller"
+    },
+    {
+      "designator": "R1",
+      "comment": "10k",
+      "layer": "bottom",
+      "footprint": "Resistor_SMD:R_0402",
+      "center_x": 5.5,
+      "center_y": -3.25,
+      "rotation": 180.0,
+      "units": "mm",
+      "description": ""
+    },
+    {
+      "designator": "C1",
+      "comment": "100nF",
+      "layer": "bottom",
+      "footprint": "Capacitor_SMD:C_0402",
+      "center_x": 7.0,
+      "center_y": -3.25,
+      "rotation": 0.0,
+      "units": "mm",
+      "description": ""
+    }
+  ]
+}
