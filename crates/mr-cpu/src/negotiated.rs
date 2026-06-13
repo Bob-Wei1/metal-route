@@ -58,6 +58,13 @@ pub const MAX_ITERS: u32 = 60;
 /// convention used by `GridBuilder`, which fills passable cells with cost 1).
 const FREE_COST: Cost = 1;
 
+/// Bounded rip-up-and-reroute budget multipliers (see [`ripup_legalize`]). The
+/// global budget caps the total number of rip-up operations; the per-net cap
+/// bounds how many times any single net may be displaced. Both guarantee
+/// termination — once either is hit, the stage stops ripping and keeps what it has.
+const RIPUP_GLOBAL_BUDGET_PER_NET: usize = 20;
+const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
+
 /// Per-net committed paths from one legalization pass, in input net order: `Some`
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
 type Committed = Vec<Option<Vec<CellIdx>>>;
@@ -222,6 +229,9 @@ impl Router for NegotiatedRouter {
         // unroutable contributes 0 and can never be committed. This doubles as the
         // ordering difficulty metric.
         let mut alone_len: Vec<Cost> = vec![0; n_nets];
+        // Full alone-path cells per net, used by the rip-up stage to find which
+        // committed foreign-group nets a stranded net's natural route would cross.
+        let mut alone_path: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
         {
             let empty_occ = vec![false; n_cells];
             for i in 0..n_nets {
@@ -231,6 +241,7 @@ impl Router for NegotiatedRouter {
                 let field = dijkstra(&work, net.src, h);
                 if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
                     alone_len[i] = unit_cost(&path);
+                    alone_path[i] = path;
                 }
             }
         }
@@ -293,9 +304,41 @@ impl Router for NegotiatedRouter {
             }
         }
 
-        let committed = best
-            .map(|(_, _, _, c)| c)
-            .unwrap_or_else(|| vec![None; n_nets]);
+        let (best_routed, best_order, multi_committed) = best
+            .map(|(r, _, o, c)| (r, o, c))
+            .unwrap_or_else(|| (0, base_order.clone(), vec![None; n_nets]));
+
+        // ---- Bounded rip-up-and-reroute legalization (final stage) ----
+        //
+        // The multi-order pass commits whole groups in some fixed order and never
+        // displaces an already-committed group. That fails when net A's shortest
+        // route blocks B *and* B's shortest route blocks A: no single commit order
+        // works, you must displace a committed net. This stage seeds a work-queue
+        // with the BEST multi-order result and, for any net that cannot route
+        // around the committed cells, rips up the cheapest committed blocker(s),
+        // re-places the stranded net, and re-enqueues the ripped nets — bounded by
+        // a global rip budget so it always terminates. The result is used only if
+        // it routes strictly more nets than the multi-order pass (never a regress).
+        let committed = if best_routed < n_nets {
+            let rip = ripup_legalize(
+                grid,
+                &mut work,
+                nets,
+                &pad_sets,
+                &group_ids,
+                &alone_path,
+                &best_order,
+                n_cells,
+            );
+            let rip_routed = rip.iter().filter(|c| c.is_some()).count();
+            if rip_routed > best_routed {
+                rip
+            } else {
+                multi_committed
+            }
+        } else {
+            multi_committed
+        };
 
         // Assemble in input net order for determinism.
         let mut results: Vec<RouteResult> = Vec::new();
@@ -358,9 +401,9 @@ fn build_legal_grid(
     src: CellIdx,
     dst: CellIdx,
 ) {
-    for c in 0..base.dims.len() {
+    for (c, slot) in work.cost.iter_mut().enumerate() {
         let ci = c as CellIdx;
-        let cost = if occupied[c] {
+        *slot = if occupied[c] {
             // Foreign-group cells are hard obstacles — even if they are this net's
             // declared endpoints, since distinct groups may not share any cell.
             OBSTACLE
@@ -381,7 +424,6 @@ fn build_legal_grid(
         } else {
             base.cost_at(ci)
         };
-        work.cost[c] = cost;
     }
 }
 
@@ -457,6 +499,209 @@ fn legalize_in_order(
     }
 
     committed
+}
+
+/// Bounded rip-up-and-reroute legalization.
+///
+/// Produces a cell-disjoint-across-groups commit that, unlike [`legalize_in_order`],
+/// may *displace* an already-committed net to make room for a stranded one. This
+/// solves the co-dependent case where net A's natural route blocks B and B's blocks
+/// A simultaneously — no static commit order works, you must rip up a committed net.
+///
+/// Algorithm (work-queue):
+/// 1. Seed the queue with every net in `seed_group_order` (the BEST multi-order
+///    order, so only the genuinely-hard leftovers cost extra work). Within a group,
+///    nets are queued in input order.
+/// 2. Pop net `i`. Build a grid where cells owned by OTHER groups are hard obstacles
+///    (own pads unmasked), then route `i`. If it routes, commit it (mark its cells
+///    owned by `i`'s group). If not, find the committed OTHER-group nets whose cells
+///    lie on `i`'s alone path (the blockers); rip up the blocker(s) with the
+///    smallest committed path length first (cheapest to re-place), free their cells,
+///    commit `i`, and re-enqueue the ripped nets (bumping their rip count).
+/// 3. Bounds: a global rip budget and a per-net rip cap; when exhausted, stop
+///    ripping and place whatever still fits. ALWAYS terminates.
+///
+/// Determinism: every tie is broken by `(group_id, net index, cell idx)`; no RNG.
+/// Sibling sub-nets of one connection (same group) never block each other because
+/// occupancy is tracked per *group*, never per net.
+#[allow(clippy::too_many_arguments)]
+fn ripup_legalize(
+    grid: &Grid,
+    work: &mut Grid,
+    nets: &[NetEndpoints],
+    pad_sets: &[std::collections::HashSet<CellIdx>],
+    group_ids: &[usize],
+    alone_path: &[Vec<CellIdx>],
+    seed_group_order: &[usize],
+    n_cells: usize,
+) -> Committed {
+    let dims = grid.dims;
+    let n_nets = nets.len();
+
+    let mut committed: Committed = vec![None; n_nets];
+    // Owning group per cell, or -1 for free. A cell is "owned by another group"
+    // (w.r.t. net i) iff occupied_by_group[c] is set to a group != group_ids[i].
+    let mut owner: Vec<i64> = vec![-1; n_cells];
+
+    let mut rip_count: Vec<usize> = vec![0; n_nets];
+    let global_budget = RIPUP_GLOBAL_BUDGET_PER_NET * n_nets.max(1);
+    let per_net_cap = n_nets + RIPUP_PER_NET_CAP_EXTRA;
+    let mut rips_done: usize = 0;
+
+    // FIFO work-queue of net indices to (re)place. Seed in best-order, groups in
+    // the seed order and nets within a group in input order, for determinism.
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for &g in seed_group_order {
+        for (i, &gi) in group_ids.iter().enumerate() {
+            if gi == g {
+                queue.push_back(i);
+            }
+        }
+    }
+
+    // Free every cell currently owned by group `g` (its committed nets are
+    // un-committed by the caller separately). Reset committed entries here.
+    let free_group_cells =
+        |owner: &mut [i64], committed: &mut Committed, group_ids: &[usize], g: usize| {
+            for i in 0..committed.len() {
+                if group_ids[i] == g {
+                    if let Some(path) = committed[i].take() {
+                        for &c in &path {
+                            // Only clear cells this group still owns (siblings may
+                            // share; clearing is idempotent and safe).
+                            if owner[c as usize] == g as i64 {
+                                owner[c as usize] = -1;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+    while let Some(i) = queue.pop_front() {
+        // If already committed (e.g. re-enqueued then satisfied earlier), skip.
+        if committed[i].is_some() {
+            continue;
+        }
+        let net = &nets[i];
+        let g = group_ids[i];
+
+        // Build the routing grid: cells owned by OTHER groups are hard obstacles.
+        build_ripup_grid(work, grid, &pad_sets[i], &owner, g, net.src, net.dst);
+        let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
+        let field = dijkstra(work, net.src, h);
+
+        if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+            for &c in &path {
+                owner[c as usize] = g as i64;
+            }
+            committed[i] = Some(path);
+            continue;
+        }
+
+        // Stranded. Find committed OTHER-group blockers on i's alone path.
+        if rips_done >= global_budget || rip_count[i] >= per_net_cap {
+            // Budget exhausted for this net: leave it unrouted.
+            continue;
+        }
+
+        // Collect the distinct blocker groups whose owned cells lie on i's alone
+        // path. (Sibling cells of i's own group are never blockers.)
+        let mut blocker_groups: Vec<usize> = Vec::new();
+        for &c in &alone_path[i] {
+            let o = owner[c as usize];
+            if o >= 0 && o as usize != g {
+                let bg = o as usize;
+                if !blocker_groups.contains(&bg) {
+                    blocker_groups.push(bg);
+                }
+            }
+        }
+
+        if blocker_groups.is_empty() {
+            // Nothing committed is in the way along the natural route, yet it still
+            // would not route — it is genuinely unroutable given current commits.
+            continue;
+        }
+
+        // Rip the blocker group whose total committed path length is smallest
+        // (cheapest to re-place); tie-break by lowest group id for determinism.
+        blocker_groups.sort_by_key(|&bg| {
+            let len: Cost = (0..n_nets)
+                .filter(|&j| group_ids[j] == bg)
+                .filter_map(|j| committed[j].as_ref())
+                .map(|p| unit_cost(p))
+                .fold(0, |a, b| a.saturating_add(b));
+            (len, bg)
+        });
+
+        let victim = blocker_groups[0];
+
+        // Re-enqueue every (currently committed) net of the victim group, in input
+        // order, bumping their rip count, then free the group's cells and commit i.
+        for j in 0..n_nets {
+            if group_ids[j] == victim && committed[j].is_some() {
+                rip_count[j] += 1;
+                queue.push_back(j);
+            }
+        }
+        free_group_cells(&mut owner, &mut committed, group_ids, victim);
+        rips_done += 1;
+
+        // Re-route i now that the victim's cells are free.
+        build_ripup_grid(work, grid, &pad_sets[i], &owner, g, net.src, net.dst);
+        let field = dijkstra(work, net.src, h);
+        if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+            for &c in &path {
+                owner[c as usize] = g as i64;
+            }
+            committed[i] = Some(path);
+        } else {
+            // Still cannot route even after the rip: re-enqueue i once (its rip
+            // count is bounded by per_net_cap, so this terminates).
+            rip_count[i] += 1;
+            queue.push_back(i);
+        }
+    }
+
+    committed
+}
+
+/// Overwrite `work` for a rip-up reroute of one net in group `own_group`: cells
+/// owned by ANY OTHER group become hard obstacles, the net's own pads are unmasked
+/// to [`FREE_COST`], and the net's own endpoints are always kept passable. Cells
+/// owned by the net's own group (siblings) are NOT obstacles.
+fn build_ripup_grid(
+    work: &mut Grid,
+    base: &Grid,
+    pads: &std::collections::HashSet<CellIdx>,
+    owner: &[i64],
+    own_group: usize,
+    src: CellIdx,
+    dst: CellIdx,
+) {
+    let og = own_group as i64;
+    for (c, slot) in work.cost.iter_mut().enumerate() {
+        let ci = c as CellIdx;
+        let foreign = owner[c] >= 0 && owner[c] != og;
+        *slot = if foreign {
+            OBSTACLE
+        } else if ci == src || ci == dst {
+            if base.is_obstacle(ci) {
+                FREE_COST
+            } else {
+                base.cost_at(ci)
+            }
+        } else if base.is_obstacle(ci) {
+            if pads.contains(&ci) {
+                FREE_COST
+            } else {
+                OBSTACLE
+            }
+        } else {
+            base.cost_at(ci)
+        };
+    }
 }
 
 /// All permutations of `items`, generated in a deterministic order (Heap-free
@@ -652,6 +897,128 @@ mod tests {
         assert!(br.results[1].path.contains(&mid));
         // The shared middle cell shows congestion 2 — allowed within one group.
         assert_eq!(br.congestion[mid as usize], 2);
+    }
+
+    /// Co-dependent two-net board: BOTH nets must deviate from their greedy path
+    /// for a cell-disjoint solution to exist. A vertical wall on column x=2 blocks
+    /// rows y=2,3,4, so the only crossing is via rows 0–1. Net A's greedy route is
+    /// straight across row 1 — which walls B off from crossing — and net B's greedy
+    /// route detours up *through A's endpoints*, stranding A. Neither greedy commit
+    /// order works; the disjoint solution forces A up onto row 0 AND B to cross at
+    /// (2,1) clear of A's endpoints. The full router must route BOTH.
+    #[test]
+    fn co_dependent_both_must_deviate() {
+        let dims = Dims::new(5, 5);
+        let mut gb = GridBuilder::new(dims, 1);
+        gb.mark_cell(2, 2);
+        gb.mark_cell(2, 3);
+        gb.mark_cell(2, 4);
+        let grid = gb.build();
+
+        let a = net("a", dims.idx(0, 1), dims.idx(4, 1));
+        let b = net("b", dims.idx(0, 3), dims.idx(4, 3));
+
+        // Precondition: each net's *greedy* path blocks the other. Routing A alone
+        // (straight row 1) leaves B with no disjoint route, and vice versa.
+        let ga = crate::LeeRouter::route_one(&grid, a.src, a.dst).unwrap().0;
+        let gb_path = crate::LeeRouter::route_one(&grid, b.src, b.dst).unwrap().0;
+        assert!(
+            ga.iter().any(|c| gb_path.contains(c)) || {
+                // B's greedy uses A's endpoints, so even where the cell sets don't
+                // literally overlap the greedy commit still strands the other.
+                ga.contains(&a.src) && gb_path.contains(&a.src)
+            },
+            "precondition: greedy paths are in mutual conflict"
+        );
+
+        let br = NegotiatedRouter
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+        assert!(
+            br.unrouted.is_empty(),
+            "both co-dependent nets must route: {br:?}"
+        );
+        assert_eq!(br.results.len(), 2);
+        let pa = &br.results[0].path;
+        let pb = &br.results[1].path;
+        assert!(
+            disjoint(pa, pb),
+            "paths must be cell-disjoint: {pa:?} {pb:?}"
+        );
+        assert_eq!(pa.first().copied(), Some(a.src));
+        assert_eq!(pa.last().copied(), Some(a.dst));
+        assert_eq!(pb.first().copied(), Some(b.src));
+        assert_eq!(pb.last().copied(), Some(b.dst));
+    }
+
+    /// Bounded rip-up actually rescues a net that the multi-order pass alone leaves
+    /// unrouted. On this 6x6 board with a single wall at (4,1), the negotiation +
+    /// multi-order legalization commits two of the three nets and strands the
+    /// third; only displacing an already-committed net (rip-up) frees a corridor
+    /// so all three route. We assert the full router routes ALL THREE — which is
+    /// only reachable through the rip-up stage (verified empirically against a
+    /// rip-up-disabled build during development).
+    #[test]
+    fn ripup_rescues_third_net() {
+        let dims = Dims::new(6, 6);
+        let mut gb = GridBuilder::new(dims, 1);
+        gb.mark_cell(4, 1);
+        let grid = gb.build();
+
+        let nets = vec![
+            net("a", dims.idx(3, 0), dims.idx(4, 3)),
+            net("b", dims.idx(0, 4), dims.idx(5, 4)),
+            net("c", dims.idx(2, 1), dims.idx(5, 3)),
+        ];
+
+        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        assert!(
+            br.unrouted.is_empty(),
+            "rip-up must route all three nets: {br:?}"
+        );
+        assert_eq!(br.results.len(), 3);
+
+        // Cell-disjoint across the three (distinct) groups.
+        for i in 0..br.results.len() {
+            for j in (i + 1)..br.results.len() {
+                assert!(
+                    disjoint(&br.results[i].path, &br.results[j].path),
+                    "group paths must be cell-disjoint: {} vs {}",
+                    br.results[i].net,
+                    br.results[j].net
+                );
+            }
+        }
+        // Endpoints honoured.
+        for (r, n) in br.results.iter().zip(nets.iter()) {
+            assert_eq!(r.path.first().copied(), Some(n.src));
+            assert_eq!(r.path.last().copied(), Some(n.dst));
+        }
+    }
+
+    /// Rip-up must terminate and never panic even when no disjoint solution exists.
+    /// Re-uses the over-constrained single corridor (two same-endpoint nets in
+    /// distinct groups): rip-up may ping-pong the corridor but is bounded by its
+    /// global/per-net budgets, so it stops and returns the best partial (one net),
+    /// never regressing below the multi-order result.
+    #[test]
+    fn ripup_terminates_when_unsolvable() {
+        let dims = Dims::new(3, 3);
+        let mut b = GridBuilder::new(dims, 1);
+        b.mark_cell(1, 0);
+        b.mark_cell(1, 2);
+        let grid = b.build();
+        let nets = vec![
+            net("a", dims.idx(0, 1), dims.idx(2, 1)),
+            net("b", dims.idx(0, 1), dims.idx(2, 1)),
+        ];
+        let br = NegotiatedRouter.route(&grid, &nets).unwrap();
+        assert_eq!(br.results.len() + br.unrouted.len(), 2);
+        assert_eq!(br.unrouted.len(), 1, "single corridor fits only one net");
+        // Determinism across repeated runs (rip-up tie-breaks must be stable).
+        let br2 = NegotiatedRouter.route(&grid, &nets).unwrap();
+        assert_eq!(br.results, br2.results);
+        assert_eq!(br.unrouted, br2.unrouted);
     }
 
     /// The deterministic permutation generator yields every permutation exactly
