@@ -195,8 +195,10 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     let mut builder = GridBuilder::new(mapping.dims, 1);
 
     // Collect every connection endpoint as a continuous (x, y). These are the
-    // pad centres we must connect; the pad each one sits in is also present in
-    // `obstacles`, and marking it would box the endpoint in inside its own pad.
+    // pad centres we must connect. The pad each endpoint sits in IS marked as an
+    // obstacle in the base grid (correct DRC model: all pads are obstacles); the
+    // router later unmasks each net's own pad cells via `passable_pads` so a net
+    // may escape its own pads but cannot run through a foreign net's pad.
     let endpoints: Vec<(f64, f64)> = srj
         .connections
         .iter()
@@ -210,16 +212,6 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         let min_y = obs.center.y - obs.height / 2.0;
         let max_y = obs.center.y + obs.height / 2.0;
 
-        // Skip pads we must connect into: if any endpoint lies within this
-        // rect's continuous box, marking it would trap that endpoint. Decoy /
-        // other-net pads contain no endpoint and stay obstacles.
-        if endpoints
-            .iter()
-            .any(|&(px, py)| px >= min_x && px <= max_x && py >= min_y && py <= max_y)
-        {
-            continue;
-        }
-
         // Lower cell holds the box minimum; upper cell is the last cell whose
         // square overlaps the box. A box edge that lands exactly on a cell
         // boundary does not spill into the next cell (half-open cells).
@@ -232,19 +224,17 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         builder.mark_rect(x0, y0, x1, y1);
     }
 
-    // Belt-and-suspenders: explicitly clear the exact cell of every endpoint, so
-    // an endpoint is never on an obstacle even if a non-skipped obstacle (e.g. a
-    // neighbouring pad) happens to overlap it. Also record each endpoint's exact
-    // continuous coordinate so `to_solution` can snap traces back to the port.
+    // Record each endpoint's exact continuous coordinate so `to_solution` can
+    // snap traces back to the port. Endpoint cells stay obstacles in the base
+    // grid; the router unmasks each net's own pad cells per net.
     let mut pin_points: HashMap<CellIdx, (f64, f64)> = HashMap::new();
     for &(px, py) in &endpoints {
-        let (cx, cy) = mapping.point_to_xy((px, py));
-        builder.clear_cell(cx, cy);
-        pin_points.insert(mapping.dims.idx(cx, cy), (px, py));
+        let cell = mapping.point_to_cell((px, py));
+        pin_points.insert(cell, (px, py));
     }
 
     let grid = builder.build();
-    let nets = decompose_connections(&srj.connections, &mapping);
+    let nets = decompose_connections(&srj.connections, &mapping, &srj.obstacles);
 
     RasterizedProblem {
         grid,
@@ -252,6 +242,45 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
         mapping,
         pin_points,
     }
+}
+
+/// All grid cells covered by obstacle rect(s) that contain the continuous point
+/// `point`, plus the point's own rasterised cell. This is the set of pad cells a
+/// net owning this endpoint is allowed to traverse. The cells are returned in
+/// ascending [`CellIdx`] order, deduplicated, for deterministic serialisation.
+fn pad_cells_for_point(
+    point: (f64, f64),
+    mapping: &Mapping,
+    obstacles: &[Obstacle],
+) -> Vec<CellIdx> {
+    let (px, py) = point;
+    let mut cells: Vec<CellIdx> = Vec::new();
+    for obs in obstacles {
+        let min_x = obs.center.x - obs.width / 2.0;
+        let max_x = obs.center.x + obs.width / 2.0;
+        let min_y = obs.center.y - obs.height / 2.0;
+        let max_y = obs.center.y + obs.height / 2.0;
+        if px < min_x || px > max_x || py < min_y || py > max_y {
+            continue;
+        }
+        // Same cell-range logic as the obstacle marking loop.
+        let (x0, y0) = mapping.point_to_xy((min_x, min_y));
+        let x1 = cell_upper(max_x, mapping.origin_x, mapping.resolution, mapping.dims.w);
+        let y1 = cell_upper(max_y, mapping.origin_y, mapping.resolution, mapping.dims.h);
+        if x1 < x0 || y1 < y0 {
+            continue;
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                cells.push(mapping.dims.idx(x, y));
+            }
+        }
+    }
+    // Always include the endpoint's own rasterised cell.
+    cells.push(mapping.point_to_cell((px, py)));
+    cells.sort_unstable();
+    cells.dedup();
+    cells
 }
 
 /// Upper (inclusive) cell index touched by a continuous box that ends at `hi`:
@@ -262,7 +291,16 @@ fn cell_upper(hi: f64, origin: f64, res: f64, extent: u32) -> u32 {
 }
 
 /// Decompose every connection into chained two-point nets (plan R8).
-fn decompose_connections(connections: &[Connection], mapping: &Mapping) -> Vec<NetEndpoints> {
+///
+/// Each emitted net's `passable_pads` is the union of the own-pad cells of its
+/// src and dst points: the cells of every obstacle rect that contains that
+/// endpoint, plus the endpoint's own cell. This lets the router unmask exactly
+/// this net's pads while keeping every foreign pad an obstacle.
+fn decompose_connections(
+    connections: &[Connection],
+    mapping: &Mapping,
+    obstacles: &[Obstacle],
+) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
         let pts = &conn.points_to_connect;
@@ -278,7 +316,21 @@ fn decompose_connections(connections: &[Connection], mapping: &Mapping) -> Vec<N
             } else {
                 format!("{}#{}", conn.name, seg)
             };
-            nets.push(NetEndpoints { net, src, dst });
+            // Union of the src and dst pad cells, sorted + deduped.
+            let mut passable_pads = pad_cells_for_point((win[0].x, win[0].y), mapping, obstacles);
+            passable_pads.extend(pad_cells_for_point(
+                (win[1].x, win[1].y),
+                mapping,
+                obstacles,
+            ));
+            passable_pads.sort_unstable();
+            passable_pads.dedup();
+            nets.push(NetEndpoints {
+                net,
+                src,
+                dst,
+                passable_pads,
+            });
         }
     }
     nets
@@ -624,20 +676,23 @@ mod tests {
         assert_eq!(p.layer.as_deref(), Some("top"));
     }
 
-    /// (b) An endpoint that sits at the centre of its own pad obstacle must NOT
-    /// be left boxed in: rasterising must clear the endpoint cell (the pad it
-    /// connects into is skipped) so the router has a passable start/end.
+    /// (b) An endpoint that sits at the centre of its own pad obstacle leaves the
+    /// pad cells marked as obstacles in the BASE grid (correct DRC model), but the
+    /// net's `passable_pads` carries the whole pad (and the src cell) so the router
+    /// can unmask it. A decoy pad (no endpoint) is in no net's `passable_pads`.
     #[test]
-    fn rasterize_does_not_box_in_endpoint_inside_pad() {
-        // A 0.4mm pad centred on the endpoint at (5,5), pad spans several cells
-        // at res 0.1; the endpoint would be on an obstacle without the skip.
+    fn rasterize_pad_is_obstacle_but_in_own_net_passable_pads() {
+        // A pad large enough to span >= 3x3 cells centred on the endpoint at
+        // (5,5); at res 0.1 a 0.4mm pad spans several cells.
         let blob = r#"{
             "minTraceWidth": 0.1,
             "layerCount": 1,
             "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
             "obstacles": [
                 { "type": "rect", "center": {"x": 5, "y": 5}, "width": 0.4, "height": 0.4,
-                  "connectedTo": ["pcb_smtpad_0"] }
+                  "connectedTo": ["pcb_smtpad_0"] },
+                { "type": "rect", "center": {"x": 2, "y": 2}, "width": 0.4, "height": 0.4,
+                  "connectedTo": ["pcb_smtpad_decoy"] }
             ],
             "connections": [
                 { "name": "n", "pointsToConnect": [ {"x": 5, "y": 5}, {"x": 9, "y": 9} ] }
@@ -645,21 +700,42 @@ mod tests {
         }"#;
         let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
         let prob = rasterize(&srj, 0.1);
+        let d = prob.mapping.dims;
         let src = prob.nets[0].src;
+        // Base grid: the pad cell IS an obstacle now.
         assert!(
-            !prob.grid.is_obstacle(src),
-            "endpoint inside its own pad must not be an obstacle"
+            prob.grid.is_obstacle(src),
+            "pad cell is an obstacle in the base grid"
         );
-        // The skipped pad leaves the whole pad area passable.
+        // The own pad's cells (and the src cell) are in this net's passable_pads.
+        let pads = &prob.nets[0].passable_pads;
+        assert!(pads.contains(&src), "src cell must be in passable_pads");
         let (cx, cy) = prob.mapping.point_to_xy((5.0, 5.0));
+        // The own pad spans >= 3x3 cells; every one is in passable_pads.
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let (x, y) = ((cx as i32 + dx) as u32, (cy as i32 + dy) as u32);
+                let cell = d.idx(x, y);
                 assert!(
-                    !prob.grid.is_obstacle(prob.mapping.dims.idx(x, y)),
-                    "pad cell ({x},{y}) should be cleared"
+                    prob.grid.is_obstacle(cell),
+                    "own pad cell ({x},{y}) is an obstacle in base grid"
+                );
+                assert!(
+                    pads.contains(&cell),
+                    "own pad cell ({x},{y}) must be in passable_pads"
                 );
             }
+        }
+        // The decoy pad at (2,2) contains no endpoint -> in NO net's
+        // passable_pads, and remains an obstacle.
+        let (dx2, dy2) = prob.mapping.point_to_xy((2.0, 2.0));
+        let decoy = d.idx(dx2, dy2);
+        assert!(prob.grid.is_obstacle(decoy), "decoy pad stays an obstacle");
+        for net in &prob.nets {
+            assert!(
+                !net.passable_pads.contains(&decoy),
+                "decoy pad must not be in any net's passable_pads"
+            );
         }
     }
 
@@ -681,6 +757,11 @@ mod tests {
         let prob = rasterize(&srj, 1.0);
         // Decoy pad at (5,5) contains no endpoint -> still blocked.
         assert!(prob.grid.is_obstacle(prob.mapping.dims.idx(5, 5)));
+        // And it is in no net's passable_pads.
+        let decoy = prob.mapping.dims.idx(5, 5);
+        for net in &prob.nets {
+            assert!(!net.passable_pads.contains(&decoy));
+        }
     }
 
     /// (c) `to_solution` snaps the first and last vertex to the exact port

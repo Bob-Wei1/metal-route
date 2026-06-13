@@ -238,16 +238,19 @@ mod tests {
                 net: "a".into(),
                 src: dims.idx(0, 0),
                 dst: dims.idx(5, 0),
+                passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "b".into(),
                 src: dims.idx(0, 5),
                 dst: dims.idx(5, 5),
+                passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "c".into(),
                 src: dims.idx(0, 2),
                 dst: dims.idx(5, 3),
+                passable_pads: Vec::new(),
             },
         ];
         (grid, nets)
@@ -343,6 +346,7 @@ mod tests {
                 net: format!("n{k}"),
                 src,
                 dst,
+                passable_pads: Vec::new(),
             });
         }
         (grid, nets)

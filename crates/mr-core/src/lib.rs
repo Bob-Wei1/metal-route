@@ -133,11 +133,19 @@ impl Grid {
 ///
 /// Multi-terminal nets are decomposed into pairs upstream (see plan R8); the
 /// router contract is strictly two-point.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NetEndpoints {
     pub net: String,
     pub src: CellIdx,
     pub dst: CellIdx,
+    /// Cells this net is permitted to traverse even though they are obstacles in
+    /// the base grid — namely this net's *own* pad cells. In the base grid ALL
+    /// pads are obstacles; a router unmasks each net's `passable_pads` in its
+    /// per-net working grid so the net can escape its own pads but cannot run
+    /// through a foreign net's pad. Defaults to empty (no pads), which preserves
+    /// behaviour for every construction site that does not set it.
+    #[serde(default)]
+    pub passable_pads: Vec<CellIdx>,
 }
 
 /// A routed net: the ordered path of cells from src to dst and its total cost.

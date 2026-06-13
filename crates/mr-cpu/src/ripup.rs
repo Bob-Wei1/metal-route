@@ -45,15 +45,33 @@ struct Placed {
     cost: Cost,
 }
 
+/// Free-cell cost used when unmasking a net's own pad cells. The base grid uses
+/// cost 1 for passable cells (see `GridBuilder`); there is no direct accessor, so
+/// we use the same constant the rest of the pipeline treats as a free cell.
+const FREE_COST: Cost = 1;
+
+/// The base grid with `net`'s own pad cells (`passable_pads`) unmasked back to
+/// free cells. This is the grid on which the net would route if it were the only
+/// net on the board: all foreign pads stay obstacles, only this net's pads open.
+fn own_grid(grid: &Grid, net: &NetEndpoints) -> Grid {
+    let mut g = grid.clone();
+    for &c in &net.passable_pads {
+        g.set(c, FREE_COST);
+    }
+    g
+}
+
 /// Build a working grid where every committed net other than `ni` occupies
-/// obstacle cells (except the current net's own endpoints, which stay passable).
+/// obstacle cells. The current net's own pad cells (`passable_pads`) are unmasked
+/// FIRST so the net can escape its own pads; committed nets' paths are then marked
+/// as obstacles, so a committed path still wins on any (abnormal) overlap.
 fn working_grid(
     grid: &Grid,
     ni: usize,
     net: &NetEndpoints,
     placed: &HashMap<usize, Placed>,
 ) -> Grid {
-    let mut work = grid.clone();
+    let mut work = own_grid(grid, net);
     for (&oi, p) in placed {
         if oi == ni {
             continue;
@@ -74,11 +92,13 @@ impl Router for RipUpRouter {
             return Err(RouterError::MalformedGrid);
         }
         for net in nets {
-            if !grid.dims.contains(net.src)
-                || !grid.dims.contains(net.dst)
-                || grid.is_obstacle(net.src)
-                || grid.is_obstacle(net.dst)
-            {
+            // An endpoint is invalid only if out of bounds, or it sits on an
+            // obstacle that is NOT one of this net's own (passable) pad cells.
+            // Sitting on one's own pad obstacle is valid (the router unmasks it).
+            let endpoint_invalid = |c: CellIdx| {
+                !grid.dims.contains(c) || (grid.is_obstacle(c) && !net.passable_pads.contains(&c))
+            };
+            if endpoint_invalid(net.src) || endpoint_invalid(net.dst) {
                 return Err(RouterError::InvalidEndpoint {
                     net: net.net.clone(),
                 });
@@ -121,8 +141,12 @@ impl Router for RipUpRouter {
                     continue;
                 }
 
-                // Blocked. Can we route at all on the empty grid?
-                let Some((free_path, _)) = LeeRouter::route_one(grid, net.src, net.dst) else {
+                // Blocked. Can we route at all on the empty grid? The base grid
+                // now has this net's pads as obstacles, so check on a per-net grid
+                // with only THIS net's own pads unmasked (no committed nets).
+                let free_grid = own_grid(grid, net);
+                let Some((free_path, _)) = LeeRouter::route_one(&free_grid, net.src, net.dst)
+                else {
                     // Unroutable regardless of other nets: give up permanently.
                     abandoned[ni] = true;
                     continue;
@@ -192,6 +216,7 @@ mod tests {
             net: name.into(),
             src,
             dst,
+            passable_pads: Vec::new(),
         }
     }
 
@@ -277,5 +302,64 @@ mod tests {
         let br = RipUpRouter.route(&grid, &nets).unwrap();
         assert_eq!(br.results.len() + br.unrouted.len(), 2);
         assert_eq!(MAX_PASSES, 20);
+    }
+
+    /// Per-net pad masking: net A's pad lies directly on net B's shortest straight
+    /// path. B must route AROUND A's pad (B's path contains none of A's pad cells),
+    /// and A must still route (escaping its own pad). Both routed, paths disjoint.
+    #[test]
+    fn net_routes_around_foreign_pad() {
+        // 7x3 open grid. A's pad is a 2x1 vertical block on column 3, rows 0..=1
+        // (cells (3,0),(3,1)) — an obstacle in the base grid. It sits on B's
+        // straight path across row 1, but row 2 stays open so B can detour. A's
+        // endpoints are inside its own pad so A can escape it.
+        let dims = Dims::new(7, 3);
+        let grid = GridBuilder::new(dims, 1)
+            .mark_rect(3, 0, 3, 1) // A's pad: cells (3,0),(3,1) (obstacle in base grid)
+            .build();
+
+        // A owns those two pad cells; route A vertically within them.
+        let a_pad: Vec<CellIdx> = vec![dims.idx(3, 0), dims.idx(3, 1)];
+        let net_a = NetEndpoints {
+            net: "a".into(),
+            src: dims.idx(3, 0),
+            dst: dims.idx(3, 1),
+            passable_pads: a_pad.clone(),
+        };
+        // B runs across row 1; its straight path would cross A's pad cell (3,1),
+        // but B does not own that pad so it must dip down to row 2 and around.
+        let net_b = NetEndpoints {
+            net: "b".into(),
+            src: dims.idx(0, 1),
+            dst: dims.idx(6, 1),
+            passable_pads: Vec::new(),
+        };
+        let nets = vec![net_a, net_b];
+
+        let br = RipUpRouter.route(&grid, &nets).unwrap();
+        assert!(br.unrouted.is_empty(), "both nets must route: {br:?}");
+        assert_eq!(br.results.len(), 2);
+
+        let a_path = &br.results[0].path;
+        let b_path = &br.results[1].path;
+
+        // B's path must contain NONE of A's pad cells.
+        for c in b_path {
+            assert!(
+                !a_pad.contains(c),
+                "B must route around A's pad; cell {c} is A's pad"
+            );
+        }
+        // A must escape its own pad (it routes within the unmasked pad cells).
+        assert!(a_path.contains(&dims.idx(3, 0)));
+        assert!(a_path.contains(&dims.idx(3, 1)));
+
+        // The two paths are cell-disjoint.
+        for c in b_path {
+            assert!(
+                !a_path.contains(c),
+                "paths must be cell-disjoint; shared cell {c}"
+            );
+        }
     }
 }
