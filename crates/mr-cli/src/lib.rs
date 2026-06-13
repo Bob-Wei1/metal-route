@@ -254,7 +254,9 @@ pub fn route_problem(
     // Standard tscircuit naming (top/inner_N/bottom) applies for SimpleRouteJson.
     let layer_count = layers.unwrap_or(srj.layer_count).max(1);
     let layer_map = LayerMap::standard(layer_count);
-    let problem = rasterize_with_layers(srj, resolution, layer_map);
+    // SimpleRouteJson route_problem does not apply pad clearance (that is the DSN
+    // pipeline's concern, which carries a min-clearance rule); pass 0.
+    let problem = rasterize_with_layers(srj, resolution, layer_map, 0);
     let total = problem.nets.len();
 
     // Only the negotiated backend places vias; give it a through-hole model over
@@ -695,22 +697,31 @@ pub fn route_dsn_problem(
         signal_layers.truncate(n);
     }
     let layer_map = LayerMap::from_names(signal_layers);
-    // Clearance enforcement (M2.4 finding): the legalization-phase clearance halo —
-    // hard OR soft — does NOT reduce violations on a congested coarse grid. The hard
-    // halo (clearance_cells > 0, blocking) dropped ~24% of nets; the soft halo (cost,
-    // never blocks) keeps full connectivity but leaves clearance ≈ unchanged while
-    // adding vias and runtime, because the negotiated paths are already packed and
-    // legalization can't create space that isn't there. Measured on fixture_fresh:
-    // off → 142 routed / 2715 clearance / 244 vias / ~5 s; soft halo → 142 / 2726 /
-    // 402 / minutes. So we keep the (tested) soft-clearance machinery in `mr-cpu` as
-    // the foundation but DISABLE the legalization halo by default; real clearance
-    // reduction belongs in the negotiation search + a finer grid (see
-    // benchmarks/drc_sota_research.md, P1/P4). Plane-antipad modelling (the via-
+    // Clearance enforcement (M3): the DSN `(rule (clearance N))` is now honoured in
+    // cell space. `clearance_cells = ceil(min_clearance / resolution)` is the
+    // copper-to-copper halo width in cells. It is enforced in two places:
+    //   * the negotiation search (`with_clearance_cells`, the parallel agent's side)
+    //     keeps tracks of different nets that many cells apart; and
+    //   * pad rasterisation (`rasterize_with_layers`, this crate's `mr-srj`) reserves
+    //     the same halo around every pad while still letting each net escape its own
+    //     pads via `passable_pads`.
+    // Committed vias likewise reserve a keepout halo (`ViaModel.keepout`) sized for
+    // the via pad plus clearance. This supersedes the M2.4 "disabled legalization
+    // halo" experiment: clearance now lives in the negotiation phase + the pad/via
+    // grid, not a post-hoc legalization fold. Plane-antipad modelling (the via-
     // through-plane fix) is independent and stays on.
-    let clearance_cells = 0;
+    let clearance_cells = if stats.min_clearance_mm > 0.0 && resolution > 0.0 {
+        (stats.min_clearance_mm / resolution).ceil() as u32
+    } else {
+        0
+    };
     let mut via_model = ViaModel::through_hole(layer_map.len());
-    via_model.keepout = 0;
-    let problem = rasterize_with_layers(&srj, resolution, layer_map);
+    via_model.keepout = if resolution > 0.0 {
+        ((VIA_PAD_MM / 2.0 + stats.min_clearance_mm) / resolution).ceil() as u32
+    } else {
+        0
+    };
+    let problem = rasterize_with_layers(&srj, resolution, layer_map, clearance_cells);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
     let grid_h = problem.mapping.dims.h;
@@ -1119,9 +1130,16 @@ mod tests {
         let ingest = dsn_to_ingest(dsn).unwrap();
         assert_eq!(ingest.srj.connections.len(), 2);
         // Skip GND -> only SIGNAL remains.
-        let (report, _, _, _) =
-            route_dsn_problem(ingest, "f", Some(0.5), &["GND".to_string()], None, None, true)
-                .unwrap();
+        let (report, _, _, _) = route_dsn_problem(
+            ingest,
+            "f",
+            Some(0.5),
+            &["GND".to_string()],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(report.original_nets, 1);
     }
 }

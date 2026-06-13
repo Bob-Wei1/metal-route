@@ -698,6 +698,7 @@ dependencies = [
  "mr-core",
  "mr-fixtures",
  "mr-grid",
+ "rayon",
 ]
 
 [[package]]

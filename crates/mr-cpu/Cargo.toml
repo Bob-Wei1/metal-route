@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 mr-core = { workspace = true }
 mr-grid = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 mr-fixtures = { workspace = true }

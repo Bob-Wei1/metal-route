@@ -227,7 +227,7 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     // The board's layer axis. `layer_count == 1` yields `["top"]`, so every
     // single-layer construction below collapses onto layer 0 and is byte-identical
     // to the pre-layers path.
-    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count))
+    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0)
 }
 
 /// (B3) Rasterise with an explicit [`LayerMap`] — use this when the layer *names*
@@ -235,10 +235,21 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// `B.Cu` stackup), so each [`Point`]/[`Obstacle`]'s named layer resolves to the
 /// right grid plane instead of collapsing onto layer 0. The grid is built with
 /// `layers.len()` planes; `rasterize` is the standard-naming special case.
+///
+/// `clearance_cells` reserves a copper-to-copper clearance halo around every pad:
+/// when `> 0`, after all pad obstacles are marked the base grid is grown by
+/// `clearance_cells` (planar Chebyshev, per-layer — see
+/// [`mr_grid::GridBuilder::inflate_clearance`]) so a track of another net cannot
+/// enter the halo. To preserve own-pad access through that now-inflated region,
+/// each net's `passable_pads` is correspondingly expanded to include the same
+/// Chebyshev neighbourhood (radius `clearance_cells`, on the endpoint's layer) of
+/// its own pad cells, so the net can still escape its own pads. `clearance_cells
+/// == 0` is byte-identical to no clearance: no inflation, no halo expansion.
 pub fn rasterize_with_layers(
     srj: &SimpleRouteJson,
     resolution: f64,
     layers: LayerMap,
+    clearance_cells: u32,
 ) -> RasterizedProblem {
     let layer_count = layers.len();
     let mapping = Mapping::with_layers(&srj.bounds, resolution, layer_count);
@@ -299,8 +310,22 @@ pub fn rasterize_with_layers(
     // rasterise time — committed vias reserve their keepout halo there, so nothing
     // extra is stamped on the base grid here.
 
+    // Pad clearance: grow every pad obstacle by `clearance_cells` so a foreign
+    // net's track cannot enter the halo. Own-pad access through the halo is
+    // restored below by expanding each net's `passable_pads` to the same
+    // neighbourhood. `clearance_cells == 0` is a no-op (byte-identical base grid).
+    if clearance_cells > 0 {
+        builder.inflate_clearance(clearance_cells);
+    }
+
     let grid = builder.build();
-    let nets = decompose_connections(&srj.connections, &mapping, &srj.obstacles, &layers);
+    let nets = decompose_connections(
+        &srj.connections,
+        &mapping,
+        &srj.obstacles,
+        &layers,
+        clearance_cells,
+    );
 
     RasterizedProblem {
         grid,
@@ -342,14 +367,23 @@ fn obstacle_layers(obs: &Obstacle, layers: &LayerMap) -> Vec<u32> {
 /// `point`, plus the point's own rasterised cell. This is the set of pad cells a
 /// net owning this endpoint is allowed to traverse. The cells are returned in
 /// ascending [`CellIdx`] order, deduplicated, for deterministic serialisation.
+///
+/// When `clearance_cells > 0` the set is additionally expanded to the planar
+/// Chebyshev neighbourhood (radius `clearance_cells`, on the endpoint's `layer`)
+/// of every own-pad cell — mirroring [`mr_grid::GridBuilder::inflate_clearance`] —
+/// so the net can still reach and escape its own pad through the inflated clearance
+/// halo that now surrounds it. `clearance_cells == 0` leaves the set unchanged.
 fn pad_cells_for_point(
     point: (f64, f64),
     layer: u32,
     mapping: &Mapping,
     obstacles: &[Obstacle],
+    clearance_cells: u32,
 ) -> Vec<CellIdx> {
     let (px, py) = point;
-    let mut cells: Vec<CellIdx> = Vec::new();
+    // Pad cells as (x, y) on this endpoint's layer; we inflate these planar coords
+    // before resolving to layered cell indices so the halo stays on `layer`.
+    let mut planar: Vec<(u32, u32)> = Vec::new();
     for obs in obstacles {
         let min_x = obs.center.x - obs.width / 2.0;
         let max_x = obs.center.x + obs.width / 2.0;
@@ -365,16 +399,32 @@ fn pad_cells_for_point(
         if x1 < x0 || y1 < y0 {
             continue;
         }
-        // Unmask the pad only on the endpoint's own layer: the net escapes through
-        // its pad on the layer it connects, not on every layer the pad spans.
         for y in y0..=y1 {
             for x in x0..=x1 {
-                cells.push(mapping.dims.idx3(x, y, layer));
+                planar.push((x, y));
             }
         }
     }
-    // Always include the endpoint's own rasterised (layered) cell.
-    cells.push(mapping.point_to_cell_layer((px, py), layer));
+    // Always include the endpoint's own rasterised cell's planar coordinate.
+    let (ex, ey) = mapping.point_to_xy((px, py));
+    planar.push((ex, ey));
+
+    // Resolve to layered cells, expanding each pad cell to its Chebyshev
+    // neighbourhood (radius `clearance_cells`) on the endpoint's own layer so the
+    // net can traverse the inflated clearance halo around its own pads.
+    let mut cells: Vec<CellIdx> = Vec::new();
+    let r = clearance_cells as i64;
+    for &(x, y) in &planar {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                if nx < 0 || ny < 0 || nx >= mapping.dims.w as i64 || ny >= mapping.dims.h as i64 {
+                    continue;
+                }
+                cells.push(mapping.dims.idx3(nx as u32, ny as u32, layer));
+            }
+        }
+    }
     cells.sort_unstable();
     cells.dedup();
     cells
@@ -398,6 +448,7 @@ fn decompose_connections(
     mapping: &Mapping,
     obstacles: &[Obstacle],
     layers: &LayerMap,
+    clearance_cells: u32,
 ) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
@@ -418,13 +469,19 @@ fn decompose_connections(
             };
             // Union of the src and dst pad cells (each on its endpoint's layer),
             // sorted + deduped.
-            let mut passable_pads =
-                pad_cells_for_point((win[0].x, win[0].y), src_layer, mapping, obstacles);
+            let mut passable_pads = pad_cells_for_point(
+                (win[0].x, win[0].y),
+                src_layer,
+                mapping,
+                obstacles,
+                clearance_cells,
+            );
             passable_pads.extend(pad_cells_for_point(
                 (win[1].x, win[1].y),
                 dst_layer,
                 mapping,
                 obstacles,
+                clearance_cells,
             ));
             passable_pads.sort_unstable();
             passable_pads.dedup();
@@ -1210,5 +1267,104 @@ mod tests {
             }
             _ => panic!("wire expected"),
         }
+    }
+
+    /// Pad clearance JSON: two single-cell pads of DIFFERENT nets two cells apart
+    /// on a 7×7 board at res 1 (pad "a" centred at (1.5,3.5) -> cell (1,3); pad "b"
+    /// at (4.5,3.5) -> cell (4,3)). The cells between them are otherwise free.
+    const CLEARANCE_SRJ: &str = r#"{
+        "layerCount": 1,
+        "bounds": { "minX": 0, "maxX": 7, "minY": 0, "maxY": 7 },
+        "obstacles": [
+            { "type": "rect", "center": {"x": 1.5, "y": 3.5}, "width": 0.5, "height": 0.5,
+              "connectedTo": ["pad_a"] },
+            { "type": "rect", "center": {"x": 4.5, "y": 3.5}, "width": 0.5, "height": 0.5,
+              "connectedTo": ["pad_b"] }
+        ],
+        "connections": [
+            { "name": "a", "pointsToConnect": [ {"x": 1.5, "y": 3.5}, {"x": 1.5, "y": 0.5} ] },
+            { "name": "b", "pointsToConnect": [ {"x": 4.5, "y": 3.5}, {"x": 4.5, "y": 0.5} ] }
+        ]
+    }"#;
+
+    /// `clearance_cells = 1`: each pad reserves a 1-cell Chebyshev halo (foreign
+    /// tracks can't enter it), while a net's OWN `passable_pads` includes that halo
+    /// so it can escape.
+    #[test]
+    fn rasterize_pad_clearance_reserves_halo_and_unmasks_own() {
+        let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1);
+        let d = prob.mapping.dims;
+
+        // Pad "a" rasterises to cell (1,3); its 1-cell halo (cells (0..=2, 2..=4))
+        // is reserved as obstacles. In particular the cells around/adjacent to the
+        // foreign pad are blocked.
+        for y in 2..=4 {
+            for x in 0..=2 {
+                assert!(
+                    prob.grid.is_obstacle(d.idx(x, y)),
+                    "pad-a halo cell ({x},{y}) must be reserved"
+                );
+            }
+        }
+        // Symmetric for pad "b" at cell (4,3): halo (3..=5, 2..=4).
+        for y in 2..=4 {
+            for x in 3..=5 {
+                assert!(
+                    prob.grid.is_obstacle(d.idx(x, y)),
+                    "pad-b halo cell ({x},{y}) must be reserved"
+                );
+            }
+        }
+
+        // Net "a" can escape its OWN pad: its passable_pads includes the halo
+        // around cell (1,3) — e.g. the cell directly below it, (1,2), which is an
+        // obstacle in the base grid but unmasked for net "a".
+        let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
+        for (x, y) in [(0, 3), (2, 3), (1, 2), (1, 4)] {
+            let cell = d.idx(x, y);
+            assert!(
+                prob.grid.is_obstacle(cell),
+                "halo cell ({x},{y}) is an obstacle in the base grid"
+            );
+            assert!(
+                net_a.passable_pads.contains(&cell),
+                "net a must be able to traverse its own-pad halo at ({x},{y})"
+            );
+        }
+        // Net "a" must NOT be allowed through the foreign pad "b" or its halo.
+        let net_b_core = d.idx(4, 3);
+        assert!(
+            !net_a.passable_pads.contains(&net_b_core),
+            "net a must not be allowed through foreign pad b"
+        );
+    }
+
+    /// `clearance_cells = 0` is byte-identical to the historical rasterisation:
+    /// the same obstacle set and the same `passable_pads` as a no-clearance build.
+    #[test]
+    fn rasterize_clearance_zero_is_byte_identical() {
+        let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
+        // `rasterize` (no clearance) and `rasterize_with_layers(.., 0)` must agree.
+        let baseline = rasterize(&srj, 1.0);
+        let zero = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 0);
+
+        assert_eq!(
+            baseline.grid.cost, zero.grid.cost,
+            "clearance_cells=0 grid must equal the no-clearance grid"
+        );
+        assert_eq!(
+            baseline.nets, zero.nets,
+            "clearance_cells=0 nets/passable_pads must equal the no-clearance build"
+        );
+
+        // And no extra obstacles beyond the two 1-cell pads exist.
+        let obstacles = zero
+            .grid
+            .cost
+            .iter()
+            .filter(|&&c| c == mr_core::OBSTACLE)
+            .count();
+        assert_eq!(obstacles, 2, "exactly the two single-cell pads, no halo");
     }
 }

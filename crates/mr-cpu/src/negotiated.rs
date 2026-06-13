@@ -42,6 +42,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use mr_core::{
     BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError, ViaModel,
     OBSTACLE,
@@ -65,6 +67,24 @@ pub const SCALE: Cost = 16;
 /// cost is always capped strictly below [`OBSTACLE`] so a penalized cell is never
 /// confused with an impassable one.
 pub const CLEARANCE_PENALTY: Cost = 16 * SCALE;
+
+/// Soft clearance weight priced into the NEGOTIATION search (TritonRoute `objCost`
+/// analog). Distinct from [`CLEARANCE_PENALTY`] (a legalization-only cost): during
+/// negotiation each net additionally pays `pfac * CLEARANCE_NEG_WEIGHT * present_halo[c]`
+/// to ENTER a cell `c` that lies inside *another* net's clearance / via-keepout halo
+/// (see `present_halo` in [`NegotiatedRouter::route`]). Because the cost scales with
+/// `pfac` (which grows each iteration), routing within a neighbour's spacing becomes
+/// steadily more expensive, so the negotiation SPREADS nets apart by clearance over
+/// iterations rather than relying on legalization alone to enforce it.
+///
+/// Tunable. Starts at [`SCALE`] (`= 16`): one unit of clearance overlap is priced
+/// like one unit of direct cell sharing (`pfac * SCALE * present[c]`), a deliberately
+/// soft starting point that the per-iteration `pfac` ramp amplifies. Like every other
+/// negotiation cost it is capped strictly below [`OBSTACLE`] so a penalized cell is
+/// never confused with an impassable one. When `clearance_cells == 0` AND
+/// `via_model.keepout == 0` the halo field stays all-zero and this term contributes
+/// nothing, keeping the default router byte-identical to the pre-clearance behaviour.
+pub const CLEARANCE_NEG_WEIGHT: Cost = SCALE;
 
 /// Maximum negotiation iterations before falling through to legalization.
 pub const MAX_ITERS: u32 = 60;
@@ -317,6 +337,20 @@ impl Router for NegotiatedRouter {
         // Persistent congestion state.
         let mut history: Vec<u32> = vec![0; n_cells];
         let mut present: Vec<u32> = vec![0; n_cells];
+        // Per-cell count of how many *other* nets' clearance footprints (planar
+        // clearance halo + via keepout) cover this cell — the negotiation analog of
+        // TritonRoute's `objCost`. Maintained EXACTLY parallel to `present`: when a
+        // net's path is removed from `present` its halo footprint is removed from
+        // `present_halo`, and when the new path is added to `present` its footprint is
+        // added here (see the inc/dec sites in the loop below, both via
+        // `for_each_halo_cell`). So during net i's search `present_halo` excludes net i
+        // = every OTHER net's clearance footprint, exactly like `present`. When
+        // `clearance_cells == 0 && via_model.keepout == 0` the footprint is empty so
+        // this stays all-zero and contributes nothing (byte-identical default).
+        let mut present_halo: Vec<u32> = vec![0; n_cells];
+        // Whether the clearance mechanism is active at all. Drives both the
+        // `present_halo` pricing and the incremental-skip gating below.
+        let clearance_active = self.clearance_cells > 0 || via_model.keepout > 0;
         // Current routed path per net (empty == not currently routed).
         let mut paths: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
 
@@ -335,7 +369,17 @@ impl Router for NegotiatedRouter {
         // path is unchanged. This cuts later iterations from O(all nets) to
         // O(congested nets). Gated to large net counts so the small deterministic
         // unit tests keep their exact full-reroute behaviour.
-        let incremental = n_nets > 8;
+        //
+        // CLEARANCE GATING: the quiescence test below skips a routed net whose path
+        // avoids every `prev_overused` cell, on the reasoning that such a net's priced
+        // costs are unchanged. That reasoning fails once clearance is active: a net's
+        // priced cost can change because a *neighbour's* halo (`present_halo`) shifted,
+        // which `prev_overused` (a copper-overuse set) does not capture. So when
+        // clearance is active we disable the incremental skip and reroute every net
+        // each iteration — slower, but sound; clearance routing is already the slow
+        // path. When clearance is inactive the field stays all-zero and the skip is
+        // exactly as before (byte-identical).
+        let incremental = n_nets > 8 && !clearance_active;
         // `overused` from the previous iteration (cell -> was it over-used). Empty
         // before the first iteration (everything reroutes).
         let mut prev_overused: Vec<bool> = vec![false; n_cells];
@@ -349,54 +393,200 @@ impl Router for NegotiatedRouter {
         for iter in 0..MAX_ITERS {
             let pfac: u32 = 1 + iter;
 
-            for i in 0..n_nets {
-                let net = &nets[i];
-
-                // Skip quiescent nets after the first iteration: a routed net whose
-                // path avoids every previously-over-used cell keeps its path.
-                if incremental && iter > 0 && !paths[i].is_empty() {
-                    let touches_overuse = paths[i].iter().any(|&c| prev_overused[c as usize]);
-                    if !touches_overuse {
-                        continue;
+            if clearance_active {
+                // ---- Snapshot-based (Jacobi-style) PARALLEL negotiation ----
+                //
+                // When clearance is active the incremental quiescence skip is unsound
+                // (a net's price can shift because a NEIGHBOUR's halo moved, which
+                // `prev_overused` does not capture), so every net reroutes each
+                // iteration anyway — making the work embarrassingly parallel. We take
+                // `present`/`present_halo` (and `history`, already iteration-stable) as
+                // a READ-ONLY snapshot: every net prices against the occupancy from the
+                // END of the previous iteration, not within-iteration updates. The nets
+                // are routed in parallel with rayon; results are MERGED back into the
+                // shared state SEQUENTIALLY in net-index order, so the outcome is
+                // independent of thread scheduling (deterministic). This is a standard,
+                // correct PathFinder variant (Jacobi vs Gauss-Seidel); it may converge
+                // to a different-but-equivalent route than the sequential path, which is
+                // fine for the clearance path. `clearance_active` is FALSE for the
+                // default router, so this branch never affects the byte-identical path.
+                let clearance_cells = self.clearance_cells;
+                // Borrow the snapshots immutably for the duration of the parallel map.
+                // Each worker thread keeps its OWN reusable `SearchBuf` + `PadSet`
+                // scratch via `map_init` (never shared across threads). The closure
+                // captures only shared `&` references (all `Sync`): `grid`, the three
+                // occupancy slices, `nets`, `windows`, `via_model`.
+                let present_snap: &[u32] = &present;
+                let halo_snap: &[u32] = &present_halo;
+                let history_snap: &[u32] = &history;
+                let nets_ref = nets;
+                let windows_ref = &windows;
+                let via_ref = &via_model;
+                let mut routed_paths: Vec<(usize, Option<Vec<CellIdx>>)> = (0..n_nets)
+                    .into_par_iter()
+                    .map_init(
+                        || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
+                        |(buf, pad_set), i| {
+                            let net = &nets_ref[i];
+                            pad_set.load(&net.passable_pads);
+                            // Route within the net's window; on failure, retry once on
+                            // the full board so the occasional global net still
+                            // completes. Pure read-only search over the snapshots.
+                            let routed = route_negotiated(
+                                buf,
+                                grid,
+                                pad_set,
+                                present_snap,
+                                halo_snap,
+                                history_snap,
+                                pfac,
+                                net.src,
+                                net.dst,
+                                windows_ref[i],
+                                via_ref,
+                            )
+                            .or_else(|| {
+                                route_negotiated(
+                                    buf,
+                                    grid,
+                                    pad_set,
+                                    present_snap,
+                                    halo_snap,
+                                    history_snap,
+                                    pfac,
+                                    net.src,
+                                    net.dst,
+                                    Window::full(dims),
+                                    via_ref,
+                                )
+                            });
+                            (i, routed.map(|(p, _)| p))
+                        },
+                    )
+                    .collect();
+                // Deterministic merge: sort by net index, then rebuild `present` /
+                // `present_halo` from ALL new paths in index order so the next
+                // iteration's snapshot is identical regardless of scheduling.
+                routed_paths.sort_unstable_by_key(|(i, _)| *i);
+                present.iter_mut().for_each(|c| *c = 0);
+                present_halo.iter_mut().for_each(|c| *c = 0);
+                for (i, path) in routed_paths {
+                    match path {
+                        Some(path) => {
+                            for &c in &path {
+                                present[c as usize] = present[c as usize].saturating_add(1);
+                            }
+                            for_each_halo_cell(
+                                dims,
+                                grid,
+                                &path,
+                                clearance_cells,
+                                &via_model,
+                                |c| {
+                                    present_halo[c as usize] =
+                                        present_halo[c as usize].saturating_add(1);
+                                },
+                            );
+                            paths[i] = path;
+                        }
+                        None => {
+                            // Unrouted this iteration: contributes nothing to occupancy.
+                            paths[i].clear();
+                        }
                     }
                 }
+            } else {
+                // ---- Sequential incremental negotiation (clearance INACTIVE) ----
+                // Verbatim pre-parallel behaviour; kept byte-identical. `clearance_active`
+                // is false here, so `present_halo` stays all-zero and contributes nothing.
+                for i in 0..n_nets {
+                    let net = &nets[i];
 
-                // Remove this net's old path from `present` before pricing.
-                for &c in &paths[i] {
-                    present[c as usize] = present[c as usize].saturating_sub(1);
-                }
-                paths[i].clear();
+                    // Skip quiescent nets after the first iteration: a routed net whose
+                    // path avoids every previously-over-used cell keeps its path.
+                    if incremental && iter > 0 && !paths[i].is_empty() {
+                        let touches_overuse = paths[i].iter().any(|&c| prev_overused[c as usize]);
+                        if !touches_overuse {
+                            continue;
+                        }
+                    }
 
-                pad_set.load(&net.passable_pads);
+                    // Remove this net's old path from `present` before pricing, and its
+                    // clearance footprint from `present_halo` in lockstep (saturating), so
+                    // both maps exclude net i during its own search. `for_each_halo_cell`
+                    // is a no-op when clearance is inactive, so `present_halo` stays 0.
+                    for &c in &paths[i] {
+                        present[c as usize] = present[c as usize].saturating_sub(1);
+                    }
+                    if clearance_active {
+                        for_each_halo_cell(
+                            dims,
+                            grid,
+                            &paths[i],
+                            self.clearance_cells,
+                            &via_model,
+                            |c| {
+                                present_halo[c as usize] =
+                                    present_halo[c as usize].saturating_sub(1);
+                            },
+                        );
+                    }
+                    paths[i].clear();
 
-                // Route within the net's window; on failure, retry once on the
-                // full board so the occasional global net still completes.
-                let routed = route_negotiated(
-                    &mut buf, grid, &pad_set, &present, &history, pfac, net.src, net.dst,
-                    windows[i], &via_model,
-                )
-                .or_else(|| {
-                    route_negotiated(
+                    pad_set.load(&net.passable_pads);
+
+                    // Route within the net's window; on failure, retry once on the
+                    // full board so the occasional global net still completes.
+                    let routed = route_negotiated(
                         &mut buf,
                         grid,
                         &pad_set,
                         &present,
+                        &present_halo,
                         &history,
                         pfac,
                         net.src,
                         net.dst,
-                        Window::full(dims),
+                        windows[i],
                         &via_model,
                     )
-                });
+                    .or_else(|| {
+                        route_negotiated(
+                            &mut buf,
+                            grid,
+                            &pad_set,
+                            &present,
+                            &present_halo,
+                            &history,
+                            pfac,
+                            net.src,
+                            net.dst,
+                            Window::full(dims),
+                            &via_model,
+                        )
+                    });
 
-                if let Some((path, _)) = routed {
-                    for &c in &path {
-                        present[c as usize] = present[c as usize].saturating_add(1);
+                    if let Some((path, _)) = routed {
+                        for &c in &path {
+                            present[c as usize] = present[c as usize].saturating_add(1);
+                        }
+                        if clearance_active {
+                            for_each_halo_cell(
+                                dims,
+                                grid,
+                                &path,
+                                self.clearance_cells,
+                                &via_model,
+                                |c| {
+                                    present_halo[c as usize] =
+                                        present_halo[c as usize].saturating_add(1);
+                                },
+                            );
+                        }
+                        paths[i] = path;
                     }
-                    paths[i] = path;
+                    // else: leave unrouted this iteration (no contribution to present).
                 }
-                // else: leave unrouted this iteration (no contribution to present).
             }
 
             // Overuse across GROUPS: a cell is over-used iff ≥2 distinct groups
@@ -538,47 +728,80 @@ impl Router for NegotiatedRouter {
             }
         }
 
-        // Evaluate each candidate and keep the best. "Best" = most nets routed,
-        // then lowest total unit cost, then lexicographically lowest group order
-        // (for determinism). The group order is carried alongside the result so it
-        // can serve as the final tie-break directly.
-        let mut best: Option<(usize, Cost, Vec<usize>, Committed)> = None;
-        for order in &candidates {
-            let committed = legalize_in_order(
-                grid,
-                &mut buf,
-                &mut pad_set,
-                nets,
-                &group_ids,
-                &paths,
-                &windows,
-                order,
-                n_cells,
-                &via_model,
-                self.clearance_cells,
-            );
-            let routed = committed.iter().filter(|c| c.is_some()).count();
-            let total_cost: Cost = committed
-                .iter()
-                .filter_map(|c| c.as_ref())
-                .map(|p| unit_cost(p))
-                .fold(0, |a, b| a.saturating_add(b));
+        // Evaluate each candidate IN PARALLEL and keep the best. The candidate orders
+        // are independent (`legalize_in_order` is a pure function of its inputs), so
+        // rayon distributes them across cores; each worker uses its OWN `SearchBuf` +
+        // `PadSet` scratch via `map_init` (never shared). Results are collected with
+        // their candidate INDEX, then the winner is picked by a fully deterministic,
+        // scheduling-independent fold over the indexed results.
+        let evaluated: Vec<(usize, usize, Cost, Committed)> = candidates
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
+                |(buf, pad_set), (idx, order)| {
+                    let committed = legalize_in_order(
+                        grid,
+                        buf,
+                        pad_set,
+                        nets,
+                        &group_ids,
+                        &paths,
+                        &windows,
+                        order,
+                        n_cells,
+                        &via_model,
+                        self.clearance_cells,
+                    );
+                    let routed = committed.iter().filter(|c| c.is_some()).count();
+                    let total_cost: Cost = committed
+                        .iter()
+                        .filter_map(|c| c.as_ref())
+                        .map(|p| unit_cost(p))
+                        .fold(0, |a, b| a.saturating_add(b));
+                    (idx, routed, total_cost, committed)
+                },
+            )
+            .collect();
+
+        // Deterministic pick — IDENTICAL to the old sequential criterion: most nets
+        // routed, then lowest total unit cost, then lexicographically lowest group
+        // ORDER (`order < bo`). Iterating the indexed results in candidate-index
+        // order (sequential scan) reproduces the exact tie-break path the sequential
+        // loop took (it processed `candidates` in order with the same `better` test),
+        // so the chosen `committed` is byte-identical regardless of how rayon
+        // scheduled the parallel evaluation.
+        let mut best: Option<(usize, Cost, &Vec<usize>)> = None;
+        let mut best_idx: Option<usize> = None;
+        for (idx, routed, total_cost, _committed) in &evaluated {
+            let order = &candidates[*idx];
             let better = match &best {
                 None => true,
-                Some((br, bc, bo, _)) => {
-                    routed > *br
-                        || (routed == *br && total_cost < *bc)
-                        || (routed == *br && total_cost == *bc && order < bo)
+                Some((br, bc, bo)) => {
+                    *routed > *br
+                        || (*routed == *br && *total_cost < *bc)
+                        || (*routed == *br && *total_cost == *bc && order < bo)
                 }
             };
             if better {
-                best = Some((routed, total_cost, order.clone(), committed));
+                best = Some((*routed, *total_cost, order));
+                best_idx = Some(*idx);
             }
         }
 
-        let (best_routed, best_order, multi_committed) = best
-            .map(|(r, _, o, c)| (r, o, c))
-            .unwrap_or_else(|| (0, base_order.clone(), vec![None; n_nets]));
+        let (best_routed, best_order, multi_committed) = match best_idx {
+            Some(idx) => {
+                let routed = best.as_ref().map(|b| b.0).unwrap_or(0);
+                // Reclaim the winning committed vec by index without cloning.
+                let committed = evaluated
+                    .into_iter()
+                    .find(|(i, _, _, _)| *i == idx)
+                    .map(|(_, _, _, c)| c)
+                    .unwrap_or_else(|| vec![None; n_nets]);
+                (routed, candidates[idx].clone(), committed)
+            }
+            None => (0, base_order.clone(), vec![None; n_nets]),
+        };
 
         // ---- Bounded rip-up-and-reroute legalization (final stage) ----
         //
@@ -651,6 +874,7 @@ fn route_negotiated(
     base: &Grid,
     pads: &PadSet,
     present: &[u32],
+    present_halo: &[u32],
     history: &[u32],
     pfac: u32,
     src: CellIdx,
@@ -659,16 +883,23 @@ fn route_negotiated(
     via_model: &ViaModel,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
-    // Price to ENTER cell `c`: planar base `SCALE`, plus permanent history and the
-    // present-congestion penalty, capped below OBSTACLE. Vias reuse this same
-    // congestion (history + present of the destination cell) but substitute the
-    // planar `SCALE` base with the via's `step_cost` so layer changes also
-    // negotiate congestion — see `via_priced` below.
+    // Price to ENTER cell `c`: planar base `SCALE`, plus permanent history, the
+    // present-congestion penalty, and the clearance penalty (TritonRoute `objCost`
+    // analog) — `pfac * CLEARANCE_NEG_WEIGHT * present_halo[c]`, i.e. how many OTHER
+    // nets' clearance footprints cover `c`, scaled by the growing present-factor so
+    // the negotiation spreads nets apart over iterations. Capped below OBSTACLE.
+    // `present_halo` is all-zero when clearance is inactive, so this term vanishes
+    // (byte-identical default). Vias reuse this same congestion + clearance of the
+    // destination cell but substitute the planar `SCALE` base with the via's
+    // `step_cost` so layer changes also negotiate — see `via_step` below.
     let priced_with_base = |c: CellIdx, base_cost: u64| -> Cost {
         let ci = c as usize;
         let priced = base_cost
             .saturating_add(history[ci] as u64)
-            .saturating_add((pfac as u64) * (SCALE as u64) * (present[ci] as u64));
+            .saturating_add((pfac as u64) * (SCALE as u64) * (present[ci] as u64))
+            .saturating_add(
+                (pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * (present_halo[ci] as u64),
+            );
         priced.min(OBSTACLE as u64 - 1) as Cost
     };
     let cost_fn = |c: CellIdx| -> Cost { priced_with_base(c, SCALE as u64) };
@@ -795,6 +1026,79 @@ fn route_legal(
     };
     let h = |c: CellIdx| manhattan_scaled(dims, c, dst, via_model.step_cost);
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
+}
+
+/// Enumerate every cell in a `path`'s SOFT clearance footprint, invoking `visit`
+/// once per cell (cells may repeat across overlapping halos — the callers use
+/// saturating inc/dec or first-claim guards, so repeats are intended/idempotent).
+///
+/// The footprint is exactly the set of cells [`stamp_owner`] considers for `halo`
+/// (so the negotiation `present_halo` field and the legalization `halo` map share
+/// one shape):
+///   * **Planar clearance halo.** For each path cell, on that cell's OWN layer, the
+///     `(2r+1)x(2r+1)` Chebyshev box of radius `r = clearance_cells`. Base-obstacle
+///     cells are SKIPPED (a halo never claims an obstacle / foreign pad).
+///   * **Via keepout halo.** At each via (two consecutive path cells sharing `(x,y)`
+///     but differing in layer), on BOTH spanned layers, the Chebyshev box of radius
+///     `max(clearance_cells, via_model.keepout)`. Base-obstacle cells are SKIPPED.
+///
+/// When `clearance_cells == 0` AND `via_model.keepout == 0` every radius is 0, so
+/// `visit` is never called and the footprint is empty — the property that keeps the
+/// `clearance_cells == 0` router byte-identical.
+///
+/// NOTE: unlike [`stamp_owner`] this does NOT skip cells already owned/claimed (it
+/// has no ownership view); it visits the geometric footprint and leaves
+/// owner/first-claim policy to the caller. `present_halo` wants the raw geometric
+/// count (every other net's halo contributes), so this is the right shape for it,
+/// and `stamp_owner` layers its own `owner == -1 && halo == -1` guard on top.
+fn for_each_halo_cell(
+    dims: mr_core::Dims,
+    base: &Grid,
+    path: &[CellIdx],
+    clearance_cells: u32,
+    via_model: &ViaModel,
+    mut visit: impl FnMut(CellIdx),
+) {
+    // Visit the planar Chebyshev box of radius `r` around `(cx, cy)` on `layer`,
+    // skipping base obstacles (a halo never claims an obstacle / foreign pad).
+    let box_cells = |cx: u32, cy: u32, layer: u32, r: u32, visit: &mut dyn FnMut(CellIdx)| {
+        if r == 0 {
+            return;
+        }
+        let x0 = cx.saturating_sub(r);
+        let y0 = cy.saturating_sub(r);
+        let x1 = (cx + r).min(dims.w.saturating_sub(1));
+        let y1 = (cy + r).min(dims.h.saturating_sub(1));
+        for ny in y0..=y1 {
+            for nx in x0..=x1 {
+                let n = dims.idx3(nx, ny, layer);
+                if !base.is_obstacle(n) {
+                    visit(n);
+                }
+            }
+        }
+    };
+
+    // Planar clearance halo around each path cell, on that cell's own layer.
+    for &c in path {
+        let (cx, cy, cl) = dims.xyz(c);
+        box_cells(cx, cy, cl, clearance_cells, &mut visit);
+    }
+
+    // Via keepout: a via is a consecutive same-(x,y), layer-changing step. At each
+    // via (x,y) visit the larger of the planar clearance and the via keepout on both
+    // layers the via spans.
+    let via_r = clearance_cells.max(via_model.keepout);
+    if via_r > 0 {
+        for w in path.windows(2) {
+            let (ax, ay, al) = dims.xyz(w[0]);
+            let (bx, by, bl) = dims.xyz(w[1]);
+            if ax == bx && ay == by && al != bl {
+                box_cells(ax, ay, al, via_r, &mut visit);
+                box_cells(bx, by, bl, via_r, &mut visit);
+            }
+        }
+    }
 }
 
 /// Fold a committed `path` into the ownership maps, separating HARD copper from the
@@ -1028,8 +1332,7 @@ fn legalize_in_order(
             } else {
                 pad_set.load(&net.passable_pads);
                 route_legal(
-                    buf, grid, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
-                    via_model,
+                    buf, grid, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i], via_model,
                 )
                 .or_else(|| {
                     route_legal(
@@ -2131,7 +2434,10 @@ mod tests {
                 }
             }
         }
-        assert!(!via_neigh.is_empty(), "A must place at least one via: {ra:?}");
+        assert!(
+            !via_neigh.is_empty(),
+            "A must place at least one via: {ra:?}"
+        );
 
         // With room to spare, the router PREFERS keeping B's copper out of A's
         // reserved via neighbourhood (the soft keepout steers B away).
@@ -2172,5 +2478,67 @@ mod tests {
         assert!(br_zero.unrouted.is_empty());
         assert_eq!(br_zero.results.len(), 2);
         assert!(disjoint(&br_zero.results[0].path, &br_zero.results[1].path));
+    }
+
+    /// Determinism under parallelism: a clearance-ACTIVE route (which now takes the
+    /// snapshot-based rayon-parallel negotiation path) must produce a byte-identical
+    /// [`BoardRoute`] across two runs. The deterministic snapshot + index-ordered
+    /// merge make the result independent of how rayon schedules the parallel net
+    /// searches, so two runs of the same problem agree exactly.
+    #[test]
+    fn clearance_active_route_is_deterministic_under_parallelism() {
+        // A handful of nets on a roomy board so several route in parallel each
+        // iteration. clearance_cells = 1 makes `clearance_active` true → parallel path.
+        let dims = Dims::new(12, 12);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = vec![
+            net("a", dims.idx(0, 0), dims.idx(11, 11)),
+            net("b", dims.idx(11, 0), dims.idx(0, 11)),
+            net("c", dims.idx(0, 5), dims.idx(11, 5)),
+            net("d", dims.idx(5, 0), dims.idx(5, 11)),
+            net("e", dims.idx(0, 9), dims.idx(11, 2)),
+        ];
+
+        let router = NegotiatedRouter::new().with_clearance_cells(1);
+        let br1 = router.route(&grid, &nets).unwrap();
+        let br2 = router.route(&grid, &nets).unwrap();
+
+        // Byte-identical across runs despite parallel scheduling.
+        assert_eq!(br1.results, br2.results);
+        assert_eq!(br1.unrouted, br2.unrouted);
+        assert_eq!(br1.congestion, br2.congestion);
+    }
+
+    /// Parallel + clearance still routes all nets on a roomy board (a
+    /// timing-independent correctness check on the parallel negotiation path). Three
+    /// well-separated nets with clearance active must all route, cell-disjoint.
+    #[test]
+    fn clearance_active_parallel_routes_all_on_roomy_board() {
+        let dims = Dims::new(10, 10);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = vec![
+            net("a", dims.idx(0, 1), dims.idx(9, 1)),
+            net("b", dims.idx(0, 5), dims.idx(9, 5)),
+            net("c", dims.idx(0, 8), dims.idx(9, 8)),
+        ];
+
+        let br = NegotiatedRouter::new()
+            .with_clearance_cells(1)
+            .route(&grid, &nets)
+            .unwrap();
+
+        assert!(
+            br.unrouted.is_empty(),
+            "parallel clearance route must place all nets on a roomy board: {br:?}"
+        );
+        assert_eq!(br.results.len(), 3);
+        for i in 0..br.results.len() {
+            for j in (i + 1)..br.results.len() {
+                assert!(
+                    disjoint(&br.results[i].path, &br.results[j].path),
+                    "distinct nets must be cell-disjoint"
+                );
+            }
+        }
     }
 }
