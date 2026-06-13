@@ -8,3 +8,11 @@ rust-version.workspace = true
 [dependencies]
 mr-core = { workspace = true }
 mr-grid = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+
+[dev-dependencies]
+mr-cpu = { workspace = true }
+mr-fixtures = { workspace = true }
+mr-oracle = { workspace = true }
