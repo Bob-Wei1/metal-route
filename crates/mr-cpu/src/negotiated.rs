@@ -52,11 +52,15 @@ use crate::dijkstra::{dijkstra, reconstruct_path};
 pub const SCALE: Cost = 16;
 
 /// Maximum negotiation iterations before falling through to legalization.
-pub const MAX_ITERS: u32 = 40;
+pub const MAX_ITERS: u32 = 60;
 
 /// Free-cell cost used when unmasking a net's own pad cells (mirrors the base grid
 /// convention used by `GridBuilder`, which fills passable cells with cost 1).
 const FREE_COST: Cost = 1;
+
+/// Per-net committed paths from one legalization pass, in input net order: `Some`
+/// when the net was placed, `None` when it could not be (dropped/unrouted).
+type Committed = Vec<Option<Vec<CellIdx>>>;
 
 /// PathFinder-style negotiated-congestion router. Default multi-net backend.
 #[derive(Debug, Default, Clone, Copy)]
@@ -200,63 +204,98 @@ impl Router for NegotiatedRouter {
             }
         }
 
-        // ---- Final legalization: commit group-by-group, cell-disjoint across
-        // groups. Cells used within a group never block its own members. ----
-        let mut occupied: Vec<bool> = vec![false; n_cells];
-        let mut committed: Vec<Option<Vec<CellIdx>>> = vec![None; n_nets];
+        // ---- Order-robust legalization ----
+        //
+        // Legalization commits whole connection groups, one at a time, in a chosen
+        // group order; each group's cells become hard obstacles for later groups.
+        // The first-committed group can take a corridor that strands a later one,
+        // so the order matters: a cell-disjoint solution may exist only under a
+        // different order. We therefore run the same commit logic for several
+        // candidate group orders and keep the result that routes the most nets.
 
-        // Deterministic commit order: by (group id, net index). Group ids are
-        // assigned in first-appearance order, so this is stable input order.
-        let mut order: Vec<usize> = (0..n_nets).collect();
-        order.sort_by_key(|&i| (group_ids[i], i));
+        // Distinct group ids in first-appearance order (group_ids are interned by
+        // first appearance, so the set {0..n_groups-1} is exactly that order).
+        let n_groups = group_ids.iter().map(|&g| g + 1).max().unwrap_or(0);
 
-        // Track which cells the current group itself owns, so sibling sub-nets of
-        // the same connection may overlap freely without being blocked.
-        let mut group_cells: Vec<bool> = vec![false; n_cells];
-        let mut cur_group: Option<usize> = None;
-
-        for &i in &order {
-            let g = group_ids[i];
-            if cur_group != Some(g) {
-                // Starting a new group: fold the previous group's cells into the
-                // global `occupied` set and reset the per-group scratch.
-                if cur_group.is_some() {
-                    for c in 0..n_cells {
-                        if group_cells[c] {
-                            occupied[c] = true;
-                            group_cells[c] = false;
-                        }
-                    }
-                }
-                cur_group = Some(g);
-            }
-
-            let net = &nets[i];
-
-            // Does the negotiated path avoid every foreign-group cell? Endpoints
-            // are not exempt: two distinct groups may never share any cell,
-            // including pads (each net's pads are its own distinct cells).
-            let cur = &paths[i];
-            let clean = !cur.is_empty() && cur.iter().all(|&c| !occupied[c as usize]);
-
-            let chosen = if clean {
-                Some(cur.clone())
-            } else {
-                // Reroute once on a grid where foreign-group cells are hard
-                // obstacles; own pads are unmasked.
-                build_legal_grid(&mut work, grid, &pad_sets[i], &occupied, net.src, net.dst);
+        // Per-net "alone-path" length: the net routed by itself on the base grid
+        // (own pads unmasked, no other nets present). A net that is individually
+        // unroutable contributes 0 and can never be committed. This doubles as the
+        // ordering difficulty metric.
+        let mut alone_len: Vec<Cost> = vec![0; n_nets];
+        {
+            let empty_occ = vec![false; n_cells];
+            for i in 0..n_nets {
+                let net = &nets[i];
+                build_legal_grid(&mut work, grid, &pad_sets[i], &empty_occ, net.src, net.dst);
                 let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
                 let field = dijkstra(&work, net.src, h);
-                reconstruct_path(&field.pred, net.src, net.dst, &field.dist)
-            };
-
-            if let Some(path) = chosen {
-                for &c in &path {
-                    group_cells[c as usize] = true;
+                if let Some(path) = reconstruct_path(&field.pred, net.src, net.dst, &field.dist) {
+                    alone_len[i] = unit_cost(&path);
                 }
-                committed[i] = Some(path);
             }
         }
+
+        // Per-group alone-path length = sum over the group's nets.
+        let mut group_alone: Vec<Cost> = vec![0; n_groups];
+        for i in 0..n_nets {
+            group_alone[group_ids[i]] = group_alone[group_ids[i]].saturating_add(alone_len[i]);
+        }
+
+        // Candidate group orders (each a permutation of 0..n_groups).
+        let base_order: Vec<usize> = (0..n_groups).collect();
+        let mut candidates: Vec<Vec<usize>> = Vec::new();
+        // 1. First-appearance / input order.
+        candidates.push(base_order.clone());
+        // 2. Ascending by alone-path length (stable; ties keep input order).
+        {
+            let mut o = base_order.clone();
+            o.sort_by_key(|&g| group_alone[g]);
+            candidates.push(o);
+        }
+        // 3. Descending by alone-path length (stable; ties keep input order).
+        {
+            let mut o = base_order.clone();
+            o.sort_by_key(|&g| std::cmp::Reverse(group_alone[g]));
+            candidates.push(o);
+        }
+        // 4. For few groups, exhaustively try every order (≤ 7! = 5040).
+        if n_groups <= 7 {
+            for perm in permutations(&base_order) {
+                candidates.push(perm);
+            }
+        }
+
+        // Evaluate each candidate and keep the best. "Best" = most nets routed,
+        // then lowest total unit cost, then lexicographically lowest group order
+        // (for determinism). The group order is carried alongside the result so it
+        // can serve as the final tie-break directly.
+        let mut best: Option<(usize, Cost, Vec<usize>, Committed)> = None;
+        for order in &candidates {
+            let committed = legalize_in_order(
+                grid, &mut work, nets, &pad_sets, &group_ids, &paths, order, n_cells,
+            );
+            let routed = committed.iter().filter(|c| c.is_some()).count();
+            let total_cost: Cost = committed
+                .iter()
+                .filter_map(|c| c.as_ref())
+                .map(|p| unit_cost(p))
+                .fold(0, |a, b| a.saturating_add(b));
+            let better = match &best {
+                None => true,
+                Some((br, bc, bo, _)) => {
+                    routed > *br
+                        || (routed == *br && total_cost < *bc)
+                        || (routed == *br && total_cost == *bc && order < bo)
+                }
+            };
+            if better {
+                best = Some((routed, total_cost, order.clone(), committed));
+            }
+        }
+
+        let committed = best
+            .map(|(_, _, _, c)| c)
+            .unwrap_or_else(|| vec![None; n_nets]);
 
         // Assemble in input net order for determinism.
         let mut results: Vec<RouteResult> = Vec::new();
@@ -343,6 +382,113 @@ fn build_legal_grid(
             base.cost_at(ci)
         };
         work.cost[c] = cost;
+    }
+}
+
+/// Commit all connection groups in the given `group_order`, returning the
+/// per-net committed path (or `None` if that net could not be placed).
+///
+/// Each group is committed as a unit: its members are placed (reusing the
+/// negotiated `paths[i]` when that path already avoids every foreign-group cell,
+/// otherwise rerouting once around the committed `occupied` set), then the
+/// group's cells are folded into `occupied` so later groups treat them as hard
+/// obstacles. Sibling sub-nets of the same group never block one another.
+///
+/// `group_order` must be a permutation of the distinct group ids. `work` is used
+/// as scratch and is left in an arbitrary state. The result is in net-index
+/// order and is fully deterministic given the inputs and order.
+#[allow(clippy::too_many_arguments)]
+fn legalize_in_order(
+    grid: &Grid,
+    work: &mut Grid,
+    nets: &[NetEndpoints],
+    pad_sets: &[std::collections::HashSet<CellIdx>],
+    group_ids: &[usize],
+    paths: &[Vec<CellIdx>],
+    group_order: &[usize],
+    n_cells: usize,
+) -> Committed {
+    let dims = grid.dims;
+    let n_nets = nets.len();
+    let mut occupied: Vec<bool> = vec![false; n_cells];
+    let mut committed: Committed = vec![None; n_nets];
+
+    // Cells owned by the group currently being committed; reset per group so
+    // sibling sub-nets may overlap freely without blocking each other.
+    let mut group_cells: Vec<bool> = vec![false; n_cells];
+
+    for &g in group_order {
+        // Members of this group, in input net order for determinism.
+        for i in 0..n_nets {
+            if group_ids[i] != g {
+                continue;
+            }
+            let net = &nets[i];
+
+            // Prefer the negotiated path if it avoids every foreign-group cell.
+            // Endpoints are not exempt: distinct groups may never share any cell.
+            let cur = &paths[i];
+            let clean = !cur.is_empty() && cur.iter().all(|&c| !occupied[c as usize]);
+
+            let chosen = if clean {
+                Some(cur.clone())
+            } else {
+                build_legal_grid(work, grid, &pad_sets[i], &occupied, net.src, net.dst);
+                let h = |c: CellIdx| manhattan_scaled(dims, c, net.dst);
+                let field = dijkstra(work, net.src, h);
+                reconstruct_path(&field.pred, net.src, net.dst, &field.dist)
+            };
+
+            if let Some(path) = chosen {
+                for &c in &path {
+                    group_cells[c as usize] = true;
+                }
+                committed[i] = Some(path);
+            }
+        }
+
+        // Fold this group's cells into the global obstacle set and reset scratch.
+        for c in 0..n_cells {
+            if group_cells[c] {
+                occupied[c] = true;
+                group_cells[c] = false;
+            }
+        }
+    }
+
+    committed
+}
+
+/// All permutations of `items`, generated in a deterministic order (Heap-free
+/// lexicographic-by-construction recursion: index 0 fixed first, then 1, …).
+/// Used only for small group counts (≤ 7), so allocating the full set is cheap.
+fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::with_capacity(items.len());
+    let mut used: Vec<bool> = vec![false; items.len()];
+    permute_rec(items, &mut used, &mut cur, &mut out);
+    out
+}
+
+fn permute_rec(
+    items: &[usize],
+    used: &mut [bool],
+    cur: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if cur.len() == items.len() {
+        out.push(cur.clone());
+        return;
+    }
+    for i in 0..items.len() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        cur.push(items[i]);
+        permute_rec(items, used, cur, out);
+        cur.pop();
+        used[i] = false;
     }
 }
 
@@ -506,5 +652,122 @@ mod tests {
         assert!(br.results[1].path.contains(&mid));
         // The shared middle cell shows congestion 2 — allowed within one group.
         assert_eq!(br.congestion[mid as usize], 2);
+    }
+
+    /// The deterministic permutation generator yields every permutation exactly
+    /// once, in a fixed (lexicographic-by-construction) order.
+    #[test]
+    fn permutations_are_complete_and_ordered() {
+        let perms = permutations(&[0, 1, 2]);
+        assert_eq!(
+            perms,
+            vec![
+                vec![0, 1, 2],
+                vec![0, 2, 1],
+                vec![1, 0, 2],
+                vec![1, 2, 0],
+                vec![2, 0, 1],
+                vec![2, 1, 0],
+            ]
+        );
+        // 4 distinct items -> 24 unique permutations.
+        let p4 = permutations(&[0, 1, 2, 3]);
+        assert_eq!(p4.len(), 24);
+        let uniq: std::collections::HashSet<_> = p4.iter().cloned().collect();
+        assert_eq!(uniq.len(), 24);
+    }
+
+    /// Order-robust legalization: a board where committing net A's group first
+    /// strands net B, but committing B's group first routes both. The full router
+    /// must find the good order and route BOTH nets.
+    ///
+    /// 5x5 open grid:
+    ///   A: (0,2) -> (4,2)  horizontal across the middle row
+    ///   B: (2,1) -> (2,3)  vertical across the middle column
+    /// If A claims the whole middle row first, it walls off rows y<2 from y>2 and
+    /// B (which must get from y=1 to y=3) is stranded. If B claims the middle
+    /// column first, A simply detours one row up/down and crosses elsewhere.
+    #[test]
+    fn legalization_is_order_robust() {
+        let dims = Dims::new(5, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+
+        // Net order is [A, B], i.e. the FAILING first-appearance order.
+        let a = net("a", dims.idx(0, 2), dims.idx(4, 2));
+        let b = net("b", dims.idx(2, 1), dims.idx(2, 3));
+
+        // Direct check of the legalization primitive: hand-crafted negotiated
+        // paths that collide on the centre cell (2,2). One commit order strands a
+        // net; the other routes both — proving the order genuinely matters.
+        let n_cells = dims.len();
+        let pad_sets: Vec<std::collections::HashSet<CellIdx>> = vec![
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        ];
+        let group_ids = vec![0usize, 1usize];
+        let nets_ab = [a.clone(), b.clone()];
+        let crafted = vec![
+            // A: full middle row.
+            vec![
+                dims.idx(0, 2),
+                dims.idx(1, 2),
+                dims.idx(2, 2),
+                dims.idx(3, 2),
+                dims.idx(4, 2),
+            ],
+            // B: full middle column.
+            vec![dims.idx(2, 1), dims.idx(2, 2), dims.idx(2, 3)],
+        ];
+        let mut work = grid.clone();
+
+        // Order [0,1] = A first: B should be stranded.
+        let c_ab = legalize_in_order(
+            &grid,
+            &mut work,
+            &nets_ab,
+            &pad_sets,
+            &group_ids,
+            &crafted,
+            &[0, 1],
+            n_cells,
+        );
+        assert!(c_ab[0].is_some(), "A commits in A-first order");
+        assert!(
+            c_ab[1].is_none(),
+            "B must be stranded when A claims the middle row first"
+        );
+
+        // Order [1,0] = B first: both route.
+        let c_ba = legalize_in_order(
+            &grid,
+            &mut work,
+            &nets_ab,
+            &pad_sets,
+            &group_ids,
+            &crafted,
+            &[1, 0],
+            n_cells,
+        );
+        assert!(
+            c_ba[0].is_some() && c_ba[1].is_some(),
+            "both route when B claims the middle column first"
+        );
+
+        // The full router must pick the good order and route BOTH nets even though
+        // first-appearance order [A, B] alone would strand B.
+        let br = NegotiatedRouter
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+        assert!(
+            br.unrouted.is_empty(),
+            "order-robust router must route both nets: {br:?}"
+        );
+        assert_eq!(br.results.len(), 2);
+        let pa = &br.results[0].path;
+        let pb = &br.results[1].path;
+        assert!(
+            disjoint(pa, pb),
+            "paths must be cell-disjoint: {pa:?} {pb:?}"
+        );
     }
 }
