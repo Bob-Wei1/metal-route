@@ -18,6 +18,7 @@ mr-core = { workspace = true }
 mr-srj = { workspace = true }
 mr-cpu = { workspace = true }
 mr-bench = { workspace = true }
+mr-bridge = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

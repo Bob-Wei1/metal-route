@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use mr_cli::{bench::run_bench, run_project, run_route, Cli, Command};
+use mr_cli::{bench::run_bench, run_handoff, run_project, run_route, Cli, Command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -32,6 +32,10 @@ fn main() -> Result<()> {
                 report.m2_verdict,
                 report.m2_projected_speedup,
             );
+        }
+        Command::Handoff(args) => {
+            let out = run_handoff(args)?;
+            eprintln!("handoff ok={} ({} bytes stdout)", out.status_ok, out.stdout.len());
         }
     }
     Ok(())

@@ -48,6 +48,54 @@ pub enum Command {
     Project(ProjectArgs),
     /// Run the local tscircuit-style benchmark suite and write a CPU baseline report.
     Bench(bench::BenchArgs),
+    /// Hand a board to Freerouting (via bed-of-nails) for detailed routing (M5).
+    Handoff(HandoffArgs),
+}
+
+/// Arguments for the `handoff` subcommand (M5 Freerouting bridge).
+#[derive(Debug, Parser)]
+pub struct HandoffArgs {
+    /// Path to the `.kicad_pcb` to route.
+    #[arg(long)]
+    pub pcb: PathBuf,
+
+    /// Freerouting optimization passes.
+    #[arg(long, default_value_t = 20)]
+    pub passes: u32,
+
+    /// Timeout in seconds.
+    #[arg(long, default_value_t = 600)]
+    pub timeout: u64,
+
+    /// The bed-of-nails command to invoke.
+    #[arg(long, default_value = "bon")]
+    pub bon_command: String,
+}
+
+impl From<&HandoffArgs> for mr_bridge::BridgeConfig {
+    fn from(a: &HandoffArgs) -> Self {
+        mr_bridge::BridgeConfig {
+            freerouting_passes: a.passes,
+            timeout_s: a.timeout,
+            bon_command: a.bon_command.clone(),
+        }
+    }
+}
+
+/// Core `handoff` logic over an injectable runner (so tests can mock the
+/// subprocess). Shells out to bed-of-nails to drive Freerouting.
+pub fn handoff_with<R: mr_bridge::CommandRunner>(
+    runner: &R,
+    args: &HandoffArgs,
+) -> Result<mr_bridge::RunOutput> {
+    let cfg = mr_bridge::BridgeConfig::from(args);
+    let pcb = args.pcb.to_string_lossy();
+    mr_bridge::handoff(runner, &pcb, &cfg).context("Freerouting handoff failed")
+}
+
+/// Execute the `handoff` subcommand against the real system.
+pub fn run_handoff(args: &HandoffArgs) -> Result<mr_bridge::RunOutput> {
+    handoff_with(&mr_bridge::SystemRunner, args)
 }
 
 /// Which CPU router backend to use.
@@ -345,6 +393,36 @@ mod tests {
         assert!(!text.contains('\n'));
         assert!(text.contains("2/3"));
         assert!(text.contains("10x8"));
+    }
+
+    #[test]
+    fn handoff_builds_expected_bon_invocation() {
+        let args = HandoffArgs {
+            pcb: PathBuf::from("board.kicad_pcb"),
+            passes: 12,
+            timeout: 300,
+            bon_command: "bon".into(),
+        };
+        let runner = mr_bridge::MockRunner::ok();
+        let out = handoff_with(&runner, &args).unwrap();
+        assert!(out.status_ok);
+        let (program, argv) = runner.last().expect("invocation recorded");
+        assert_eq!(program, "bon");
+        assert!(argv.contains(&"board.kicad_pcb".to_string()));
+        assert!(argv.contains(&"12".to_string()));
+        assert!(argv.contains(&"300".to_string()));
+    }
+
+    #[test]
+    fn handoff_propagates_backend_failure() {
+        let args = HandoffArgs {
+            pcb: PathBuf::from("b.kicad_pcb"),
+            passes: 20,
+            timeout: 600,
+            bon_command: "bon".into(),
+        };
+        let runner = mr_bridge::MockRunner::failing("freerouting crashed");
+        assert!(handoff_with(&runner, &args).is_err());
     }
 
     #[test]

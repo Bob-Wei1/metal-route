@@ -672,6 +672,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mr-bench",
+ "mr-bridge",
  "mr-core",
  "mr-cpu",
  "mr-srj",
