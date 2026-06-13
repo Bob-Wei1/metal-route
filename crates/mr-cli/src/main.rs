@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use mr_cli::{run_project, run_route, Cli, Command};
+use mr_cli::{bench::run_bench, run_project, run_route, Cli, Command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -19,6 +19,19 @@ fn main() -> Result<()> {
         Command::Project(args) => {
             let projection = run_project(args)?;
             println!("{projection}");
+        }
+        Command::Bench(args) => {
+            let report = run_bench(args)?;
+            eprintln!(
+                "bench: {} boards, {}/{} nets routed ({:.1}% completion), {:.0} nets/sec, M2 {} ({:.2}x)",
+                report.boards,
+                report.nets_routed,
+                report.nets_total,
+                report.completion_rate * 100.0,
+                report.nets_per_sec,
+                report.m2_verdict,
+                report.m2_projected_speedup,
+            );
         }
     }
     Ok(())

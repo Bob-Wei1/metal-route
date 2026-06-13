@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+
+pub mod bench;
 use mr_core::Router;
 use mr_cpu::{LeeRouter, RipUpRouter};
 use mr_srj::{rasterize, to_solution, SimpleRouteJson};
@@ -44,6 +46,8 @@ pub enum Command {
     Route(RouteArgs),
     /// Print the M2 batch-GPU speedup projection and a GO/NO-GO verdict.
     Project(ProjectArgs),
+    /// Run the local tscircuit-style benchmark suite and write a CPU baseline report.
+    Bench(bench::BenchArgs),
 }
 
 /// Which CPU router backend to use.

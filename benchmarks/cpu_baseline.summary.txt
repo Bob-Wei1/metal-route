@@ -1,0 +1,1 @@
+bench: 10 boards, 168/300 nets routed (56.0% completion), 357 nets/sec, M2 GO (2.43x)

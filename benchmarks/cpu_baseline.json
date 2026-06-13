@@ -1,0 +1,104 @@
+{
+  "router": "ripup-cpu",
+  "boards": 10,
+  "nets_total": 300,
+  "nets_routed": 168,
+  "completion_rate": 0.56,
+  "mean_trace_cost": 59.5,
+  "total_wall_ms": 470.07246100000003,
+  "nets_per_sec": 357.3917085944756,
+  "m2_projected_speedup": 2.4326892,
+  "m2_verdict": "GO",
+  "per_board": [
+    {
+      "seed": 1,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 17,
+      "total_cost": 852,
+      "wall_ms": 63.053791999999994
+    },
+    {
+      "seed": 2,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 14,
+      "total_cost": 870,
+      "wall_ms": 48.120749999999994
+    },
+    {
+      "seed": 3,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 16,
+      "total_cost": 1049,
+      "wall_ms": 44.6145
+    },
+    {
+      "seed": 4,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 17,
+      "total_cost": 1002,
+      "wall_ms": 46.007292
+    },
+    {
+      "seed": 5,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 18,
+      "total_cost": 1207,
+      "wall_ms": 46.459
+    },
+    {
+      "seed": 6,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 19,
+      "total_cost": 1098,
+      "wall_ms": 43.069959
+    },
+    {
+      "seed": 7,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 16,
+      "total_cost": 898,
+      "wall_ms": 46.582917
+    },
+    {
+      "seed": 8,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 18,
+      "total_cost": 946,
+      "wall_ms": 41.054709
+    },
+    {
+      "seed": 9,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 16,
+      "total_cost": 1030,
+      "wall_ms": 44.724167
+    },
+    {
+      "seed": 10,
+      "grid_w": 64,
+      "grid_h": 64,
+      "nets_total": 30,
+      "nets_routed": 17,
+      "total_cost": 1044,
+      "wall_ms": 46.385374999999996
+    }
+  ]
+}
