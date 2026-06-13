@@ -9,15 +9,15 @@
 //!
 //! `--port` (or `-p`) defaults to `1234`, the port the tscircuit
 //! `autorouting-dataset benchmark --solver-url http://localhost:1234` harness
-//! expects. The router backend is a [`mr_cpu::RipUpRouter`] (sequential rip-up
-//! routing over Lee's wavefront), injected behind `Arc<dyn Router>` so a Metal
-//! backend can replace it later without touching this file.
+//! expects. The router backend is a [`mr_cpu::NegotiatedRouter`] (PathFinder-style
+//! negotiated-congestion routing over Dijkstra), injected behind `Arc<dyn Router>`
+//! so a Metal backend can replace it later without touching this file.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mr_core::Router;
-use mr_cpu::RipUpRouter;
+use mr_cpu::NegotiatedRouter;
 
 const DEFAULT_PORT: u16 = 1234;
 
@@ -57,7 +57,7 @@ async fn main() {
         }
     };
 
-    let router: Arc<dyn Router + Send + Sync> = Arc::new(RipUpRouter::new());
+    let router: Arc<dyn Router + Send + Sync> = Arc::new(NegotiatedRouter::new());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("mr-server listening on http://{addr} (POST /solve, GET /health)");
 

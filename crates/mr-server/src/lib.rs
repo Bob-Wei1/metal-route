@@ -203,7 +203,7 @@ pub async fn serve(addr: std::net::SocketAddr, router: SharedRouter) -> std::io:
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use mr_cpu::RipUpRouter;
+    use mr_cpu::NegotiatedRouter;
     use tower::ServiceExt; // for `oneshot`
 
     const SAMPLE: &str = r#"{
@@ -221,7 +221,7 @@ mod tests {
     }"#;
 
     fn test_router() -> SharedRouter {
-        Arc::new(RipUpRouter::new())
+        Arc::new(NegotiatedRouter::new())
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {

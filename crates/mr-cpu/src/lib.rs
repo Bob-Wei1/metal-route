@@ -26,10 +26,12 @@
 mod astar;
 mod dijkstra;
 mod lee;
+mod negotiated;
 mod ripup;
 pub mod sweep;
 
 pub use astar::AStarRouter;
 pub use lee::LeeRouter;
+pub use negotiated::{NegotiatedRouter, MAX_ITERS, SCALE};
 pub use ripup::{RipUpRouter, MAX_PASSES};
 pub use sweep::{bfs_distance_field, sweep_distance_field};

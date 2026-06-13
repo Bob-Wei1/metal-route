@@ -184,7 +184,7 @@ pub fn run_suite(args: &BenchArgs) -> Result<BenchReport> {
         let srj = generate_problem(seed, args.size, args.obstacles, args.nets);
 
         let t0 = Instant::now();
-        let (_traces, summary) = route_problem(&srj, args.resolution, RouterKind::Ripup)?;
+        let (_traces, summary) = route_problem(&srj, args.resolution, RouterKind::Negotiated)?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         nets_total += summary.total;

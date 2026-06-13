@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bench;
 use mr_core::Router;
-use mr_cpu::{LeeRouter, RipUpRouter};
+use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
 use mr_srj::{rasterize, to_solution, SimpleRouteJson};
 
 /// The ~2× speedup threshold the M2 go/no-go gate uses.
@@ -104,8 +104,10 @@ pub enum RouterKind {
     /// Lee/Dijkstra single-source router; each net routed independently.
     Lee,
     /// Sequential router with bounded rip-up-on-collision.
-    #[default]
     Ripup,
+    /// PathFinder-style negotiated-congestion router (cell-disjoint across groups).
+    #[default]
+    Negotiated,
 }
 
 /// Arguments for the `route` subcommand.
@@ -234,6 +236,7 @@ pub fn route_problem(
     let board = match router {
         RouterKind::Lee => LeeRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
+        RouterKind::Negotiated => NegotiatedRouter::new().route(&problem.grid, &problem.nets),
     }
     .context("router failed")?;
 
