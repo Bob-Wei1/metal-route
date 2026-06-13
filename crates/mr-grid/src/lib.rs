@@ -117,7 +117,9 @@ mod tests {
 
     #[test]
     fn marks_rect_obstacle() {
-        let g = GridBuilder::new(Dims::new(5, 5), 1).mark_rect(1, 1, 2, 3).build();
+        let g = GridBuilder::new(Dims::new(5, 5), 1)
+            .mark_rect(1, 1, 2, 3)
+            .build();
         assert!(g.is_well_formed());
         assert!(g.is_obstacle(g.dims.idx(1, 1)));
         assert!(g.is_obstacle(g.dims.idx(2, 3)));
@@ -132,9 +134,15 @@ mod tests {
     fn clearance_inflation_marks_expected_cells() {
         // single obstacle at center of 5x5, inflate by 1 => 3x3 block of obstacles
         let d = Dims::new(5, 5);
-        let g = GridBuilder::new(d, 1).mark_cell(2, 2).inflate_clearance(1).build();
+        let g = GridBuilder::new(d, 1)
+            .mark_cell(2, 2)
+            .inflate_clearance(1)
+            .build();
         let obstacles = g.cost.iter().filter(|&&c| c == OBSTACLE).count();
-        assert_eq!(obstacles, 9, "1-cell Chebyshev halo of one cell is a 3x3 block");
+        assert_eq!(
+            obstacles, 9,
+            "1-cell Chebyshev halo of one cell is a 3x3 block"
+        );
         for y in 1..=3 {
             for x in 1..=3 {
                 assert!(g.is_obstacle(d.idx(x, y)), "({x},{y}) should be obstacle");

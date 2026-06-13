@@ -7,9 +7,7 @@
 //! A net whose target is unreachable is reported in [`BoardRoute::unrouted`] and
 //! produces no [`RouteResult`].
 
-use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError,
-};
+use mr_core::{BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError};
 
 use crate::dijkstra::{dijkstra, reconstruct_path};
 
@@ -26,7 +24,11 @@ impl LeeRouter {
     /// path (`src..=dst`) and its cost, or `None` when `dst` is unreachable.
     ///
     /// `cost` = sum of `cost_at` over the path **excluding** the source.
-    pub(crate) fn route_one(grid: &Grid, src: CellIdx, dst: CellIdx) -> Option<(Vec<CellIdx>, Cost)> {
+    pub(crate) fn route_one(
+        grid: &Grid,
+        src: CellIdx,
+        dst: CellIdx,
+    ) -> Option<(Vec<CellIdx>, Cost)> {
         let field = dijkstra(grid, src, |_| 0);
         let path = reconstruct_path(&field.pred, src, dst, &field.dist)?;
         Some((path, field.dist[dst as usize]))
@@ -102,7 +104,11 @@ mod tests {
         let r = &br.results[0];
         assert_eq!(r.cost, 93);
         assert_valid_path(&f.grid, &r.path, f.nets[0].src, f.nets[0].dst);
-        assert_eq!(r.cost as usize, r.path.len() - 1, "unit grid: cost == moves");
+        assert_eq!(
+            r.cost as usize,
+            r.path.len() - 1,
+            "unit grid: cost == moves"
+        );
     }
 
     #[test]

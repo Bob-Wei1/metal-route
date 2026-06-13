@@ -144,7 +144,13 @@ fn router_error_response(e: RouterError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    (status, Json(ErrorResponse { error: e.to_string() })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            error: e.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// Build a `400 Bad Request` JSON response.

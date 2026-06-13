@@ -57,10 +57,7 @@ fn route_to_stdout_emits_pcb_traces_and_summary() {
     let arr = traces.as_array().expect("solution must be a JSON array");
     assert!(!arr.is_empty(), "expected >=1 pcb_trace");
     assert!(
-        arr.iter()
-            .filter(|t| t["type"] == "pcb_trace")
-            .count()
-            >= 1,
+        arr.iter().filter(|t| t["type"] == "pcb_trace").count() >= 1,
         "expected at least one pcb_trace element"
     );
 
@@ -98,7 +95,9 @@ fn route_to_file_writes_solution() {
 #[test]
 fn project_large_batch_reports_go() {
     let output = Command::new(BIN)
-        .args(["project", "--width", "256", "--height", "256", "--nets", "500"])
+        .args([
+            "project", "--width", "256", "--height", "256", "--nets", "500",
+        ])
         .output()
         .expect("failed to run metalroute");
 
@@ -128,8 +127,14 @@ fn help_smoke_test() {
         .expect("failed to run metalroute");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("route"), "help should list route subcommand");
-    assert!(stdout.contains("project"), "help should list project subcommand");
+    assert!(
+        stdout.contains("route"),
+        "help should list route subcommand"
+    );
+    assert!(
+        stdout.contains("project"),
+        "help should list project subcommand"
+    );
 }
 
 #[test]

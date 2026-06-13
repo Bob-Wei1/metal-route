@@ -221,7 +221,10 @@ mod tests {
             let d = Dims::new(w, h);
             for i in 0..d.len() as u32 {
                 let (x, y) = d.xy(i);
-                assert!(d.in_bounds(x, y), "{i} -> ({x},{y}) out of bounds for {d:?}");
+                assert!(
+                    d.in_bounds(x, y),
+                    "{i} -> ({x},{y}) out of bounds for {d:?}"
+                );
                 assert_eq!(d.idx(x, y), i, "idx∘xy mismatch for {d:?} at {i}");
             }
             for y in 0..h {
@@ -248,8 +251,16 @@ mod tests {
     fn congestion_counts_overlaps() {
         let d = Dims::new(3, 1);
         let results = vec![
-            RouteResult { net: "a".into(), path: vec![0, 1], cost: 2 },
-            RouteResult { net: "b".into(), path: vec![1, 2], cost: 2 },
+            RouteResult {
+                net: "a".into(),
+                path: vec![0, 1],
+                cost: 2,
+            },
+            RouteResult {
+                net: "b".into(),
+                path: vec![1, 2],
+                cost: 2,
+            },
         ];
         assert_eq!(BoardRoute::congestion_from(d, &results), vec![1, 2, 1]);
     }

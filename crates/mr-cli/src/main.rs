@@ -35,7 +35,11 @@ fn main() -> Result<()> {
         }
         Command::Handoff(args) => {
             let out = run_handoff(args)?;
-            eprintln!("handoff ok={} ({} bytes stdout)", out.status_ok, out.stdout.len());
+            eprintln!(
+                "handoff ok={} ({} bytes stdout)",
+                out.status_ok,
+                out.stdout.len()
+            );
         }
     }
     Ok(())

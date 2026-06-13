@@ -16,8 +16,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mr_cpu::RipUpRouter;
 use mr_core::Router;
+use mr_cpu::RipUpRouter;
 
 const DEFAULT_PORT: u16 = 1234;
 
@@ -31,15 +31,11 @@ fn parse_port(args: impl Iterator<Item = String>) -> Result<u16, String> {
                 let val = args
                     .next()
                     .ok_or_else(|| format!("{arg} requires a value"))?;
-                port = val
-                    .parse()
-                    .map_err(|_| format!("invalid port: {val:?}"))?;
+                port = val.parse().map_err(|_| format!("invalid port: {val:?}"))?;
             }
             other if other.starts_with("--port=") => {
                 let val = &other["--port=".len()..];
-                port = val
-                    .parse()
-                    .map_err(|_| format!("invalid port: {val:?}"))?;
+                port = val.parse().map_err(|_| format!("invalid port: {val:?}"))?;
             }
             "-h" | "--help" => {
                 return Err("usage: mr-server [--port <PORT>]".to_string());

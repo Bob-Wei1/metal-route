@@ -107,7 +107,9 @@ impl Lcg {
 /// always valid input — an endpoint inside an obstacle is genuinely unroutable
 /// and the router rejects it, which is not what we want to measure here.
 pub fn generate_problem(seed: u64, size: f64, n_obstacles: u32, n_nets: u32) -> SimpleRouteJson {
-    let mut rng = Lcg(seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493));
+    let mut rng = Lcg(seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493));
 
     // (cx, cy, half_w, half_h)
     let rects: Vec<(f64, f64, f64, f64)> = (0..n_obstacles)
@@ -145,7 +147,10 @@ pub fn generate_problem(seed: u64, size: f64, n_obstacles: u32, n_nets: u32) -> 
         }
         // Fallback: the edge band is outside every obstacle (centres are in
         // [0.15,0.85]·size with half-extent < 0.08·size).
-        (rng.uniform(0.01 * size, 0.04 * size), rng.uniform(0.01 * size, 0.96 * size))
+        (
+            rng.uniform(0.01 * size, 0.04 * size),
+            rng.uniform(0.01 * size, 0.96 * size),
+        )
     };
 
     let connections: Vec<_> = (0..n_nets)

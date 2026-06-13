@@ -9,9 +9,7 @@
 //! `device.new_library_with_source`.
 
 use metal::objc::rc::autoreleasepool;
-use metal::{
-    Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
-};
+use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 
 use mr_core::{CellIdx, Cost, Grid, RouterError};
 
@@ -187,9 +185,11 @@ impl MetalCtx {
             let f = lib.get_function(name, None).map_err(|e| {
                 RouterError::BackendUnavailable(format!("missing kernel `{name}`: {e}"))
             })?;
-            device.new_compute_pipeline_state_with_function(&f).map_err(|e| {
-                RouterError::BackendUnavailable(format!("pipeline `{name}` failed: {e}"))
-            })
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| {
+                    RouterError::BackendUnavailable(format!("pipeline `{name}` failed: {e}"))
+                })
         };
 
         Ok(Self {
@@ -231,7 +231,10 @@ fn prepare(grid: &Grid, src: CellIdx) -> Result<PrepResult, RouterError> {
     }
     init[src as usize] = 0;
     Ok(PrepResult::Run {
-        gdims: GpuDims { w: dims.w, h: dims.h },
+        gdims: GpuDims {
+            w: dims.w,
+            h: dims.h,
+        },
         n,
         cost: grid.cost.clone(),
         init,
@@ -253,7 +256,12 @@ pub fn wavefront_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterErr
     let prep = prepare(grid, src)?;
     let (gdims, n, cost, init) = match prep {
         PrepResult::Trivial(d) => return Ok(d),
-        PrepResult::Run { gdims, n, cost, init } => (gdims, n, cost, init),
+        PrepResult::Run {
+            gdims,
+            n,
+            cost,
+            init,
+        } => (gdims, n, cost, init),
     };
 
     let result = autoreleasepool(|| -> Result<Vec<Cost>, RouterError> {
@@ -309,7 +317,12 @@ pub fn sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> 
     let prep = prepare(grid, src)?;
     let (gdims, n, cost, init) = match prep {
         PrepResult::Trivial(d) => return Ok(d),
-        PrepResult::Run { gdims, n, cost, init } => (gdims, n, cost, init),
+        PrepResult::Run {
+            gdims,
+            n,
+            cost,
+            init,
+        } => (gdims, n, cost, init),
     };
 
     let result = autoreleasepool(|| -> Result<Vec<Cost>, RouterError> {

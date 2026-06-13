@@ -59,7 +59,11 @@ pub fn parse_ascii(name: &'static str, s: &str, expected_total_cost: Option<u64>
         }
     }
     let nets = match (src, dst) {
-        (Some(src), Some(dst)) => vec![NetEndpoints { net: "n0".into(), src, dst }],
+        (Some(src), Some(dst)) => vec![NetEndpoints {
+            net: "n0".into(),
+            src,
+            dst,
+        }],
         _ => Vec::new(),
     };
     Fixture {
@@ -120,11 +124,7 @@ pub fn obstacle_battery() -> Vec<Fixture> {
     vec![
         parse_ascii("open_5x5", "S....\n.....\n.....\n.....\n....T", Some(8)),
         parse_ascii("notch", "S.#..\n..#..\n..#..\n..#..\n....T", Some(8)),
-        parse_ascii(
-            "spiral",
-            "S....\n####.\n...#.\n.#.#.\n.#..T",
-            None,
-        ),
+        parse_ascii("spiral", "S....\n####.\n...#.\n.#.#.\n.#..T", None),
         parse_ascii("corridor", "S#...\n.#.#.\n.#.#.\n.#.#.\n...#T", None),
         parse_ascii("blocked_gap", "S....\n.###.\n.#T#.\n.###.\n.....", None),
         hand_32x32_wall(),

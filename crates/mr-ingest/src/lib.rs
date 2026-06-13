@@ -258,8 +258,7 @@ mod tests {
     use super::*;
 
     const REAL_FIXTURE: &str = include_str!("../tests/fixtures/pnp_sample.json");
-    const SYNTH_MULTILAYER: &str =
-        include_str!("../tests/fixtures/pnp_multilayer_synthetic.json");
+    const SYNTH_MULTILAYER: &str = include_str!("../tests/fixtures/pnp_multilayer_synthetic.json");
 
     #[test]
     fn parses_real_fixture_pad_count_and_layers() {

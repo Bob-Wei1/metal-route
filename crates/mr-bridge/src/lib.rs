@@ -168,9 +168,9 @@ pub fn handoff<R: CommandRunner>(
     cfg: &BridgeConfig,
 ) -> Result<RunOutput, RouterError> {
     let (program, args) = build_apply_routing_args(pcb_path, cfg);
-    let output = runner
-        .run(&program, &args)
-        .map_err(|e| RouterError::BackendUnavailable(format!("failed to spawn `{program}`: {e}")))?;
+    let output = runner.run(&program, &args).map_err(|e| {
+        RouterError::BackendUnavailable(format!("failed to spawn `{program}`: {e}"))
+    })?;
     if !output.status_ok {
         return Err(RouterError::BackendUnavailable(format!(
             "`{program}` exited with failure: {}",

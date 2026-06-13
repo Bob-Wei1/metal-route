@@ -193,22 +193,36 @@ mod tests {
         let mut b = base();
         b.congestion = vec![2, 1, 1]; // same sum, different distribution
 
-        assert_eq!(a.total_cost(), b.total_cost(), "test setup: totals must match");
+        assert_eq!(
+            a.total_cost(),
+            b.total_cost(),
+            "test setup: totals must match"
+        );
 
         let d = compare(&a, &b);
         assert!(!are_equivalent(&a, &b));
         // No cost discrepancies expected.
         assert!(
-            !d.iter()
-                .any(|x| matches!(x, Discrepancy::TotalCost { .. } | Discrepancy::NetCost { .. })),
+            !d.iter().any(|x| matches!(
+                x,
+                Discrepancy::TotalCost { .. } | Discrepancy::NetCost { .. }
+            )),
             "no cost discrepancies expected, got {d:?}"
         );
         assert!(
-            d.contains(&Discrepancy::Congestion { cell: 0, a: 1, b: 2 }),
+            d.contains(&Discrepancy::Congestion {
+                cell: 0,
+                a: 1,
+                b: 2
+            }),
             "expected Congestion at cell 0, got {d:?}"
         );
         assert!(
-            d.contains(&Discrepancy::Congestion { cell: 1, a: 2, b: 1 }),
+            d.contains(&Discrepancy::Congestion {
+                cell: 1,
+                a: 2,
+                b: 1
+            }),
             "expected Congestion at cell 1, got {d:?}"
         );
     }

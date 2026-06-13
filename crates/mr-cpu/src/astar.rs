@@ -6,9 +6,7 @@
 //! on a 4-connected unit-cost grid, so A* returns the same optimal cost as Lee
 //! (paths may differ when ties exist, but total cost is identical).
 
-use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError,
-};
+use mr_core::{BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError};
 
 use crate::dijkstra::{dijkstra, reconstruct_path};
 
@@ -28,7 +26,11 @@ impl AStarRouter {
         ax.abs_diff(bx) + ay.abs_diff(by)
     }
 
-    pub(crate) fn route_one(grid: &Grid, src: CellIdx, dst: CellIdx) -> Option<(Vec<CellIdx>, Cost)> {
+    pub(crate) fn route_one(
+        grid: &Grid,
+        src: CellIdx,
+        dst: CellIdx,
+    ) -> Option<(Vec<CellIdx>, Cost)> {
         let field = dijkstra(grid, src, |c| Self::manhattan(grid, c, dst));
         let path = reconstruct_path(&field.pred, src, dst, &field.dist)?;
         Some((path, field.dist[dst as usize]))

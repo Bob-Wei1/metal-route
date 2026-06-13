@@ -435,12 +435,7 @@ mod tests {
         let expected = [(0.5, 0.5), (1.5, 0.5), (2.5, 0.5)];
         for (pt, &(ex, ey)) in traces[0].route.iter().zip(expected.iter()) {
             match pt {
-                RoutePoint::Wire {
-                    x,
-                    y,
-                    width,
-                    layer,
-                } => {
+                RoutePoint::Wire { x, y, width, layer } => {
                     assert_eq!(*x, ex);
                     assert_eq!(*y, ey);
                     assert_eq!(*width, 0.2);

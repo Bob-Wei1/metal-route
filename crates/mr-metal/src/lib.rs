@@ -34,9 +34,7 @@
 //! returns [`RouterError::BackendUnavailable`] so the workspace compiles
 //! everywhere.
 
-use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError,
-};
+use mr_core::{BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError};
 
 #[cfg(target_os = "macos")]
 mod gpu;
@@ -236,9 +234,21 @@ mod tests {
         b.mark_rect(2, 1, 2, 3); // column x=2, rows 1..=3 (inclusive corners)
         let grid = b.build();
         let nets = vec![
-            NetEndpoints { net: "a".into(), src: dims.idx(0, 0), dst: dims.idx(5, 0) },
-            NetEndpoints { net: "b".into(), src: dims.idx(0, 5), dst: dims.idx(5, 5) },
-            NetEndpoints { net: "c".into(), src: dims.idx(0, 2), dst: dims.idx(5, 3) },
+            NetEndpoints {
+                net: "a".into(),
+                src: dims.idx(0, 0),
+                dst: dims.idx(5, 0),
+            },
+            NetEndpoints {
+                net: "b".into(),
+                src: dims.idx(0, 5),
+                dst: dims.idx(5, 5),
+            },
+            NetEndpoints {
+                net: "c".into(),
+                src: dims.idx(0, 2),
+                dst: dims.idx(5, 3),
+            },
         ];
         (grid, nets)
     }
@@ -329,7 +339,11 @@ mod tests {
         for k in 0..n_nets {
             let src = pick(&grid);
             let dst = pick(&grid);
-            nets.push(NetEndpoints { net: format!("n{k}"), src, dst });
+            nets.push(NetEndpoints {
+                net: format!("n{k}"),
+                src,
+                dst,
+            });
         }
         (grid, nets)
     }

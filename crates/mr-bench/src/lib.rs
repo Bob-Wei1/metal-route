@@ -207,7 +207,14 @@ mod tests {
     fn speedup_non_decreasing_in_grid_cells() {
         let net_count = 64;
         let mut prev = project_speedup(Dims::new(4, 4), net_count);
-        for &(w, h) in &[(8u32, 8u32), (16, 16), (32, 32), (64, 64), (128, 128), (256, 256)] {
+        for &(w, h) in &[
+            (8u32, 8u32),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (128, 128),
+            (256, 256),
+        ] {
             let s = project_speedup(Dims::new(w, h), net_count);
             assert!(
                 s >= prev - f32::EPSILON,
@@ -275,7 +282,11 @@ mod tests {
             }
         }
         let grid = Grid::filled(Dims::new(4, 4), 1);
-        let nets = vec![NetEndpoints { net: "a".into(), src: 0, dst: 15 }];
+        let nets = vec![NetEndpoints {
+            net: "a".into(),
+            src: 0,
+            dst: 15,
+        }];
         let t = time_router(&FailRouter, &grid, &nets);
         assert_eq!(t.routed, 0);
         assert_eq!(t.unrouted, 1);
