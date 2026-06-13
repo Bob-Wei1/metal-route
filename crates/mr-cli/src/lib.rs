@@ -695,21 +695,21 @@ pub fn route_dsn_problem(
         signal_layers.truncate(n);
     }
     let layer_map = LayerMap::from_names(signal_layers);
-    // Clearance-aware routing (M2): reserve a net-owned halo around committed copper
-    // so different nets keep the DSN's minimum spacing, and a wider keepout around
-    // vias (their 0.45 mm pad bleeds further than a track). Radii are in grid cells.
-    let clearance_mm = stats.min_clearance_mm;
-    let cells_for = |mm: f64| -> u32 {
-        if mm > 0.0 && resolution > 0.0 {
-            (mm / resolution).ceil() as u32
-        } else {
-            0
-        }
-    };
-    let clearance_cells = cells_for(clearance_mm + DEFAULT_TRACE_WIDTH);
-    let via_keepout_cells = cells_for(VIA_PAD_MM / 2.0 + clearance_mm);
+    // Clearance enforcement (M2.4 finding): the legalization-phase clearance halo —
+    // hard OR soft — does NOT reduce violations on a congested coarse grid. The hard
+    // halo (clearance_cells > 0, blocking) dropped ~24% of nets; the soft halo (cost,
+    // never blocks) keeps full connectivity but leaves clearance ≈ unchanged while
+    // adding vias and runtime, because the negotiated paths are already packed and
+    // legalization can't create space that isn't there. Measured on fixture_fresh:
+    // off → 142 routed / 2715 clearance / 244 vias / ~5 s; soft halo → 142 / 2726 /
+    // 402 / minutes. So we keep the (tested) soft-clearance machinery in `mr-cpu` as
+    // the foundation but DISABLE the legalization halo by default; real clearance
+    // reduction belongs in the negotiation search + a finer grid (see
+    // benchmarks/drc_sota_research.md, P1/P4). Plane-antipad modelling (the via-
+    // through-plane fix) is independent and stays on.
+    let clearance_cells = 0;
     let mut via_model = ViaModel::through_hole(layer_map.len());
-    via_model.keepout = via_keepout_cells;
+    via_model.keepout = 0;
     let problem = rasterize_with_layers(&srj, resolution, layer_map);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;

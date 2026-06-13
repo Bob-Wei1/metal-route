@@ -88,6 +88,44 @@ What worked and what's left:
   "dirty" and reroutes around halos. This is the strongest motivation for the M3
   Metal acceleration (cross-net batching + GPU clearance stamping).
 
-Next: push clearance toward 0 (pad-aware halos + finer resolution + negotiation-phase
-clearance) and recover connectivity, then GPU-accelerate the now-dominant routing and
-DRC costs.
+## M2.4 — soft clearance + the legalization-clearance finding
+
+Guided by an SOTA survey (`benchmarks/drc_sota_research.md`: TritonRoute object/marker
+cost, Freerouting shape clearance), we made the clearance halo **soft** — only foreign
+*copper* is a hard block; the clearance *halo* is a high routing cost so a net is never
+dropped, and legalization reroutes to prefer clearance. Measured on `fixture_fresh`:
+
+| Approach | Routed | Clearance | via-plane | Vias | Runtime |
+| --- | --- | --- | --- | --- | --- |
+| M1 (clearance off) | 142 | 2715 | 304 | 244 | ~5 s |
+| M2 hard halo | 108 | 1394 | 0 | 326 | minutes |
+| M2.4 soft halo (legalization) | 142 | 2726 | 0 | 402 | minutes |
+| **M2.4 default (halo off, antipads on)** | **142** | **2715** | **0** | **244** | **~5 s** |
+
+**Finding (empirical + matches SOTA):** clearance enforced *only in legalization* — hard
+or soft — cannot reduce violations on this congested coarse grid. The hard halo buys a
+−49 % clearance reduction but drops 34 nets; the soft halo keeps all 142 nets but leaves
+clearance essentially unchanged (2726 ≈ 2715) while adding vias and runtime, because the
+negotiated paths are already packed and legalization can't create space that isn't
+there. Real clearance reduction must move into the **negotiation search cost** (P1) and a
+**finer/half-pitch grid** (P4) — see the research roadmap.
+
+**Default operating point (committed):** the soft-clearance machinery is retained and
+tested in `mr-cpu` (the foundation for P1), but the legalization halo is **off by
+default** (`clearance_cells = 0`). The shipped result is a strict improvement over M1 at
+full connectivity and full speed:
+
+| Metric | M1 | M2.4 default |
+| --- | --- | --- |
+| Routed / fully-connected | 142 / 55 | 142 / 55 |
+| **Total violations** | **3019** | **2715** (−10 %) |
+| — via-through-plane | 304 | **0** (eliminated) |
+| — clearance | 2715 | 2715 |
+| Runtime | ~5 s | ~5 s |
+
+The **via-through-plane fix (304 → 0)** is the clean, durable win — it holds at full
+connectivity and speed. Clearance reduction is the next milestone.
+
+Next (validated roadmap, `drc_sota_research.md`): **P1** clearance as a soft object/marker
+cost *inside the negotiation A\** (+ rip-up-repair), **P2** per-net pin-access reservation,
+**P4** half-pitch grid — then GPU-accelerate the now-dominant routing + DRC (M3).

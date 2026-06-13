@@ -3,11 +3,11 @@
   "total_nets": 142,
   "routed_nets": 142,
   "fully_connected": 55,
-  "vias": 244,
+  "vias": 402,
   "clearance_mm": 0.15,
   "summary": {
-    "total": 2715,
-    "clearance": 2715,
+    "total": 2726,
+    "clearance": 2726,
     "via_through_plane": 0,
     "annular_ring": 0
   },
@@ -16,119 +16,21 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        48.205,
-        -172.0075
-      ],
-      "nets": [
-        "RAIL1",
-        "RAIL3"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.205,
-        -169.2375
+        45.735,
+        -168.9375
       ],
       "nets": [
         "RAIL0",
         "RAIL2"
       ],
-      "measured": 0.13500000000000084,
+      "measured": 0.1134807682497183,
       "required": 0.15
     },
     {
       "class": "clearance",
       "layer": 0,
       "location": [
-        48.28,
-        -171.9325
-      ],
-      "nets": [
-        "RAIL1",
-        "RAIL3"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.28,
-        -171.78250000000003
-      ],
-      "nets": [
-        "RAIL1",
-        "RAIL3"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.28,
-        -171.63250000000002
-      ],
-      "nets": [
-        "RAIL1",
-        "RAIL3"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.28,
-        -171.48250000000002
-      ],
-      "nets": [
-        "RAIL1",
-        "RAIL3"
-      ],
-      "measured": 0.13553503271427286,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.28,
-        -169.16250000000002
-      ],
-      "nets": [
-        "RAIL0",
-        "RAIL2"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.28,
-        -169.01250000000002
-      ],
-      "nets": [
-        "RAIL0",
-        "RAIL2"
-      ],
-      "measured": 0.13500000000000084,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        48.355000000000004,
+        45.885000000000005,
         -168.9375
       ],
       "nets": [
@@ -142,7 +44,7 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        48.505,
+        46.035,
         -168.9375
       ],
       "nets": [
@@ -156,7 +58,7 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        48.655,
+        46.185,
         -168.9375
       ],
       "nets": [
@@ -170,8 +72,8 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        48.730000000000004,
-        -168.8625
+        46.335,
+        -168.9375
       ],
       "nets": [
         "RAIL0",
@@ -184,25 +86,11 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        50.825,
+        46.485,
         -168.9375
       ],
       "nets": [
-        "GND",
-        "RAIL2"
-      ],
-      "measured": 0.10700274723202312,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        50.975,
-        -168.9375
-      ],
-      "nets": [
-        "GND",
+        "RAIL0",
         "RAIL2"
       ],
       "measured": 0.10000000000001137,
@@ -212,11 +100,11 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        51.125,
+        46.635000000000005,
         -168.9375
       ],
       "nets": [
-        "GND",
+        "RAIL0",
         "RAIL2"
       ],
       "measured": 0.10000000000001137,
@@ -226,12 +114,138 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        51.275,
+        46.785,
         -168.9375
       ],
       "nets": [
-        "GND",
+        "RAIL0",
         "RAIL2"
+      ],
+      "measured": 0.10255280904565724,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.225,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.12426406871193954,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.375,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 1.1352030426792226e-14,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.525000000000006,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 1.1352030426792226e-14,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        56.675,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL4"
+      ],
+      "measured": 0.12426406871193449,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        61.325,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL6"
+      ],
+      "measured": 0.12426406871193449,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        61.474999999999994,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL6"
+      ],
+      "measured": 1.1352030426792226e-14,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        61.625,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL6"
+      ],
+      "measured": 1.1352030426792226e-14,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        61.775,
+        -170.675
+      ],
+      "nets": [
+        "RAIL0",
+        "RAIL6"
+      ],
+      "measured": 0.12426406871193449,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        66.095,
+        -168.9375
+      ],
+      "nets": [
+        "RAIL8",
+        "RAIL9"
       ],
       "measured": 0.10000000000001137,
       "required": 0.15
@@ -240,12 +254,12 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        51.425,
+        66.245,
         -168.9375
       ],
       "nets": [
-        "GND",
-        "RAIL2"
+        "RAIL8",
+        "RAIL9"
       ],
       "measured": 0.10000000000001137,
       "required": 0.15
@@ -254,12 +268,12 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        51.575,
+        66.395,
         -168.9375
       ],
       "nets": [
-        "GND",
-        "RAIL2"
+        "RAIL8",
+        "RAIL9"
       ],
       "measured": 0.10000000000001137,
       "required": 0.15
@@ -268,28 +282,14 @@
       "class": "clearance",
       "layer": 0,
       "location": [
-        51.725,
+        66.545,
         -168.9375
       ],
       "nets": [
-        "GND",
-        "RAIL2"
+        "RAIL8",
+        "RAIL9"
       ],
       "measured": 0.10000000000001137,
-      "required": 0.15
-    },
-    {
-      "class": "clearance",
-      "layer": 0,
-      "location": [
-        51.875,
-        -168.9375
-      ],
-      "nets": [
-        "GND",
-        "RAIL2"
-      ],
-      "measured": 0.10700274723202312,
       "required": 0.15
     }
   ]
