@@ -20,7 +20,9 @@ const TARGET_CELLS_PER_AXIS: f64 = 200.0;
 /// canonical copy).
 fn choose_resolution(srj: &SimpleRouteJson) -> f64 {
     let b = &srj.bounds;
-    let span = (b.max_x - b.min_x).max(0.0).max((b.max_y - b.min_y).max(0.0));
+    let span = (b.max_x - b.min_x)
+        .max(0.0)
+        .max((b.max_y - b.min_y).max(0.0));
     if span <= 0.0 {
         return MIN_RESOLUTION;
     }

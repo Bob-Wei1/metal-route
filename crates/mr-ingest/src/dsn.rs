@@ -1106,9 +1106,12 @@ fn parse_placements(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<Vec<Plac
     Ok(placements)
 }
 
+/// A net name paired with its pins, each pin a `(reference, pin-id)`.
+type NetPins = (String, Vec<(String, String)>);
+
 /// Nets: `(network (net "NAME" (pins REF-PIN ...)))`. Returns net name ->
 /// list of `(ref, pin-id)` split on the LAST `-`. Class lists are ignored.
-fn parse_nets(pcb: &Sexpr) -> Result<Vec<(String, Vec<(String, String)>)>> {
+fn parse_nets(pcb: &Sexpr) -> Result<Vec<NetPins>> {
     let mut nets = Vec::new();
     let network = match pcb.child_named("network") {
         Some(n) => n,

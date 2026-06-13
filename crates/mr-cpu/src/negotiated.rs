@@ -124,7 +124,7 @@ fn net_window(dims: mr_core::Dims, src: CellIdx, dst: CellIdx, pads: &[CellIdx])
     let bbox_h = y1 - y0;
     let span = bbox_w.max(bbox_h);
     // ceil(0.30 * span) == (3*span + 9) / 10.
-    let margin = 16u32.max((3 * span + 9) / 10);
+    let margin = 16u32.max((3 * span).div_ceil(10));
     Window {
         x0: x0.saturating_sub(margin),
         y0: y0.saturating_sub(margin),
@@ -392,8 +392,8 @@ impl Router for NegotiatedRouter {
             // Clear the per-iteration scratch for the cells we touched (O(touched),
             // not O(all cells)): `first_group` via the path cells, `overused` via
             // the over-used list.
-            for i in 0..n_nets {
-                for &c in &paths[i] {
+            for path in paths.iter().take(n_nets) {
+                for &c in path {
                     first_group[c as usize] = -1;
                 }
             }
@@ -937,23 +937,23 @@ fn ripup_legalize(
         let routed = route_legal(
             buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i], via_model,
         )
-            .or_else(|| {
-                if needs_full[i] {
-                    route_legal(
-                        buf,
-                        grid,
-                        pad_set,
-                        &owner,
-                        gi,
-                        net.src,
-                        net.dst,
-                        Window::full(dims),
-                        via_model,
-                    )
-                } else {
-                    None
-                }
-            });
+        .or_else(|| {
+            if needs_full[i] {
+                route_legal(
+                    buf,
+                    grid,
+                    pad_set,
+                    &owner,
+                    gi,
+                    net.src,
+                    net.dst,
+                    Window::full(dims),
+                    via_model,
+                )
+            } else {
+                None
+            }
+        });
 
         if let Some((path, _)) = routed {
             for &c in &path {
@@ -1016,23 +1016,23 @@ fn ripup_legalize(
         let rerouted = route_legal(
             buf, grid, pad_set, &owner, gi, net.src, net.dst, windows[i], via_model,
         )
-            .or_else(|| {
-                if needs_full[i] {
-                    route_legal(
-                        buf,
-                        grid,
-                        pad_set,
-                        &owner,
-                        gi,
-                        net.src,
-                        net.dst,
-                        Window::full(dims),
-                        via_model,
-                    )
-                } else {
-                    None
-                }
-            });
+        .or_else(|| {
+            if needs_full[i] {
+                route_legal(
+                    buf,
+                    grid,
+                    pad_set,
+                    &owner,
+                    gi,
+                    net.src,
+                    net.dst,
+                    Window::full(dims),
+                    via_model,
+                )
+            } else {
+                None
+            }
+        });
         if let Some((path, _)) = rerouted {
             for &c in &path {
                 owner[c as usize] = gi;
@@ -1168,7 +1168,9 @@ mod tests {
             passable_pads: Vec::new(),
         };
 
-        let br = NegotiatedRouter::new().route(&grid, &[net_a, net_b]).unwrap();
+        let br = NegotiatedRouter::new()
+            .route(&grid, &[net_a, net_b])
+            .unwrap();
         assert!(br.unrouted.is_empty(), "both nets must route: {br:?}");
         assert_eq!(br.results.len(), 2);
 
@@ -1419,7 +1421,9 @@ mod tests {
             "precondition: gap column is outside the window"
         );
 
-        let br = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
+        let br = NegotiatedRouter::new()
+            .route(&grid, std::slice::from_ref(&a))
+            .unwrap();
         assert!(
             br.unrouted.is_empty(),
             "net must route via the full-board retry: {br:?}"
@@ -1557,10 +1561,15 @@ mod tests {
 
         // Precondition: layer 0 alone has no path (the wall is the whole corridor).
         assert!(grid.is_obstacle(dims.idx3(1, 0, 0)));
-        assert!(!grid.is_obstacle(dims.idx3(1, 0, 1)), "layer 1 must be open");
+        assert!(
+            !grid.is_obstacle(dims.idx3(1, 0, 1)),
+            "layer 1 must be open"
+        );
 
         let a = net("a", dims.idx3(0, 0, 0), dims.idx3(2, 0, 0));
-        let br = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
+        let br = NegotiatedRouter::new()
+            .route(&grid, std::slice::from_ref(&a))
+            .unwrap();
         assert!(
             br.unrouted.is_empty(),
             "net must route by changing layers: {br:?}"
@@ -1603,7 +1612,7 @@ mod tests {
         let a = net("a", dims.idx3(0, 0, 0), dims.idx3(2, 0, 0));
         let br = NegotiatedRouter::new()
             .with_via_model(vm)
-            .route(&grid, &[a.clone()])
+            .route(&grid, std::slice::from_ref(&a))
             .unwrap();
         assert_eq!(br.results.len(), 0, "no route exists without a legal via");
         assert_eq!(br.unrouted, vec!["a".to_string()]);
@@ -1622,10 +1631,12 @@ mod tests {
 
         // Default router (synthesises a through-hole model over 1 layer) and an
         // explicit through-hole model must both produce the same single-layer route.
-        let br_default = NegotiatedRouter::new().route(&grid, &[a.clone()]).unwrap();
+        let br_default = NegotiatedRouter::new()
+            .route(&grid, std::slice::from_ref(&a))
+            .unwrap();
         let br_vm = NegotiatedRouter::new()
             .with_via_model(ViaModel::through_hole(1))
-            .route(&grid, &[a.clone()])
+            .route(&grid, std::slice::from_ref(&a))
             .unwrap();
 
         assert!(br_default.unrouted.is_empty());
