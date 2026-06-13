@@ -100,6 +100,11 @@ pub struct SimpleRouteJson {
     /// Drives both the emitted wire width and the rasterisation resolution.
     #[serde(default)]
     pub min_trace_width: Option<f64>,
+    /// Minimum copper-to-copper clearance in continuous units. Like
+    /// [`Self::min_trace_width`], this is parsed from the DSN `(rule (clearance N))`
+    /// rule (the harness emits `minClearance`) and feeds the design-rule check.
+    #[serde(default)]
+    pub min_clearance: Option<f64>,
     #[serde(default)]
     pub obstacles: Vec<Obstacle>,
     #[serde(default)]
@@ -881,7 +886,7 @@ mod tests {
         let mapping = Mapping::with_layers(&bounds, 1.0, 2);
         let d = mapping.dims;
         let layers = LayerMap::standard(2); // ["top","bottom"]
-                                             // Move on top to (2,0), via down to bottom, then on bottom to (4,0).
+                                            // Move on top to (2,0), via down to bottom, then on bottom to (4,0).
         let path = vec![
             d.idx3(0, 0, 0),
             d.idx3(1, 0, 0),

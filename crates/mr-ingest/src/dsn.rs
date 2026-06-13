@@ -50,6 +50,10 @@ use mr_srj::{Bounds, Connection, Obstacle, Point, SimpleRouteJson};
 /// Default trace width in mm when the DSN carries no `(rule (width N))`.
 const DEFAULT_TRACE_WIDTH_MM: f64 = 0.15;
 
+/// Default copper-to-copper clearance in mm when the DSN carries no
+/// `(rule (clearance N))`.
+const DEFAULT_CLEARANCE_MM: f64 = 0.15;
+
 // ---------------------------------------------------------------------------
 // S-expression tokenizer + parser
 // ---------------------------------------------------------------------------
@@ -258,6 +262,8 @@ pub struct ParseStats {
     pub board_h_mm: f64,
     /// Minimum trace width in mm used for the problem.
     pub min_trace_width_mm: f64,
+    /// Minimum copper-to-copper clearance in mm used for the problem.
+    pub min_clearance_mm: f64,
     /// Number of distinct via padstacks declared in the DSN structure.
     pub vias_declared: usize,
     /// Whether the resolved [`ViaModel`] is a full through-hole model (every
@@ -391,6 +397,10 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     let min_trace_width_mm =
         parse_rule_width(pcb, structure, &to_mm).unwrap_or(DEFAULT_TRACE_WIDTH_MM);
 
+    // Minimum clearance: structure-level (rule (clearance N)) wins, else default.
+    let min_clearance_mm =
+        parse_rule_clearance(pcb, structure, &to_mm).unwrap_or(DEFAULT_CLEARANCE_MM);
+
     // Padstack pad sizes: name -> representative (w,h) in mm.
     let pad_sizes = parse_padstacks(pcb, &to_mm)?;
 
@@ -503,6 +513,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         board_w_mm: bounds.max_x - bounds.min_x,
         board_h_mm: bounds.max_y - bounds.min_y,
         min_trace_width_mm,
+        min_clearance_mm,
         vias_declared,
         vias_through_hole,
     };
@@ -510,6 +521,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     let srj = SimpleRouteJson {
         layer_count,
         min_trace_width: Some(min_trace_width_mm),
+        min_clearance: Some(min_clearance_mm),
         obstacles,
         connections,
         bounds,
@@ -559,7 +571,11 @@ pub fn dsn_to_srj(dsn_text: &str) -> Result<SimpleRouteJson> {
 fn parse_layer_names(structure: &Sexpr) -> Vec<String> {
     let mut names = Vec::new();
     for layer in structure.children_named("layer") {
-        if let Some(name) = layer.as_list().and_then(|l| l.get(1)).and_then(|n| n.as_atom()) {
+        if let Some(name) = layer
+            .as_list()
+            .and_then(|l| l.get(1))
+            .and_then(|n| n.as_atom())
+        {
             names.push(name.to_string());
         }
     }
@@ -574,7 +590,11 @@ fn parse_signal_layer_names(structure: &Sexpr) -> Vec<String> {
     let mut signal = Vec::new();
     let mut saw_type = false;
     for layer in structure.children_named("layer") {
-        let Some(name) = layer.as_list().and_then(|l| l.get(1)).and_then(|n| n.as_atom()) else {
+        let Some(name) = layer
+            .as_list()
+            .and_then(|l| l.get(1))
+            .and_then(|n| n.as_atom())
+        else {
             continue;
         };
         let ty = layer
@@ -608,7 +628,11 @@ fn parse_signal_layer_names(structure: &Sexpr) -> Vec<String> {
 ///   preserving the historical single-`top` behaviour for that pad.
 fn pad_layer_names(declared: &[String], layer_map: &LayerMap) -> Vec<String> {
     let count = layer_map.len();
-    let all = || (0..count).map(|i| layer_map.name(i).to_string()).collect::<Vec<_>>();
+    let all = || {
+        (0..count)
+            .map(|i| layer_map.name(i).to_string())
+            .collect::<Vec<_>>()
+    };
 
     // Through-hole wildcard span.
     let is_wildcard = |s: &str| {
@@ -801,6 +825,30 @@ fn parse_rule_width(pcb: &Sexpr, structure: &Sexpr, to_mm: &impl Fn(f64) -> f64)
         let rule = node.child_named("rule")?;
         let width = rule.child_named("width")?;
         let raw = width.as_list()?.get(1)?.as_atom()?.parse::<f64>().ok()?;
+        Some(to_mm(raw))
+    };
+    find(structure).or_else(|| find(pcb))
+}
+
+/// First `(rule (clearance N))` found at structure or pcb level, converted to mm.
+///
+/// A single `(rule ...)` block can carry both width and clearance, e.g.
+/// `(rule (width 150) (clearance 200))`; this reads the `clearance` member.
+/// Structure-level rules win over pcb-level, matching [`parse_rule_width`].
+fn parse_rule_clearance(
+    pcb: &Sexpr,
+    structure: &Sexpr,
+    to_mm: &impl Fn(f64) -> f64,
+) -> Option<f64> {
+    let find = |node: &Sexpr| -> Option<f64> {
+        let rule = node.child_named("rule")?;
+        let clearance = rule.child_named("clearance")?;
+        let raw = clearance
+            .as_list()?
+            .get(1)?
+            .as_atom()?
+            .parse::<f64>()
+            .ok()?;
         Some(to_mm(raw))
     };
     find(structure).or_else(|| find(pcb))
@@ -1147,6 +1195,10 @@ mod tests {
         // min trace width 150 raw um -> 0.15mm.
         assert_eq!(srj.min_trace_width, Some(0.15));
 
+        // No (rule (clearance N)) present -> falls back to the default.
+        assert_eq!(srj.min_clearance, Some(DEFAULT_CLEARANCE_MM));
+        assert_eq!(stats.min_clearance_mm, DEFAULT_CLEARANCE_MM);
+
         // Two components placed.
         assert_eq!(stats.components, 2);
 
@@ -1160,6 +1212,64 @@ mod tests {
         assert_eq!(stats.nets_skipped_small, 1);
         assert_eq!(srj.connections[0].name, "N1");
         assert_eq!(srj.connections[0].points_to_connect.len(), 2);
+    }
+
+    #[test]
+    fn parses_clearance_rule_alongside_width() {
+        // A single (rule ...) block carrying both width and clearance. With
+        // (resolution mm 1000), raw is in µm: 200 raw -> 0.20mm.
+        let dsn = r#"
+        (pcb "clr.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (rule (width 150) (clearance 200))
+          )
+        )
+        "#;
+        let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
+        assert_eq!(srj.min_trace_width, Some(0.15));
+        assert_eq!(srj.min_clearance, Some(0.20));
+        assert_eq!(stats.min_clearance_mm, 0.20);
+    }
+
+    #[test]
+    fn clearance_falls_back_to_default_when_absent() {
+        // (rule (width N)) only -> clearance uses DEFAULT_CLEARANCE_MM.
+        let dsn = r#"
+        (pcb "noclr.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (rule (width 150))
+          )
+        )
+        "#;
+        let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
+        assert_eq!(srj.min_clearance, Some(DEFAULT_CLEARANCE_MM));
+        assert_eq!(stats.min_clearance_mm, DEFAULT_CLEARANCE_MM);
+    }
+
+    #[test]
+    fn structure_clearance_overrides_pcb_level() {
+        // A pcb-level (rule (clearance N)) and a structure-level one both present:
+        // the structure-level rule wins, matching the width precedence.
+        let dsn = r#"
+        (pcb "ovr.dsn"
+          (resolution mm 1000)
+          (rule (clearance 300))
+          (structure
+            (layer F.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (rule (clearance 200))
+          )
+        )
+        "#;
+        let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
+        assert_eq!(srj.min_clearance, Some(0.20));
+        assert_eq!(stats.min_clearance_mm, 0.20);
     }
 
     #[test]
@@ -1443,11 +1553,7 @@ mod tests {
         // A padstack using the `signal` wildcard layer should span the full stack.
         let ingest = pad_layer_names(
             &["signal".to_string()],
-            &LayerMap::from_names(vec![
-                "F.Cu".into(),
-                "In1.Cu".into(),
-                "B.Cu".into(),
-            ]),
+            &LayerMap::from_names(vec!["F.Cu".into(), "In1.Cu".into(), "B.Cu".into()]),
         );
         assert_eq!(ingest, vec!["F.Cu", "In1.Cu", "B.Cu"]);
     }
