@@ -5,7 +5,10 @@
 
 use anyhow::Result;
 use clap::Parser;
-use mr_cli::{bench::run_bench, run_handoff, run_project, run_route, run_route_dsn, Cli, Command};
+use mr_cli::{
+    bench::run_bench, drc::run_drc, run_handoff, run_project, run_route, run_route_dsn, Cli,
+    Command,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -77,6 +80,30 @@ fn main() -> Result<()> {
             );
             // Scrape-friendly one-liner on stdout.
             println!("{}", r.result_line());
+        }
+        Command::Drc(args) => {
+            let r = run_drc(args)?;
+            eprintln!(
+                "DRC {}: routed {}/{} two-point nets, {} fully-connected, {} vias",
+                r.design, r.routed_nets, r.total_nets, r.fully_connected, r.vias,
+            );
+            eprintln!(
+                "DRC violations: {} total — {} clearance, {} via-through-plane, {} annular-ring (clearance rule {:.3} mm)",
+                r.summary.total,
+                r.summary.clearance,
+                r.summary.via_through_plane,
+                r.summary.annular_ring,
+                r.clearance_mm,
+            );
+            // Scrape-friendly one-liner on stdout.
+            println!(
+                "drc design={} violations={} clearance={} via_through_plane={} annular_ring={}",
+                r.design,
+                r.summary.total,
+                r.summary.clearance,
+                r.summary.via_through_plane,
+                r.summary.annular_ring,
+            );
         }
     }
     Ok(())

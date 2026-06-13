@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bench;
+pub mod drc;
 use std::collections::HashMap;
 
 use mr_core::{BoardRoute, CellIdx, LayerMap, Router, ViaModel};
@@ -30,6 +31,11 @@ pub const GO_NO_GO_THRESHOLD: f32 = 2.0;
 
 /// Default trace width (continuous units) for emitted `pcb_trace` wires.
 const DEFAULT_TRACE_WIDTH: f64 = 0.15;
+
+/// Signal-via geometry (bon's default): 0.45 mm annular pad over a 0.2 mm drill.
+/// Shared by the SES exporter and the DRC builder so both agree on via copper.
+pub const VIA_PAD_MM: f64 = 0.45;
+pub const VIA_DRILL_MM: f64 = 0.2;
 
 /// `metalroute` — a PCB autorouter CLI.
 #[derive(Debug, Parser)]
@@ -52,6 +58,9 @@ pub enum Command {
     Handoff(HandoffArgs),
     /// Route a Specctra `.dsn` board with the CPU router and report connectivity.
     RouteDsn(RouteDsnArgs),
+    /// Route a Specctra `.dsn` board, run the native DRC checker, and report (and
+    /// optionally write) a violation report.
+    Drc(drc::DrcArgs),
 }
 
 /// Arguments for the `handoff` subcommand (M5 Freerouting bridge).
@@ -365,6 +374,11 @@ pub struct RouteDsnArgs {
     /// ready to import back onto the source board (`bon route DIR --import-ses`).
     #[arg(long)]
     pub ses: Option<PathBuf>,
+
+    /// After routing, run the native DRC checker and print a violation summary
+    /// (clearance, via-through-plane, annular-ring) to stderr.
+    #[arg(long, default_value_t = false)]
+    pub drc: bool,
 }
 
 /// Resolution policy for `route-dsn`: honour a finite positive override, else
@@ -504,7 +518,7 @@ fn board_to_ses(
     // Signal via: 0.45 mm pad / 0.2 mm drill (bon's default), encoded for the
     // importer's `Via[..]_<size_um>:<drill_um>_um` regex.
     const VIA_NAME: &str = "Via[0-7]_450:200_um";
-    let via_pad_raw = to_raw(0.45);
+    let via_pad_raw = to_raw(VIA_PAD_MM);
 
     // Endpoint vertices snap to the exact port; interior vertices use cell centres.
     let point = |cell: CellIdx, endpoint: bool| -> (f64, f64) {
@@ -550,7 +564,7 @@ fn board_to_ses(
             let mut cur_layer = dims.layer_of(path[0]);
             let p0 = point(path[0], true);
             let mut run: Vec<(i64, i64)> = vec![(to_raw(p0.0), to_raw(p0.1))];
-            let mut flush = |out: &mut String, layer: u32, run: &[(i64, i64)]| {
+            let flush = |out: &mut String, layer: u32, run: &[(i64, i64)]| {
                 let run = simplify_collinear(run);
                 if run.len() < 2 {
                     return;
@@ -600,6 +614,10 @@ fn count_vias(traces: &[mr_srj::PcbTrace]) -> usize {
 
 /// Restrict a parsed stackup to the top `n` layers, rebuilding a through-hole via
 /// model over them. `None` (or `n >= len`) keeps the full stackup and its model.
+///
+/// Retained as the canonical stackup-restriction helper; `route_dsn_problem`
+/// currently inlines the equivalent truncation over the signal-layer list.
+#[allow(dead_code)]
 fn apply_layer_override(
     layer_map: LayerMap,
     via_model: ViaModel,
@@ -626,7 +644,7 @@ pub fn route_dsn_problem(
     skip_nets: &[String],
     max_nets: Option<usize>,
     layers: Option<u32>,
-) -> Result<(DsnReport, Vec<mr_srj::PcbTrace>, String)> {
+) -> Result<(DsnReport, Vec<mr_srj::PcbTrace>, String, mr_drc::DrcBoard)> {
     let units_per_mm = ingest.units_per_mm();
     let res_unit = ingest.resolution_unit.clone();
     let res_divisor = ingest.resolution_divisor;
@@ -634,6 +652,9 @@ pub fn route_dsn_problem(
         mut srj,
         signal_layers,
         stats,
+        layer_map: physical_layers,
+        planes,
+        pin_nets,
         ..
     } = ingest;
     // Filter connections: drop skipped substrings, then cap.
@@ -720,6 +741,20 @@ pub fn route_dsn_problem(
         trace_width,
     );
 
+    // Build the physical DRC model: routed copper on the SIGNAL grid, mapped onto
+    // the FULL stackup so a through-via's barrel is seen crossing the inner planes.
+    let drc_board = drc::build_drc_board(
+        &board,
+        &problem.mapping,
+        &problem.layers,
+        &physical_layers,
+        &planes,
+        &srj.obstacles,
+        &pin_nets,
+        trace_width,
+        drc::default_rules(stats.min_clearance_mm),
+    );
+
     let report = DsnReport {
         stats,
         resolution,
@@ -734,7 +769,7 @@ pub fn route_dsn_problem(
         wall_s,
     };
 
-    Ok((report, traces, ses))
+    Ok((report, traces, ses, drc_board))
 }
 
 /// Execute the `route-dsn` subcommand: read + parse the DSN, route it, optionally
@@ -750,7 +785,7 @@ pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "fixture".to_string());
 
-    let (report, traces, ses) = route_dsn_problem(
+    let (report, traces, ses, drc_board) = route_dsn_problem(
         ingest,
         &design_name,
         args.resolution,
@@ -768,6 +803,14 @@ pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
     if let Some(path) = &args.ses {
         std::fs::write(path, &ses)
             .with_context(|| format!("failed to write SES file {}", path.display()))?;
+    }
+
+    if args.drc {
+        let summary = mr_drc::DrcSummary::of(&drc_board.check());
+        eprintln!(
+            "DRC: {} violation(s) — {} clearance, {} via-through-plane, {} annular-ring",
+            summary.total, summary.clearance, summary.via_through_plane, summary.annular_ring,
+        );
     }
 
     Ok(report)
@@ -852,7 +895,11 @@ mod tests {
             .iter()
             .flat_map(|t| &t.route)
             .find_map(|p| match p {
-                RoutePoint::Via { from_layer, to_layer, .. } => Some((from_layer.clone(), to_layer.clone())),
+                RoutePoint::Via {
+                    from_layer,
+                    to_layer,
+                    ..
+                } => Some((from_layer.clone(), to_layer.clone())),
                 _ => None,
             })
             .expect("at least one via");
@@ -998,7 +1045,7 @@ mod tests {
     fn route_dsn_round_trip_routes_synthetic_board() {
         let ingest = dsn_to_ingest(SYNTH_DSN).unwrap();
         assert_eq!(ingest.srj.connections.len(), 1);
-        let (report, traces, ses) =
+        let (report, traces, ses, _drc) =
             route_dsn_problem(ingest, "synth", Some(0.5), &[], None, None).unwrap();
         // The SES is well-formed and names the routed net.
         assert!(ses.contains("(session"));
@@ -1040,7 +1087,7 @@ mod tests {
         let ingest = dsn_to_ingest(dsn).unwrap();
         assert_eq!(ingest.srj.connections.len(), 2);
         // Skip GND -> only SIGNAL remains.
-        let (report, _, _) =
+        let (report, _, _, _) =
             route_dsn_problem(ingest, "f", Some(0.5), &["GND".to_string()], None, None).unwrap();
         assert_eq!(report.original_nets, 1);
     }

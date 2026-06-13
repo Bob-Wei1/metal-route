@@ -20,6 +20,7 @@ mr-cpu = { workspace = true }
 mr-bench = { workspace = true }
 mr-bridge = { workspace = true }
 mr-ingest = { workspace = true }
+mr-drc = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

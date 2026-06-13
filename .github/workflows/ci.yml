@@ -27,17 +27,24 @@ jobs:
         run: >
           cargo clippy --all-targets
           -p mr-core -p mr-grid -p mr-fixtures -p mr-cpu -p mr-srj
-          -p mr-ingest -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
+          -p mr-ingest -p mr-drc -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
           -- -D warnings
 
       - name: Test (CPU crates — the correctness gate)
         run: >
           cargo test
           -p mr-core -p mr-grid -p mr-fixtures -p mr-cpu -p mr-srj
-          -p mr-ingest -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
+          -p mr-ingest -p mr-drc -p mr-oracle -p mr-bench -p mr-server -p mr-bridge -p mr-cli
 
       - name: Reproducible benchmark (smoke — must run, numbers not gated)
         run: cargo run -p mr-cli --bin metalroute -- bench --boards 3 --nets 10
+
+      - name: DRC smoke (must run, violation count not gated)
+        run: >
+          cargo run -p mr-cli --bin metalroute -- drc
+          --input bench/fixture_fresh/fixture.dsn
+          --skip-nets=GND --skip-nets=+5VA --skip-nets=-5VA --skip-nets=3V3
+          --max-nets 20 --max-violations 10
 
       - name: Metal build (compile-only; GPU may be unavailable on runners)
         run: cargo build -p mr-metal

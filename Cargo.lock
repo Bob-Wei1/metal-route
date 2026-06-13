@@ -675,6 +675,7 @@ dependencies = [
  "mr-bridge",
  "mr-core",
  "mr-cpu",
+ "mr-drc",
  "mr-ingest",
  "mr-srj",
  "serde",

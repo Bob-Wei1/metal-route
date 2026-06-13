@@ -301,6 +301,22 @@ pub struct DsnIngest {
     pub resolution_divisor: f64,
     /// Human-readable parse stats.
     pub stats: ParseStats,
+    /// Poured power/ground planes: each binds a net to the copper layer it fills,
+    /// parsed from `(structure (plane "NET" (polygon LAYER ...)))`. Used by the DRC
+    /// checker to detect signal vias drilling through a foreign plane.
+    pub planes: Vec<PlaneDef>,
+    /// Map from a pad's `"REF-PIN"` id (as carried in [`mr_srj::Obstacle::connected_to`])
+    /// to its net name, derived from the DSN `(network ...)`. Lets a consumer attribute
+    /// every placed pad to a net.
+    pub pin_nets: HashMap<String, String>,
+}
+
+/// A poured plane: the `net` it carries and the copper `layer` (DSN layer name) it
+/// fills. Parsed from `(structure (plane "NET" (polygon LAYER ...)))`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaneDef {
+    pub net: String,
+    pub layer: String,
 }
 
 impl DsnIngest {
@@ -518,6 +534,15 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         vias_through_hole,
     };
 
+    // Poured planes (net ↔ layer) and a pad-id → net map for the DRC checker.
+    let planes = parse_planes(structure);
+    let mut pin_nets: HashMap<String, String> = HashMap::new();
+    for (net_name, pin_refs) in &nets {
+        for (reference, pin_id) in pin_refs {
+            pin_nets.insert(format!("{reference}-{pin_id}"), net_name.clone());
+        }
+    }
+
     let srj = SimpleRouteJson {
         layer_count,
         min_trace_width: Some(min_trace_width_mm),
@@ -535,6 +560,8 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         resolution_unit: unit.to_string(),
         resolution_divisor: divisor,
         stats,
+        planes,
+        pin_nets,
     })
 }
 
@@ -568,6 +595,35 @@ pub fn dsn_to_srj(dsn_text: &str) -> Result<SimpleRouteJson> {
 /// in file order. The DSN names them top-to-bottom (F.Cu first, B.Cu last), which
 /// is exactly the index order the [`LayerMap`] / routing grid want. Empty input
 /// is left empty for [`LayerMap::from_names`] to promote to a single `"top"`.
+/// Poured planes from `(structure (plane "NET" (polygon LAYER ...)))`, in file
+/// order. Each binds a net to the copper layer its polygon fills. A plane whose net
+/// or layer atom is missing is skipped.
+fn parse_planes(structure: &Sexpr) -> Vec<PlaneDef> {
+    let mut planes = Vec::new();
+    for plane in structure.children_named("plane") {
+        let Some(net) = plane
+            .as_list()
+            .and_then(|l| l.get(1))
+            .and_then(|n| n.as_atom())
+        else {
+            continue;
+        };
+        let Some(layer) = plane
+            .child_named("polygon")
+            .and_then(|p| p.as_list())
+            .and_then(|l| l.get(1))
+            .and_then(|n| n.as_atom())
+        else {
+            continue;
+        };
+        planes.push(PlaneDef {
+            net: net.to_string(),
+            layer: layer.to_string(),
+        });
+    }
+    planes
+}
+
 fn parse_layer_names(structure: &Sexpr) -> Vec<String> {
     let mut names = Vec::new();
     for layer in structure.children_named("layer") {
@@ -1174,6 +1230,46 @@ mod tests {
             Some(("Net-U6".to_string(), "BAT".to_string()))
         );
         assert_eq!(split_ref_pin("nodash"), None);
+    }
+
+    #[test]
+    fn builds_pin_nets_from_network() {
+        let ingest = dsn_to_ingest(SYNTH).unwrap();
+        // Every pad id resolves to its net.
+        assert_eq!(ingest.pin_nets.get("A-2").map(String::as_str), Some("N1"));
+        assert_eq!(ingest.pin_nets.get("B-1").map(String::as_str), Some("N1"));
+        assert_eq!(
+            ingest.pin_nets.get("A-1").map(String::as_str),
+            Some("ONLYONE")
+        );
+        // SYNTH declares no poured planes.
+        assert!(ingest.planes.is_empty());
+    }
+
+    #[test]
+    fn parses_plane_net_layer_binding() {
+        // A `(plane "NET" (polygon LAYER ...))` binds a net to the copper layer it
+        // fills — the binding the DRC checker needs to flag vias through a plane.
+        const DSN: &str = r#"
+        (pcb "p.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (layer In1.Cu (type power))
+            (layer B.Cu (type signal))
+            (boundary (path pcb 0 0 0 1000 1000 1000 1000 0))
+            (plane "GND" (polygon In1.Cu 0 0 0 0 1000 1000 1000 1000 0))
+          )
+        )
+        "#;
+        let ingest = dsn_to_ingest(DSN).unwrap();
+        assert_eq!(
+            ingest.planes,
+            vec![PlaneDef {
+                net: "GND".to_string(),
+                layer: "In1.Cu".to_string(),
+            }]
+        );
     }
 
     #[test]
