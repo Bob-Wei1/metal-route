@@ -467,12 +467,12 @@ fn feature_gap(a: &Feature, b: &Feature) -> f64 {
 }
 
 /// Euclidean point-to-point distance.
-fn dist(p: (f64, f64), q: (f64, f64)) -> f64 {
+pub fn dist(p: (f64, f64), q: (f64, f64)) -> f64 {
     ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt()
 }
 
 /// Distance from point `p` to the segment `[a, b]` (0 if `p` lies on it).
-fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+pub fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (abx, aby) = (b.0 - a.0, b.1 - a.1);
     let len2 = abx * abx + aby * aby;
     if len2 <= f64::MIN_POSITIVE {
@@ -488,7 +488,7 @@ fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 /// Standard closest-distance-between-two-segments: minimise the squared distance of
 /// `s(t) = p0 + t·d1` and `r(u) = q0 + u·d2` over `t,u ∈ [0,1]`, with the degenerate
 /// (point) cases handled explicitly.
-fn seg_seg_dist(p0: (f64, f64), p1: (f64, f64), q0: (f64, f64), q1: (f64, f64)) -> f64 {
+pub fn seg_seg_dist(p0: (f64, f64), p1: (f64, f64), q0: (f64, f64), q1: (f64, f64)) -> f64 {
     let d1 = (p1.0 - p0.0, p1.1 - p0.1);
     let d2 = (q1.0 - q0.0, q1.1 - q0.1);
     let r = (p0.0 - q0.0, p0.1 - q0.1);
@@ -537,7 +537,7 @@ fn seg_seg_dist(p0: (f64, f64), p1: (f64, f64), q0: (f64, f64), q1: (f64, f64)) 
 
 /// Gap from a point to an axis-aligned rectangle (center `c`, full `w`×`h`); 0 when
 /// the point is inside.
-fn point_rect_gap(p: (f64, f64), c: (f64, f64), w: f64, h: f64) -> f64 {
+pub fn point_rect_gap(p: (f64, f64), c: (f64, f64), w: f64, h: f64) -> f64 {
     let dx = (c.0 - p.0).abs() - w / 2.0;
     let dy = (c.1 - p.1).abs() - h / 2.0;
     let ox = dx.max(0.0);
@@ -552,7 +552,7 @@ fn point_rect_gap(p: (f64, f64), c: (f64, f64), w: f64, h: f64) -> f64 {
 
 /// Gap from a segment to an axis-aligned rectangle. Sampled against the rectangle's
 /// four edges (and inside-test), which is exact for the segment-vs-AABB case.
-fn seg_rect_gap(p0: (f64, f64), p1: (f64, f64), c: (f64, f64), w: f64, h: f64) -> f64 {
+pub fn seg_rect_gap(p0: (f64, f64), p1: (f64, f64), c: (f64, f64), w: f64, h: f64) -> f64 {
     // If either endpoint is inside, gap is 0.
     if point_rect_gap(p0, c, w, h) == 0.0 || point_rect_gap(p1, c, w, h) == 0.0 {
         return 0.0;
@@ -575,7 +575,7 @@ fn seg_rect_gap(p0: (f64, f64), p1: (f64, f64), c: (f64, f64), w: f64, h: f64) -
 }
 
 /// Gap between two axis-aligned rectangles (0 if they overlap or touch).
-fn rect_rect_gap(c0: (f64, f64), w0: f64, h0: f64, c1: (f64, f64), w1: f64, h1: f64) -> f64 {
+pub fn rect_rect_gap(c0: (f64, f64), w0: f64, h0: f64, c1: (f64, f64), w1: f64, h1: f64) -> f64 {
     let dx = (c0.0 - c1.0).abs() - (w0 + w1) / 2.0;
     let dy = (c0.1 - c1.1).abs() - (h0 + h1) / 2.0;
     let ox = dx.max(0.0);
