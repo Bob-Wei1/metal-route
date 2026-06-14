@@ -6,3 +6,6 @@ Cargo.lock.bak
 # tscircuit benchmark harness (cloned, not vendored) + generated fixtures
 /.bench/
 /bench/
+
+# tscircuit benchmark visual galleries (generated per run)
+/benchmarks/runs/

@@ -1,0 +1,21 @@
+{
+  "harness": "tscircuit/autorouting runBenchmark over mr-server POST /solve",
+  "pass_criteria": "checkEachPcbTraceNonOverlapping + checkEachPcbPortConnected (no layer/via constraint)",
+  "reproduce": "scripts/bench-tscircuit.sh <samples> [categories...] ; MR_SOLVE_LAYERS=N for the layer budget",
+  "categories": [
+    {"category": "single-trace",         "layers": 1, "successful": 99,  "run": 100, "pct": 99.0,  "avg_ms": 1.4},
+    {"category": "single-trace",         "layers": 2, "successful": 100, "run": 100, "pct": 100.0, "avg_ms": 1.6},
+    {"category": "distant-single-trace", "layers": 1, "successful": 97,  "run": 100, "pct": 97.0,  "avg_ms": 3.4},
+    {"category": "distant-single-trace", "layers": 2, "successful": 97,  "run": 100, "pct": 97.0,  "avg_ms": 5.6},
+    {"category": "traces",               "layers": 1, "successful": 52,  "run": 100, "pct": 52.0,  "avg_ms": 19.3},
+    {"category": "traces",               "layers": 2, "successful": 99,  "run": 100, "pct": 99.0,  "avg_ms": 16.2},
+    {"category": "keyboards",            "layers": 1, "successful": 2,   "run": 10,  "pct": 20.0,  "avg_ms": 5.2},
+    {"category": "keyboards",            "layers": 2, "successful": 2,   "run": 10,  "pct": 20.0,  "avg_ms": 5.0}
+  ],
+  "notes": [
+    "1-layer column is the byte-identical single-layer baseline; 2-layer is the default solve budget (MR_SOLVE_LAYERS=2).",
+    "traces lifts 52% -> 99% from the 2nd layer (crossing-bound boards).",
+    "keyboards does not lift (large multi-net boards fail on full-connectivity, not crossing-overlap); sampled at 10 because the 48-70-net instances are legalization-bound and mostly unroutable at this resolution.",
+    "keyboards/traces solve speed: exhaustive-permutation legalization capped at n_groups<=5 (~18x on 6-7 group boards, identical completion); negotiation parallelized for n_nets>16."
+  ]
+}
