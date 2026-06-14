@@ -773,6 +773,7 @@ name = "mr-srj"
 version = "0.1.0"
 dependencies = [
  "mr-core",
+ "mr-drc",
  "mr-grid",
  "serde",
  "serde_json",

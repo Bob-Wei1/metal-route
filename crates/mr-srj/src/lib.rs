@@ -40,6 +40,9 @@ use mr_core::{BoardRoute, CellIdx, Dims, Grid, LayerMap, NetEndpoints};
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
+mod smooth;
+pub use smooth::beautify_traces;
+
 /// A 2-D point in continuous tscircuit coordinates.
 ///
 /// The real harness attaches extra fields (`layer`, `pcb_port_id`); `layer` is
