@@ -89,6 +89,16 @@ pub const CLEARANCE_NEG_WEIGHT: Cost = SCALE;
 /// Maximum negotiation iterations before falling through to legalization.
 pub const MAX_ITERS: u32 = 60;
 
+/// Net-count threshold above which the negotiation loop routes its nets in
+/// PARALLEL (the snapshot-based Jacobi merge) even when clearance is inactive.
+/// Below it, small boards keep the sequential Gauss-Seidel path so the
+/// deterministic unit tests and single-layer fixtures stay byte-identical. Real
+/// many-net boards (e.g. tscircuit `keyboards`, 40–70 nets) are otherwise
+/// single-threaded and dominate wall-clock; routing them across all cores is the
+/// difference between ~85 s and a few seconds. The parallel path is deterministic
+/// (index-ordered merge) regardless of net count.
+const PARALLEL_NEGOTIATION_THRESHOLD: usize = 16;
+
 /// Free-cell cost used when unmasking a net's own pad cells (mirrors the base grid
 /// convention used by `GridBuilder`, which fills passable cells with cost 1).
 const FREE_COST: Cost = 1;
@@ -372,18 +382,43 @@ impl Router for NegotiatedRouter {
         //
         // CLEARANCE GATING: the quiescence test below skips a routed net whose path
         // avoids every `prev_overused` cell, on the reasoning that such a net's priced
-        // costs are unchanged. That reasoning fails once clearance is active: a net's
-        // priced cost can change because a *neighbour's* halo (`present_halo`) shifted,
-        // which `prev_overused` (a copper-overuse set) does not capture. So when
-        // clearance is active we disable the incremental skip and reroute every net
-        // each iteration — slower, but sound; clearance routing is already the slow
-        // path. When clearance is inactive the field stays all-zero and the skip is
-        // exactly as before (byte-identical).
+        // costs are unchanged. That reasoning is incomplete once clearance is active: a
+        // net's priced cost can also change because a *neighbour's* halo
+        // (`present_halo`) shifted onto its path, which `prev_overused` (a copper-overuse
+        // set) does not capture. The clearance (Jacobi) branch therefore augments the
+        // skip with a second signal — `halo_dirty`, the set of cells whose `present_halo`
+        // value actually CHANGED during the previous iteration's merge — and reroutes a
+        // net whose path touches a `prev_overused` OR a `halo_dirty` cell. A *delta* (not
+        // an absolute `present_halo > 0`) is required because `for_each_halo_cell` stamps
+        // the clearance box including its center, so every routed net self-halos its own
+        // path cells; only genuine external movement should force a reroute. The
+        // sequential (clearance-off) branch keeps the original copper-only skip and stays
+        // byte-identical (`present_halo`/`halo_dirty` remain all-zero / empty there).
         let incremental = n_nets > 8 && !clearance_active;
+        // Route nets in parallel (snapshot-based Jacobi merge) when clearance is
+        // active (it REQUIRES the merge to keep `present_halo` consistent) or when the
+        // board is large enough that the sequential per-net loop dominates wall-clock.
+        // Small non-clearance boards keep the sequential Gauss-Seidel path so the
+        // deterministic tests and single-layer fixtures stay byte-identical. For the
+        // large non-clearance case the parallel branch is already correct: `present_halo`
+        // stays all-zero (so its pricing/`halo_dirty` contribute nothing) and the
+        // incremental dirty set is driven by `prev_overused`, which `incremental` (true
+        // for `n_nets > 8`) maintains below.
+        let use_parallel = clearance_active || n_nets > PARALLEL_NEGOTIATION_THRESHOLD;
         // `overused` from the previous iteration (cell -> was it over-used). Empty
         // before the first iteration (everything reroutes).
         let mut prev_overused: Vec<bool> = vec![false; n_cells];
         let mut prev_overused_cells: Vec<CellIdx> = Vec::new();
+        // `halo_dirty[c]` == did `present_halo[c]` change during the previous iteration's
+        // merge (clearance branch only). Read by the dirty-net test, repopulated by the
+        // merge. List-reset (no O(all cells) memset). `halo_delta` is per-iteration merge
+        // scratch: the net change to `present_halo[c]` this iteration; a cell is dirty iff
+        // its delta ends non-zero (a net rerouted to the SAME path cancels to zero and is
+        // correctly NOT marked). Both stay empty/zero when clearance is inactive.
+        let mut halo_dirty: Vec<bool> = vec![false; n_cells];
+        let mut halo_dirty_cells: Vec<CellIdx> = Vec::new();
+        let mut halo_delta: Vec<i32> = vec![0; n_cells];
+        let mut halo_touched_cells: Vec<CellIdx> = Vec::new();
 
         // Per-iteration overuse scratch, allocated once and cleared incrementally
         // (via the touched-cell lists) so no iteration pays an O(all cells) memset.
@@ -393,23 +428,43 @@ impl Router for NegotiatedRouter {
         for iter in 0..MAX_ITERS {
             let pfac: u32 = 1 + iter;
 
-            if clearance_active {
+            if use_parallel {
                 // ---- Snapshot-based (Jacobi-style) PARALLEL negotiation ----
                 //
-                // When clearance is active the incremental quiescence skip is unsound
-                // (a net's price can shift because a NEIGHBOUR's halo moved, which
-                // `prev_overused` does not capture), so every net reroutes each
-                // iteration anyway — making the work embarrassingly parallel. We take
-                // `present`/`present_halo` (and `history`, already iteration-stable) as
-                // a READ-ONLY snapshot: every net prices against the occupancy from the
-                // END of the previous iteration, not within-iteration updates. The nets
-                // are routed in parallel with rayon; results are MERGED back into the
-                // shared state SEQUENTIALLY in net-index order, so the outcome is
-                // independent of thread scheduling (deterministic). This is a standard,
-                // correct PathFinder variant (Jacobi vs Gauss-Seidel); it may converge
-                // to a different-but-equivalent route than the sequential path, which is
-                // fine for the clearance path. `clearance_active` is FALSE for the
-                // default router, so this branch never affects the byte-identical path.
+                // Every DIRTY net reroutes against a READ-ONLY snapshot of
+                // `present`/`present_halo`/`history` (occupancy from the END of the
+                // previous iteration); clean nets keep their path and their existing
+                // contribution to the occupancy maps. Dirty nets are routed in parallel
+                // with rayon and MERGED back SEQUENTIALLY in net-index order, so the
+                // outcome is independent of thread scheduling (deterministic). This is a
+                // standard PathFinder variant (Jacobi vs Gauss-Seidel) and may converge
+                // to a different-but-equivalent route than the sequential path. This
+                // branch runs for the clearance path and for large non-clearance boards
+                // (`n_nets > PARALLEL_NEGOTIATION_THRESHOLD`); small non-clearance boards
+                // stay on the sequential path, so their byte-identical output is unchanged.
+                //
+                // DIRTY SET: a net needs rerouting when it is unrouted, or its path
+                // touches a cell that was over-used (`prev_overused`) or whose
+                // `present_halo` changed (`halo_dirty`) during the previous iteration.
+                // Anything else is unaffected (its priced costs are unchanged) and is
+                // skipped — cutting later iterations from O(all nets) to O(congested).
+                // Gated to >8 nets so the small deterministic tests keep full reroute.
+                let dirty: Vec<usize> = (0..n_nets)
+                    .filter(|&i| {
+                        n_nets <= 8
+                            || iter == 0
+                            || paths[i].is_empty()
+                            || paths[i]
+                                .iter()
+                                .any(|&c| prev_overused[c as usize] || halo_dirty[c as usize])
+                    })
+                    .collect();
+                // Reset the previous iteration's `halo_dirty` set now that we have
+                // consumed it; the merge below repopulates it for the next iteration.
+                for &c in &halo_dirty_cells {
+                    halo_dirty[c as usize] = false;
+                }
+                halo_dirty_cells.clear();
                 let clearance_cells = self.clearance_cells;
                 // Borrow the snapshots immutably for the duration of the parallel map.
                 // Each worker thread keeps its OWN reusable `SearchBuf` + `PadSet`
@@ -422,11 +477,11 @@ impl Router for NegotiatedRouter {
                 let nets_ref = nets;
                 let windows_ref = &windows;
                 let via_ref = &via_model;
-                let mut routed_paths: Vec<(usize, Option<Vec<CellIdx>>)> = (0..n_nets)
-                    .into_par_iter()
+                let mut routed_paths: Vec<(usize, Option<Vec<CellIdx>>)> = dirty
+                    .par_iter()
                     .map_init(
                         || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
-                        |(buf, pad_set), i| {
+                        |(buf, pad_set), &i| {
                             let net = &nets_ref[i];
                             pad_set.load(&net.passable_pads);
                             // Route within the net's window; on failure, retry once on
@@ -464,13 +519,26 @@ impl Router for NegotiatedRouter {
                         },
                     )
                     .collect();
-                // Deterministic merge: sort by net index, then rebuild `present` /
-                // `present_halo` from ALL new paths in index order so the next
-                // iteration's snapshot is identical regardless of scheduling.
+                // Deterministic INCREMENTAL merge: process the rerouted (dirty) nets in
+                // net-index order, each subtracting its OLD path/halo and adding its NEW
+                // path/halo from the shared maps (clean nets are left untouched). Counts
+                // are commutative so the result is identical regardless of scheduling and
+                // matches a full rebuild. `halo_delta` accumulates the net change to
+                // `present_halo`; a cell whose delta ends non-zero is recorded into the
+                // next iteration's `halo_dirty` set (a reroute to the SAME path cancels
+                // to zero and is correctly NOT marked, which is what lets the dirty set
+                // shrink to the congested region and the iteration cost collapse).
                 routed_paths.sort_unstable_by_key(|(i, _)| *i);
-                present.iter_mut().for_each(|c| *c = 0);
-                present_halo.iter_mut().for_each(|c| *c = 0);
                 for (i, path) in routed_paths {
+                    // Remove the old path's copper + halo (the net's prior contribution).
+                    for &c in &paths[i] {
+                        present[c as usize] = present[c as usize].saturating_sub(1);
+                    }
+                    for_each_halo_cell(dims, grid, &paths[i], clearance_cells, &via_model, |c| {
+                        present_halo[c as usize] = present_halo[c as usize].saturating_sub(1);
+                        halo_delta[c as usize] -= 1;
+                        halo_touched_cells.push(c);
+                    });
                     match path {
                         Some(path) => {
                             for &c in &path {
@@ -485,6 +553,8 @@ impl Router for NegotiatedRouter {
                                 |c| {
                                     present_halo[c as usize] =
                                         present_halo[c as usize].saturating_add(1);
+                                    halo_delta[c as usize] += 1;
+                                    halo_touched_cells.push(c);
                                 },
                             );
                             paths[i] = path;
@@ -495,6 +565,21 @@ impl Router for NegotiatedRouter {
                         }
                     }
                 }
+                // Finalize the halo-dirty set for the next iteration: any touched cell
+                // whose net delta is non-zero changed and is marked dirty; reset the
+                // delta scratch via the touched list (no O(all cells) memset). Touched
+                // cells may repeat — the delta read + reset makes the marking idempotent.
+                for &c in &halo_touched_cells {
+                    let d = &mut halo_delta[c as usize];
+                    if *d != 0 {
+                        *d = 0;
+                        if !halo_dirty[c as usize] {
+                            halo_dirty[c as usize] = true;
+                            halo_dirty_cells.push(c);
+                        }
+                    }
+                }
+                halo_touched_cells.clear();
             } else {
                 // ---- Sequential incremental negotiation (clearance INACTIVE) ----
                 // Verbatim pre-parallel behaviour; kept byte-identical. `clearance_active`
@@ -643,7 +728,6 @@ impl Router for NegotiatedRouter {
                 break; // converged: cell-disjoint across groups
             }
         }
-
         // ---- Order-robust legalization ----
         //
         // Legalization commits whole connection groups, one at a time, in a chosen
@@ -667,34 +751,50 @@ impl Router for NegotiatedRouter {
         let mut alone_path: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
         {
             // No foreign occupancy here; the alone-path is the net by itself on the
-            // base grid. Route within the window first, full board on failure.
+            // base grid (route within the window first, full board on failure). Each
+            // net's search is INDEPENDENT and pure over the read-only grid, so they run
+            // in PARALLEL with rayon — per-thread `SearchBuf`/`PadSet` scratch via
+            // `map_init`, results collected over the indexed range so they land in net
+            // order regardless of scheduling (byte-identical to the old serial loop).
+            // This loop was previously the dominant single-threaded phase of a full
+            // route (every net, plus the occasional expensive full-board fallback).
             let no_owner: Vec<i64> = Vec::new();
             let no_halo: Vec<i64> = Vec::new();
-            for i in 0..n_nets {
-                let net = &nets[i];
-                pad_set.load(&net.passable_pads);
-                let routed = route_legal(
-                    &mut buf, grid, &pad_set, &no_owner, &no_halo, -1, net.src, net.dst,
-                    windows[i], &via_model,
+            let alone: Vec<(Cost, Vec<CellIdx>)> = (0..n_nets)
+                .into_par_iter()
+                .map_init(
+                    || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
+                    |(buf, pad_set), i| {
+                        let net = &nets[i];
+                        pad_set.load(&net.passable_pads);
+                        let routed = route_legal(
+                            buf, grid, pad_set, &no_owner, &no_halo, -1, net.src, net.dst,
+                            windows[i], &via_model,
+                        )
+                        .or_else(|| {
+                            route_legal(
+                                buf,
+                                grid,
+                                pad_set,
+                                &no_owner,
+                                &no_halo,
+                                -1,
+                                net.src,
+                                net.dst,
+                                Window::full(dims),
+                                &via_model,
+                            )
+                        });
+                        match routed {
+                            Some((path, _)) => (unit_cost(&path), path),
+                            None => (0, Vec::new()),
+                        }
+                    },
                 )
-                .or_else(|| {
-                    route_legal(
-                        &mut buf,
-                        grid,
-                        &pad_set,
-                        &no_owner,
-                        &no_halo,
-                        -1,
-                        net.src,
-                        net.dst,
-                        Window::full(dims),
-                        &via_model,
-                    )
-                });
-                if let Some((path, _)) = routed {
-                    alone_len[i] = unit_cost(&path);
-                    alone_path[i] = path;
-                }
+                .collect();
+            for (i, (len, path)) in alone.into_iter().enumerate() {
+                alone_len[i] = len;
+                alone_path[i] = path;
             }
         }
 
@@ -721,8 +821,20 @@ impl Router for NegotiatedRouter {
             o.sort_by_key(|&g| std::cmp::Reverse(group_alone[g]));
             candidates.push(o);
         }
-        // 4. For few groups, exhaustively try every order (≤ 7! = 5040).
-        if n_groups <= 7 {
+        // 4. For few groups, exhaustively try every order (≤ 5! = 120).
+        //
+        // The cap is deliberately at 5, not the group count itself: each extra order is
+        // a FULL `legalize_in_order` pass (routes every net), so the candidate count
+        // multiplies the legalization cost. The factorial makes 6 groups = 720 passes
+        // and 7 = 5040 — on real multi-net boards (e.g. tscircuit `keyboards`) that is
+        // ~15–30 s of (already parallel, ~9-core) work per solve for NO completion gain:
+        // the 3 heuristic orders above plus the rip-up stage already recover the same
+        // routable nets the exhaustive search finds. Capping 6–7 group boards to the
+        // heuristics cuts those solves ~18× (≈30 s → ≈1.7 s) with identical routed
+        // counts. (An earlier experiment ADDING random orders beyond exhaustive also
+        // REGRESSED DRC quality — the `(routed, unit_cost)` selection metric is not
+        // clearance-aligned — so more orders is never the answer; fewer is.)
+        if n_groups <= 5 {
             for perm in permutations(&base_order) {
                 candidates.push(perm);
             }
@@ -788,7 +900,6 @@ impl Router for NegotiatedRouter {
                 best_idx = Some(*idx);
             }
         }
-
         let (best_routed, best_order, multi_committed) = match best_idx {
             Some(idx) => {
                 let routed = best.as_ref().map(|b| b.0).unwrap_or(0);
@@ -824,6 +935,7 @@ impl Router for NegotiatedRouter {
                 &alone_path,
                 &windows,
                 &best_order,
+                &multi_committed,
                 n_cells,
                 &via_model,
                 self.clearance_cells,
@@ -837,7 +949,6 @@ impl Router for NegotiatedRouter {
         } else {
             multi_committed
         };
-
         // Assemble in input net order for determinism.
         let mut results: Vec<RouteResult> = Vec::new();
         let mut unrouted: Vec<String> = Vec::new();
@@ -1304,78 +1415,166 @@ fn legalize_in_order(
     // (cleared per group) to avoid an O(n_cells) sweep.
     let mut group_members: Vec<usize> = Vec::new();
 
-    for &g in group_order {
-        let gi = g as i64;
-        // Members of this group, in input net order for determinism.
-        for i in 0..n_nets {
-            if group_ids[i] != g {
-                continue;
+    // ---- Serial-equivalent staging for within-candidate parallelism ----
+    //
+    // Groups commit sequentially because each group's copper blocks later ones. But
+    // two groups whose search regions are spatially DISJOINT can never affect each
+    // other's *windowed* route, so they can be routed in PARALLEL and committed in any
+    // order with the identical result. We assign each group a stage = 1 + the max
+    // stage of any earlier-order group it spatially conflicts with (bounding boxes,
+    // inflated by the clearance/via-keepout radius). Groups in the same stage are
+    // mutually disjoint; we route all their nets in parallel against the owner/halo
+    // from prior stages, then commit per group in `group_order` (deterministic).
+    //
+    // Windowed routes are byte-identical to the sequential router (a disjoint group's
+    // cells are never in this net's window, so its commit order is irrelevant). The
+    // rare full-board FALLBACK reads outside the window, so those nets are handled
+    // SERIALLY in stage order (phase B) — deterministic, and they only differ from the
+    // pure-sequential order in the uncommon global-net case, which the best-of-orders
+    // pass and rip-up downstream absorb.
+    let n_groups_total = group_ids.iter().map(|&g| g + 1).max().unwrap_or(0);
+    let mut group_nets: Vec<Vec<usize>> = vec![Vec::new(); n_groups_total];
+    for i in 0..n_nets {
+        group_nets[group_ids[i]].push(i);
+    }
+    // Group bounding boxes (union of member windows). `None` = group with no nets.
+    let gbox: Vec<Option<(u32, u32, u32, u32)>> = (0..n_groups_total)
+        .map(|g| {
+            let mut members = group_nets[g].iter();
+            let first = members.next()?;
+            let w = &windows[*first];
+            let mut b = (w.x0, w.y0, w.x1, w.y1);
+            for &i in members {
+                let w = &windows[i];
+                b.0 = b.0.min(w.x0);
+                b.1 = b.1.min(w.y0);
+                b.2 = b.2.max(w.x1);
+                b.3 = b.3.max(w.y1);
             }
-            let net = &nets[i];
+            Some(b)
+        })
+        .collect();
+    let infl = clearance_cells.max(via_model.keepout);
+    let conflict = |a: usize, b: usize| -> bool {
+        match (gbox[a], gbox[b]) {
+            (Some(a), Some(b)) => {
+                let ax0 = a.0.saturating_sub(infl);
+                let ay0 = a.1.saturating_sub(infl);
+                let (ax1, ay1) = (a.2 + infl, a.3 + infl);
+                let bx0 = b.0.saturating_sub(infl);
+                let by0 = b.1.saturating_sub(infl);
+                let (bx1, by1) = (b.2 + infl, b.3 + infl);
+                !(ax1 < bx0 || bx1 < ax0 || ay1 < by0 || by1 < ay0)
+            }
+            _ => false,
+        }
+    };
+    let mut stage: Vec<usize> = vec![0; n_groups_total];
+    for (oi, &g) in group_order.iter().enumerate() {
+        let mut s = 0;
+        for &g2 in &group_order[..oi] {
+            if conflict(g, g2) {
+                s = s.max(stage[g2] + 1);
+            }
+        }
+        stage[g] = s;
+    }
+    let max_stage = group_order.iter().map(|&g| stage[g]).max().unwrap_or(0);
 
-            // Prefer the negotiated path only if it avoids every foreign-group cell —
-            // both committed copper (`owner`) AND clearance halo (`halo`). A path that
-            // would sit in a foreign halo is rerouted via `route_legal`, which prefers
-            // clearance-legal cells (soft penalty) but still routes through the halo as
-            // a last resort rather than dropping the net. Endpoints are not exempt:
-            // distinct groups may never share copper.
-            let cur = &paths[i];
-            let clean = !cur.is_empty()
-                && cur.iter().all(|&c| {
-                    let o = owner[c as usize];
-                    let h = halo[c as usize];
-                    (o < 0 || o == gi) && (h < 0 || h == gi)
-                });
-
-            let chosen = if clean {
-                Some(cur.clone())
-            } else {
-                pad_set.load(&net.passable_pads);
-                route_legal(
-                    buf, grid, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i], via_model,
-                )
-                .or_else(|| {
-                    route_legal(
-                        buf,
+    for s in 0..=max_stage {
+        let batch: Vec<usize> = group_order
+            .iter()
+            .copied()
+            .filter(|&g| stage[g] == s)
+            .collect();
+        if batch.is_empty() {
+            continue;
+        }
+        // Nets of this stage in (group_order-within-batch, input) order, matching the
+        // phase-B iteration below so the parallel results line up by position.
+        let batch_nets: Vec<usize> = batch
+            .iter()
+            .flat_map(|&g| group_nets[g].iter().copied())
+            .collect();
+        // Phase A (parallel): clean-reuse or WINDOWED route against owner/halo from
+        // prior stages. Per-thread scratch via `map_init`; reads only `&` snapshots.
+        let owner_ref: &[i64] = &owner;
+        let halo_ref: &[i64] = &halo;
+        let mut phase_a: Vec<Option<Vec<CellIdx>>> = batch_nets
+            .par_iter()
+            .map_init(
+                || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
+                |(b, ps), &i| {
+                    let gi = group_ids[i] as i64;
+                    let net = &nets[i];
+                    let cur = &paths[i];
+                    let clean = !cur.is_empty()
+                        && cur.iter().all(|&c| {
+                            let o = owner_ref[c as usize];
+                            let h = halo_ref[c as usize];
+                            (o < 0 || o == gi) && (h < 0 || h == gi)
+                        });
+                    if clean {
+                        Some(cur.clone())
+                    } else {
+                        ps.load(&net.passable_pads);
+                        route_legal(
+                            b, grid, ps, owner_ref, halo_ref, gi, net.src, net.dst, windows[i],
+                            via_model,
+                        )
+                        .map(|(p, _)| p)
+                    }
+                },
+            )
+            .collect();
+        // Phase B (serial, group_order): commit; nets that failed the windowed route
+        // get the full-board fallback now, against owner incl. earlier same-stage
+        // groups. Stamp each group's owner/halo only after the whole group commits.
+        let mut k = 0;
+        for &g in &batch {
+            let gi = g as i64;
+            for &i in &group_nets[g] {
+                let chosen = match std::mem::take(&mut phase_a[k]) {
+                    Some(p) => Some(p),
+                    None => {
+                        pad_set.load(&nets[i].passable_pads);
+                        route_legal(
+                            buf,
+                            grid,
+                            pad_set,
+                            &owner,
+                            &halo,
+                            gi,
+                            nets[i].src,
+                            nets[i].dst,
+                            Window::full(dims),
+                            via_model,
+                        )
+                        .map(|(p, _)| p)
+                    }
+                };
+                if let Some(path) = chosen {
+                    committed[i] = Some(path);
+                    group_members.push(i);
+                }
+                k += 1;
+            }
+            for &i in &group_members {
+                if let Some(path) = &committed[i] {
+                    stamp_owner(
+                        &mut owner,
+                        &mut halo,
                         grid,
-                        pad_set,
-                        &owner,
-                        &halo,
+                        dims,
+                        path,
                         gi,
-                        net.src,
-                        net.dst,
-                        Window::full(dims),
+                        clearance_cells,
                         via_model,
-                    )
-                })
-                .map(|(p, _)| p)
-            };
-
-            if let Some(path) = chosen {
-                committed[i] = Some(path);
-                group_members.push(i);
+                    );
+                }
             }
+            group_members.clear();
         }
-
-        // Fold this group's committed paths into the owner map (path cells + the
-        // clearance/via-keepout halo) only now that the whole group is placed, so
-        // a sibling's halo never blocked another sibling's route. Same-group halos
-        // are idempotent (they re-own to `gi`). Reset the per-group scratch.
-        for &i in &group_members {
-            if let Some(path) = &committed[i] {
-                stamp_owner(
-                    &mut owner,
-                    &mut halo,
-                    grid,
-                    dims,
-                    path,
-                    gi,
-                    clearance_cells,
-                    via_model,
-                );
-            }
-        }
-        group_members.clear();
     }
 
     committed
@@ -1414,6 +1613,7 @@ fn ripup_legalize(
     alone_path: &[Vec<CellIdx>],
     windows: &[Window],
     seed_group_order: &[usize],
+    seed_committed: &Committed,
     n_cells: usize,
     via_model: &ViaModel,
     clearance_cells: u32,
@@ -1434,13 +1634,34 @@ fn ripup_legalize(
         .collect();
     let routable: Vec<bool> = (0..n_nets).map(|i| !alone_path[i].is_empty()).collect();
 
-    let mut committed: Committed = vec![None; n_nets];
+    // SEED from the best multi-order legalization instead of re-routing every net
+    // from scratch: the parallel multi-order pass already committed most nets, so we
+    // start from its solution and only work the genuinely-stranded residue. This
+    // skips the (serial, ~O(n_nets) `route_legal`) clean-route pass that otherwise
+    // dominated this stage. Owner/halo below are stamped to match the seed. The result
+    // can only ADD nets (via rips), so it never routes fewer than the seed.
+    let mut committed: Committed = seed_committed.clone();
     // Owning group per committed COPPER cell, or -1 for free: a foreign-group copper
     // cell is a HARD obstacle for net i. Owning group per clearance-HALO cell, or -1:
     // a foreign-group halo cell is a SOFT cost (CLEARANCE_PENALTY) in `route_legal`,
     // never a hard block, so a stranded net routes through the halo as a last resort.
     let mut owner: Vec<i64> = vec![-1; n_cells];
     let mut halo: Vec<i64> = vec![-1; n_cells];
+    // Stamp the seeded commits into owner/halo so the residue routes against them.
+    for (i, slot) in committed.iter().enumerate() {
+        if let Some(path) = slot {
+            stamp_owner(
+                &mut owner,
+                &mut halo,
+                grid,
+                dims,
+                path,
+                group_ids[i] as i64,
+                clearance_cells,
+                via_model,
+            );
+        }
+    }
 
     let mut rip_count: Vec<usize> = vec![0; n_nets];
     let global_budget = RIPUP_GLOBAL_BUDGET_PER_NET * n_nets.max(1);
@@ -1457,6 +1678,29 @@ fn ripup_legalize(
             }
         }
     }
+    // ROUND-BASED NO-PROGRESS EARLY-EXIT. The rip-up loop otherwise grinds until the
+    // global rip budget (thousands of rips) is exhausted, because a few mutually-
+    // contended nets ping-pong (A rips B, re-enqueued B rips A, …) — each cycle an
+    // expensive *failing* A* that commits nothing net-new. We mark round boundaries
+    // with a sentinel pushed to the back of the queue: re-enqueues during a round
+    // land BEHIND the sentinel (next round). When the sentinel surfaces we compare
+    // the committed count to the best seen; a round that did not strictly increase it
+    // cannot make progress on an identical later pass, so we stop. Productive rounds
+    // (which place a net) strictly raise the count, so there are at most `n_nets` of
+    // them → fast, bounded termination. The `accept-if-better` gate at the call site
+    // means stopping early can at worst fall back to `multi_committed` (never worse).
+    // Deterministic: the sentinel and count are pure functions of queue contents.
+    const ROUND_MARK: usize = usize::MAX;
+    // How many consecutive break-even rounds (committed count unchanged) to tolerate
+    // before giving up. A genuine rescue rips a blocker in one round (count breaks
+    // even: −victim +stranded) and re-places the blocker in the NEXT round (count
+    // rises), so we must allow at least one break-even round; oscillating ping-pong
+    // also breaks even, so we cap it. Two is the minimum that admits a one-round
+    // rip→replace gap while still bounding the ping-pong.
+    const MAX_EVEN_ROUNDS: usize = 2;
+    queue.push_back(ROUND_MARK);
+    let mut best_count = committed.iter().filter(|c| c.is_some()).count();
+    let mut even_rounds = 0usize;
 
     // Free every cell currently owned by group `g` — both the committed path cells
     // AND their clearance / via-keepout halo (via `free_owner`, the symmetric
@@ -1485,6 +1729,30 @@ fn ripup_legalize(
     };
 
     while let Some(i) = queue.pop_front() {
+        // Round boundary: stop unless this round committed strictly more nets.
+        if i == ROUND_MARK {
+            if queue.is_empty() {
+                break;
+            }
+            let cur = committed.iter().filter(|c| c.is_some()).count();
+            if cur > best_count {
+                // Progress: a new high-water of committed nets. Keep going.
+                best_count = cur;
+                even_rounds = 0;
+                queue.push_back(ROUND_MARK);
+                continue;
+            }
+            if cur == best_count && even_rounds + 1 < MAX_EVEN_ROUNDS {
+                // Break-even: could be a rip awaiting its re-placement next round.
+                // Allow a bounded number before concluding it is unproductive churn.
+                even_rounds += 1;
+                queue.push_back(ROUND_MARK);
+                continue;
+            }
+            // Net loss (rips freed more than they placed) or too many break-even
+            // rounds: unproductive. Stop; the accept-if-better gate keeps the seed.
+            break;
+        }
         // If already committed (e.g. re-enqueued then satisfied earlier), skip.
         if committed[i].is_some() {
             continue;
