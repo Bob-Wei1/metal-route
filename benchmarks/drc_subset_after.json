@@ -1,0 +1,296 @@
+{
+  "design": "fixture",
+  "total_nets": 40,
+  "routed_nets": 39,
+  "fully_connected": 19,
+  "vias": 79,
+  "clearance_mm": 0.15,
+  "summary": {
+    "total": 178,
+    "clearance": 178,
+    "via_through_plane": 0,
+    "annular_ring": 0
+  },
+  "violations": [
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.1168,
+        -143.53750000000002
+      ],
+      "nets": [
+        "-5VA~tap1",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.1168,
+        -143.4625
+      ],
+      "nets": [
+        "-5VA~tap1",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.225,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.1168,
+        -129.8625
+      ],
+      "nets": [
+        "-5VA~tap0",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.225,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.1918,
+        -143.6125
+      ],
+      "nets": [
+        "-5VA~tap1",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.1918,
+        -129.8625
+      ],
+      "nets": [
+        "-5VA~tap0",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        96.2668,
+        -130.6125
+      ],
+      "nets": [
+        "-5VA~tap0",
+        "TP_/FTracker_MCU/P0.02"
+      ],
+      "measured": 0.016399999999992948,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.33555,
+        -142.8375
+      ],
+      "nets": [
+        "",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": 0.11232619228280119,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.33555,
+        -129.7375
+      ],
+      "nets": [
+        "TP_+1V8",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": 0.10860000000001832,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.41055,
+        -129.7375
+      ],
+      "nets": [
+        "TP_+1V8",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.04139999999999304,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.48555,
+        -130.9875
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.09"
+      ],
+      "measured": 0.12660910113365434,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.56055,
+        -129.7375
+      ],
+      "nets": [
+        "TP_+1V8",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.63555,
+        -144.9625
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.09"
+      ],
+      "measured": 0.07500000000003411,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.63555,
+        -144.8125
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.09"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.63555,
+        -144.7375
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.09"
+      ],
+      "measured": -0.225,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.63555,
+        -144.4875
+      ],
+      "nets": [
+        "TP_+3.3V",
+        "TP_/FTracker_MCU/P0.02"
+      ],
+      "measured": 0.12500000000002273,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.63555,
+        -131.63750000000002
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.30"
+      ],
+      "measured": -0.1250000000000341,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.69999999999999,
+        -131.75000000000003
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.30"
+      ],
+      "measured": 0.12426406871191445,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.69999999999999,
+        -131.75000000000003
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.30"
+      ],
+      "measured": 0.12426406871191445,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.71055,
+        -131.63750000000002
+      ],
+      "nets": [
+        "TP_/FTracker_MCU/P0.02",
+        "TP_/FTracker_MCU/P0.30"
+      ],
+      "measured": 0.024999999999965897,
+      "required": 0.15
+    },
+    {
+      "class": "clearance",
+      "layer": 0,
+      "location": [
+        97.71055,
+        -129.7375
+      ],
+      "nets": [
+        "TP_+1V8",
+        "TP_/FTracker_MCU/P0.10"
+      ],
+      "measured": -0.075,
+      "required": 0.15
+    }
+  ]
+}
