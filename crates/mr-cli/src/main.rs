@@ -6,8 +6,8 @@
 use anyhow::Result;
 use clap::Parser;
 use mr_cli::{
-    bench::run_bench, drc::run_drc, run_handoff, run_project, run_route, run_route_dsn, Cli,
-    Command,
+    bench::run_bench, corpus::run_corpus, drc::run_drc, run_handoff, run_project, run_route,
+    run_route_dsn, Cli, Command,
 };
 
 fn main() -> Result<()> {
@@ -103,6 +103,32 @@ fn main() -> Result<()> {
                 r.summary.clearance,
                 r.summary.via_through_plane,
                 r.summary.annular_ring,
+            );
+        }
+        Command::BenchCorpus(args) => {
+            let report = run_corpus(args)?;
+            eprintln!();
+            for g in &report.groups {
+                eprintln!(
+                    "corpus {:<14} {:>3} boards  {:>4}/{:<4} nets  {:>5.1}%  {}/{} fully routed  {:.1}s",
+                    g.name,
+                    g.boards,
+                    g.nets_routed,
+                    g.nets_total,
+                    g.completion_rate * 100.0,
+                    g.fully_routed_boards,
+                    g.boards,
+                    g.total_wall_ms / 1000.0,
+                );
+            }
+            eprintln!(
+                "TOTAL: {} boards, {}/{} nets routed ({:.1}% completion), {} fully routed, {:.0} nets/sec",
+                report.boards,
+                report.nets_routed,
+                report.nets_total,
+                report.completion_rate * 100.0,
+                report.fully_routed_boards,
+                report.nets_per_sec,
             );
         }
     }

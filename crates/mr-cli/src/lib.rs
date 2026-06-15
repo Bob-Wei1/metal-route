@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod bench;
+pub mod corpus;
 pub mod drc;
 use std::collections::HashMap;
 
@@ -61,6 +62,9 @@ pub enum Command {
     /// Route a Specctra `.dsn` board, run the native DRC checker, and report (and
     /// optionally write) a violation report.
     Drc(drc::DrcArgs),
+    /// Route the vendored corpus of real circuit-derived boards (`benchmarks/corpus/`),
+    /// report per-board completion, and optionally render an SVG gallery.
+    BenchCorpus(corpus::CorpusArgs),
 }
 
 /// Arguments for the `handoff` subcommand (M5 Freerouting bridge).

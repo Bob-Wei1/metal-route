@@ -50,6 +50,9 @@ metalroute project --width 256 --height 256 --nets 500
 # Run the local tscircuit-style benchmark and write the CPU baseline report
 metalroute bench --out benchmarks/cpu_baseline.json
 
+# Route the vendored real-board corpus + render an SVG gallery (see below)
+scripts/bench-corpus.sh                      # -> benchmarks/runs/<ts>-corpus/index.html
+
 # Serve the tscircuit solver protocol (for the official autorouting harness)
 mr-server --port 1234            # then: POST /solve {simple_route_json: ...}
 
@@ -114,6 +117,35 @@ favors the GPU is the regime where CPU completion is hardest. Better net orderin
 > `mr-server`'s `/solve` endpoint directly; when its npm package is available, point
 > it at a running `mr-server`. The local `bench` command is the reproducible
 > substitute.
+
+### Real-board corpus (`bench-corpus`)
+
+The synthetic `bench` generator is uniformly easy. For *real* routing difficulty,
+`metalroute bench-corpus` routes the boards vendored under
+[`benchmarks/corpus/`](benchmarks/corpus/MANIFEST.md) — **112 real circuit-derived
+problems** from [tscircuit/tscircuit-autorouter](https://github.com/tscircuit/tscircuit-autorouter)
+(MIT): the `srj15` multi-net region-reroute set plus 57 bug-report boards (real
+designs like arduino-uno, esp32-breakout, LGA15x4). Each file is a pure
+SimpleRouteJson, so there's no conversion step.
+
+```bash
+scripts/bench-corpus.sh            # build + route all + SVG gallery + report.json
+scripts/bench-corpus.sh srj15      # just one sub-corpus
+scripts/vendor-corpus.sh           # refresh the fixtures from upstream
+```
+
+Current baseline (`negotiated` router, per-board declared layers):
+
+| corpus | boards | net completion | fully routed |
+|--------|-------:|---------------:|-------------:|
+| `srj15` | 55 | **73.8%** (531/720) | 8/55 |
+| `bug-reports` | 57 | **73.8%** (1806/2447) | 24/57 |
+| **total** | **112** | **73.8%** (2337/3167) | 32/112 |
+
+The run writes a self-contained SVG gallery (`benchmarks/runs/<ts>-corpus/index.html`,
+gitignored) rendering obstacles, routed traces, and vias per board — failures
+sorted first — so regressions are eyeballable. The SVG renderer is dependency-free
+Rust (no Node), so it reproduces from a clean checkout.
 
 ## Reusable dependencies (consumed via shell-out)
 
