@@ -678,6 +678,7 @@ dependencies = [
  "mr-drc",
  "mr-ingest",
  "mr-srj",
+ "rayon",
  "serde",
  "serde_json",
 ]

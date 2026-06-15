@@ -264,7 +264,7 @@ const LINE_EPSILON: f64 = 1e-6;
 /// [`build_grid_lines`]) and, if still over, a warning is logged; the historical
 /// uniform grid sat around this magnitude, so dense BGAs don't silently blow up the
 /// search space.
-const CELL_BUDGET: usize = 40_000;
+const CELL_BUDGET: usize = 160_000;
 
 /// Build the non-uniform (Hanan-style) grid-line arrays for `srj` — the per-axis
 /// sorted, deduped continuous positions every grid node sits on (plan section 2).
