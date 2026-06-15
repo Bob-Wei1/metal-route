@@ -20,6 +20,36 @@ use mr_core::{CellIdx, Cost, Dims, Grid};
 /// Sentinel for "no predecessor / unreachable".
 pub(crate) const NO_PRED: CellIdx = CellIdx::MAX;
 
+/// Fixed-point scale converting a continuous (mm) geometric length into the integer
+/// [`Cost`] units the search adds up. One unit of geometric length costs
+/// `COST_SCALE`; a uniform unit-spaced grid (see [`mr_core::GridCoords::uniform`])
+/// therefore prices each planar step at exactly `COST_SCALE`.
+///
+/// Chosen equal to the negotiated router's base [`crate::SCALE`] (`16`) so that on a
+/// uniform grid a planar step still costs `16` — the congestion penalties layered in
+/// `negotiated.rs` keep their existing relative strength and the default router stays
+/// byte-identical. Large enough that distinct geometric lengths round to distinct
+/// integers at typical board pitches; small enough that long paths stay well below
+/// the `u32` ceiling ([`saturating_add`](u32::saturating_add) guards the rare
+/// overflow regardless).
+pub const COST_SCALE: f64 = 16.0;
+
+/// Round a continuous geometric `length` to fixed-point [`Cost`] units
+/// (`round(length * COST_SCALE)`). Deterministic (round-half-away-from-zero via
+/// [`f64::round`]) and saturating at the `u32` range so a degenerate/huge length can
+/// never wrap. Negative or non-finite lengths floor to `0`.
+#[inline]
+pub(crate) fn edge_cost(length: f64) -> Cost {
+    let scaled = (length * COST_SCALE).round();
+    if !scaled.is_finite() || scaled <= 0.0 {
+        0
+    } else if scaled >= Cost::MAX as f64 {
+        Cost::MAX
+    } else {
+        scaled as Cost
+    }
+}
+
 /// Result of a single-source Dijkstra expansion.
 pub(crate) struct DijkstraField {
     /// `dist[i]` is the cheapest cost to reach cell `i` (sum of `cost_at` over the
@@ -155,8 +185,12 @@ impl SearchBuf {
 /// cloning a grid and never doing an O(n) reset. Costs and passability are
 /// supplied on the fly:
 ///
-/// - `cost_fn(c)` is the step cost to ENTER cell `c` (added once per cell, like
-///   [`dijkstra`]'s `grid.cost_at(v)`).
+/// - `cost_fn(u, v)` is the cost of the planar EDGE from `u` to its 4-neighbour `v`
+///   (the price of the move, added once per step). It is edge-aware so a router can
+///   price a step by its real geometric length (`round(len * COST_SCALE)`) on a
+///   non-uniform grid, not just by a per-cell constant. On a uniform grid the length
+///   is the same for every step, so this reduces to a per-cell enter cost exactly
+///   like [`dijkstra`]'s `grid.cost_at(v)`. Mirrors `via_step(u, v)`'s shape.
 /// - `blocked_fn(c)` marks `c` impassable. The search never relaxes a blocked
 ///   neighbour; combined with a per-net window this keeps explored area local.
 /// - `heuristic(c)` is an admissible remaining-cost estimate to the goal (return
@@ -189,7 +223,7 @@ pub(crate) fn astar_buf<C, B, H, V>(
     via_step: V,
 ) -> Option<(Vec<CellIdx>, Cost)>
 where
-    C: Fn(CellIdx) -> Cost,
+    C: Fn(CellIdx, CellIdx) -> Cost,
     B: Fn(CellIdx) -> bool,
     H: Fn(CellIdx) -> Cost,
     V: Fn(CellIdx, CellIdx) -> Option<Cost>,
@@ -224,7 +258,8 @@ where
             if blocked_fn(v) {
                 return;
             }
-            let step = cost_fn(v);
+            // Edge-aware: price the move `u -> v`, not just entering `v`.
+            let step = cost_fn(u, v);
             let nd = du.saturating_add(step);
             if nd < buf.dist_of(v) {
                 // First-writer-wins: only set predecessor on a strict improvement.
@@ -358,7 +393,7 @@ mod tests {
                 dims,
                 src,
                 dst,
-                |c| grid.cost_at(c),
+                |_u, v| grid.cost_at(v),
                 |c| grid.is_obstacle(c),
                 h,
                 // Single-layer grid: no via neighbours, so this is never called.

@@ -148,9 +148,16 @@ async fn main() {
         }
     };
 
-    // Backend factory: a `NegotiatedRouter` at the per-problem clearance budget.
-    let make_router: RouterFactory =
-        Arc::new(|cc| Box::new(NegotiatedRouter::new().with_clearance_cells(cc)));
+    // Backend factory: a `NegotiatedRouter` at the per-problem clearance budget,
+    // fed the problem's non-uniform (Hanan) grid coords so its geometric A* cost +
+    // heuristic match the real cell spacing.
+    let make_router: RouterFactory = Arc::new(|mm, coords| {
+        Box::new(
+            NegotiatedRouter::new()
+                .with_clearance_mm(mm)
+                .with_coords(coords),
+        )
+    });
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
     let clr = match opts.clearance_mm {
         Some(0.0) => "off".to_string(),

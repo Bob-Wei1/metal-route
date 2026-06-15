@@ -164,6 +164,77 @@ impl Dims {
     }
 }
 
+/// The continuous (mm) positions of a board's grid lines, one sorted array per
+/// planar axis — the geometry a router needs to price a move by its real length
+/// rather than by a uniform unit hop.
+///
+/// A cell `(x, y)` sits ON the lines `(x_lines[x], y_lines[y])` (this is the
+/// non-uniform / Hanan model: line index == cell coordinate, line position == node
+/// coordinate). The geometric length of a planar A* step `a -> b` between two
+/// 4-neighbour cells is then `|x_lines[bx] - x_lines[ax]| + |y_lines[by] -
+/// y_lines[ay]|` — exactly one of the two terms is non-zero for an orthogonal step.
+///
+/// `dims.w == x_lines.len()` and `dims.h == y_lines.len()` is the load-bearing
+/// invariant; [`mr_srj::Mapping`](../mr_srj/struct.Mapping.html) builds the arrays
+/// and satisfies it. A router given no coords falls back to
+/// [`GridCoords::uniform`], where every step has unit length, so the geometric cost
+/// of a step is a constant `COST_SCALE` — byte-identical to the pre-geometric
+/// uniform-hop behaviour.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GridCoords {
+    /// Sorted continuous x positions of the grid lines; `len() == dims.w`.
+    pub x_lines: Vec<f64>,
+    /// Sorted continuous y positions of the grid lines; `len() == dims.h`.
+    pub y_lines: Vec<f64>,
+}
+
+impl GridCoords {
+    /// Build from explicit per-axis line arrays (e.g. an
+    /// [`mr_srj::Mapping`](../mr_srj/struct.Mapping.html)'s `x_lines` / `y_lines`).
+    /// The caller guarantees they are sorted ascending and match the routed grid's
+    /// `dims.w` / `dims.h`.
+    pub fn from_lines(x_lines: Vec<f64>, y_lines: Vec<f64>) -> Self {
+        Self { x_lines, y_lines }
+    }
+
+    /// Uniform unit-spaced coords for `dims`: line `i` sits at continuous position
+    /// `i`. Every planar step then has geometric length `1.0`, so a router's
+    /// geometric step cost is the constant `COST_SCALE` — reproducing the historical
+    /// uniform-hop pricing exactly. This is the default when a router is given no
+    /// real geometry.
+    pub fn uniform(dims: Dims) -> Self {
+        Self {
+            x_lines: (0..dims.w).map(|i| i as f64).collect(),
+            y_lines: (0..dims.h).map(|i| i as f64).collect(),
+        }
+    }
+
+    /// Continuous x of column `x`. Falls back to `x` itself (unit spacing) when the
+    /// array is shorter than the grid — a defensive guard so a coords/grid size
+    /// mismatch degrades to uniform pricing rather than panicking.
+    #[inline]
+    pub fn x_of(&self, x: u32) -> f64 {
+        self.x_lines.get(x as usize).copied().unwrap_or(x as f64)
+    }
+
+    /// Continuous y of row `y`. See [`GridCoords::x_of`].
+    #[inline]
+    pub fn y_of(&self, y: u32) -> f64 {
+        self.y_lines.get(y as usize).copied().unwrap_or(y as f64)
+    }
+
+    /// Geometric (Manhattan) distance in continuous units between two cells, using
+    /// their planar `(x, y)` line positions and ignoring the layer (every layer
+    /// shares the planar geometry). For two 4-neighbour cells this is the length of
+    /// the single orthogonal step between them.
+    #[inline]
+    pub fn manhattan_len(&self, dims: Dims, a: CellIdx, b: CellIdx) -> f64 {
+        let (ax, ay) = dims.xy(a);
+        let (bx, by) = dims.xy(b);
+        (self.x_of(ax) - self.x_of(bx)).abs() + (self.y_of(ay) - self.y_of(by)).abs()
+    }
+}
+
 /// The ordered names of a board's copper layers, index ↔ name. Layer 0 is the top
 /// copper, `len()-1` the bottom; inner layers sit between. This is the single place
 /// that maps the routing grid's integer layer axis to the layer *names* the

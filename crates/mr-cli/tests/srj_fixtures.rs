@@ -10,7 +10,8 @@
 
 use mr_core::{LayerMap, Router};
 use mr_cpu::NegotiatedRouter;
-use mr_srj::{rasterize_with_layers, SimpleRouteJson};
+use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, ViolationClass};
+use mr_srj::{rasterize_with_layers, to_solution_layered, RoutePoint, SimpleRouteJson};
 
 /// Default solve-layer budget mirrored from `mr_server::DEFAULT_SOLVE_LAYERS`.
 /// The live solver routes single-layer-declared problems on this many layers so
@@ -124,6 +125,142 @@ fn keyboards_fixture_routes_on_default_budget() {
     assert_eq!(
         multi, total,
         "every net should connect at 2 layers: {multi}/{total}"
+    );
+}
+
+/// NATIVE DRC, `track_w > clearance` regime: route a board whose trace width (0.3)
+/// exceeds its clearance (0.1) end-to-end through the live pipeline, build a physical
+/// `mr_drc::DrcBoard` from the routed copper + pads, and assert the native checker
+/// reports ZERO clearance violations.
+///
+/// This is the real-board analogue of the grid-level invariant in `mr-srj`
+/// (`track_gt_clearance_reserves_centreline_margin_zero_free_nodes`): the rasteriser
+/// now reserves `clearance + track_w/2` around foreign copper, so the centreline the
+/// router lays on a grid node is far enough that the 0.3-wide trace keeps full 0.1
+/// clearance to every foreign pad. Before the fix a centred trace could sit 0.233 from
+/// a pad edge → copper 0.083 away → a clearance violation; this guards against that.
+#[test]
+fn track_gt_clearance_routes_drc_clean_native_checker() {
+    // Two columns of three different-net pads, inner edges 0.7 apart so the rasteriser
+    // places fill lanes between them (the dangerous gap from the unit test), plus a
+    // routing target on the far side, forcing the router to thread the channel.
+    const SRJ: &str = r#"{
+        "minTraceWidth": 0.3,
+        "minClearance": 0.1,
+        "layerCount": 1,
+        "bounds": { "minX": 0, "maxX": 6, "minY": 0, "maxY": 6 },
+        "obstacles": [
+            { "type": "rect", "center": {"x": 2.0, "y": 2.0}, "width": 0.6, "height": 0.6, "connectedTo": ["a"] },
+            { "type": "rect", "center": {"x": 3.3, "y": 2.0}, "width": 0.6, "height": 0.6, "connectedTo": ["b"] },
+            { "type": "rect", "center": {"x": 2.0, "y": 4.0}, "width": 0.6, "height": 0.6, "connectedTo": ["a"] },
+            { "type": "rect", "center": {"x": 3.3, "y": 4.0}, "width": 0.6, "height": 0.6, "connectedTo": ["b"] }
+        ],
+        "connections": [
+            { "name": "a", "pointsToConnect": [ {"x": 2.0, "y": 2.0}, {"x": 2.0, "y": 4.0} ] },
+            { "name": "b", "pointsToConnect": [ {"x": 3.3, "y": 2.0}, {"x": 3.3, "y": 4.0} ] }
+        ]
+    }"#;
+    let srj: SimpleRouteJson = serde_json::from_str(SRJ).unwrap();
+    let trace_w = srj.min_trace_width.unwrap();
+    let clearance = srj.min_clearance.unwrap();
+    let resolution = choose_resolution(&srj);
+    // Same clearance_cells the CLI/server derive for the routing pipeline.
+    let clearance_cells = (clearance / resolution).ceil() as u32;
+    let layers = LayerMap::standard(1);
+    let problem = rasterize_with_layers(&srj, resolution, layers.clone(), clearance_cells);
+    // Route with the router's OWN negotiation clearance DISABLED (clearance_cells = 0),
+    // so DRC-cleanliness rests on the rasteriser's `clearance + track_w/2` grid blocking
+    // alone (not the router's separate clearance). The tight geometric guard that the
+    // dangerous nodes are gone is the mr-srj unit test
+    // `track_gt_clearance_reserves_centreline_margin_zero_free_nodes`; THIS test is the
+    // end-to-end confirmation that the live route → physical-board → native checker path
+    // reports ZERO clearance violations on a track_w>clearance board.
+    let board = NegotiatedRouter::new()
+        .route(&problem.grid, &problem.nets)
+        .expect("route");
+    let traces = to_solution_layered(&board, &problem.mapping, &problem.pin_points, trace_w, &layers);
+
+    // Build a physical DRC board: every routed wire vertex-pair → a Segment, every
+    // pad → a Pad (its own net). The net of a trace is the net of the two pads it
+    // joins; recover it by matching the trace's endpoints to a pad centre.
+    let mut segments: Vec<Segment> = Vec::new();
+    let pad_specs = [
+        ("a", 2.0, 2.0),
+        ("b", 3.3, 2.0),
+        ("a", 2.0, 4.0),
+        ("b", 3.3, 4.0),
+    ];
+    let net_at = |x: f64, y: f64| -> Option<&'static str> {
+        pad_specs
+            .iter()
+            .find(|(_, px, py)| (px - x).abs() <= 0.31 && (py - y).abs() <= 0.31)
+            .map(|(n, _, _)| *n)
+    };
+    for tr in &traces {
+        // Resolve the trace net from its first wire vertex.
+        let first = tr.route.iter().find_map(|p| match p {
+            RoutePoint::Wire { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        });
+        let net = first
+            .and_then(|(x, y)| net_at(x, y))
+            .unwrap_or("unknown")
+            .to_string();
+        let pts: Vec<(f64, f64, u32)> = tr
+            .route
+            .iter()
+            .filter_map(|p| match p {
+                RoutePoint::Wire { x, y, .. } => Some((*x, *y, 0u32)),
+                _ => None,
+            })
+            .collect();
+        for w in pts.windows(2) {
+            segments.push(Segment {
+                net: net.clone(),
+                layer: w[0].2,
+                a: (w[0].0, w[0].1),
+                b: (w[1].0, w[1].1),
+                width: trace_w,
+            });
+        }
+    }
+    let pads: Vec<Pad> = pad_specs
+        .iter()
+        .map(|(n, x, y)| Pad {
+            net: Some((*n).to_string()),
+            layer: 0,
+            center: (*x, *y),
+            width: 0.6,
+            height: 0.6,
+        })
+        .collect();
+
+    let drc = DrcBoard {
+        layers: vec![LayerKind::Signal],
+        segments,
+        pads,
+        vias: Vec::new(),
+        rules: DrcRules {
+            clearance,
+            plane_antipad: 0.0,
+            min_annular_ring: 0.0,
+        },
+    };
+    let violations = drc.check();
+    let clearance_viol: Vec<_> = violations
+        .iter()
+        .filter(|v| v.class == ViolationClass::Clearance)
+        .collect();
+    assert!(
+        clearance_viol.is_empty(),
+        "native DRC: {} clearance violation(s) on a track_w>clearance board: {:#?}",
+        clearance_viol.len(),
+        clearance_viol
+    );
+    // Sanity: the router actually laid copper (otherwise zero violations is vacuous).
+    assert!(
+        !drc.segments.is_empty(),
+        "expected routed copper to DRC-check"
     );
 }
 

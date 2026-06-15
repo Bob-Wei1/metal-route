@@ -12,11 +12,22 @@
 //!
 //! ## Coordinate mapping ([`Mapping`])
 //!
-//! The grid origin is the bounds minimum `(minX, minY)`. Each cell is a square of
-//! side `resolution` in continuous units. Grid dimensions are
-//! `ceil((maxX-minX)/res) × ceil((maxY-minY)/res)`, clamped to a minimum of 1×1 so
-//! degenerate / zero-area bounds still produce a usable single-cell grid. A cell's
-//! continuous *centre* is `(originX + (x+0.5)·res, originY + (y+0.5)·res)`.
+//! The grid is a **non-uniform / Hanan grid**: instead of a single scalar
+//! `resolution`, each axis carries a sorted array of continuous grid-line
+//! positions ([`Mapping::x_lines`] / [`Mapping::y_lines`]). A cell *is* a pair of
+//! line indices `(x, y)`, and its continuous coordinate sits exactly ON those lines
+//! — `cell_center((x,y)) = (x_lines[x], y_lines[y])` (no `+0.5`: nodes are on
+//! lines). Grid dimensions are line counts: `dims.w = x_lines.len()`,
+//! `dims.h = y_lines.len()`, each floored at 1 so degenerate / zero-area bounds
+//! still yield a usable single-cell grid.
+//!
+//! Each cell owns the half-open continuous region bounded by the midpoints between
+//! its line and its neighbours (a 1-D Voronoi partition). [`Mapping::new`] /
+//! [`Mapping::with_layers`] still take a scalar `resolution`; they build a
+//! *uniform* line set placed at the historical cell centres
+//! (`origin + (i+0.5)·res`), so the cell regions, [`Mapping::point_to_cell`] floor
+//! mapping, and obstacle coverage are byte-identical to the old uniform grid. Only
+//! the internal representation changed.
 //!
 //! ## Obstacles
 //!
@@ -36,7 +47,7 @@
 
 use std::collections::HashMap;
 
-use mr_core::{BoardRoute, CellIdx, Dims, Grid, LayerMap, NetEndpoints};
+use mr_core::{BoardRoute, CellIdx, Dims, Grid, GridCoords, LayerMap, NetEndpoints};
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -116,54 +127,73 @@ pub struct SimpleRouteJson {
 }
 
 /// Continuous ↔ grid-cell coordinate conversion. See module docs for the rules.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Mapping {
-    /// Continuous x of the grid origin = `bounds.min_x`.
-    pub origin_x: f64,
-    /// Continuous y of the grid origin = `bounds.min_y`.
-    pub origin_y: f64,
-    /// Side length of one (square) cell in continuous units.
-    pub resolution: f64,
-    /// Grid dimensions (≥ 1×1).
+    /// Sorted, deduped continuous x positions of the grid lines. Nodes sit ON
+    /// these lines; `dims.w == x_lines.len()`. Always non-empty (≥ 1 line).
+    pub x_lines: Vec<f64>,
+    /// Sorted, deduped continuous y positions of the grid lines. Nodes sit ON
+    /// these lines; `dims.h == y_lines.len()`. Always non-empty (≥ 1 line).
+    pub y_lines: Vec<f64>,
+    /// Grid dimensions (≥ 1×1). `dims.w == x_lines.len()`, `dims.h == y_lines.len()`.
     pub dims: Dims,
 }
 
 impl Mapping {
     /// Build a single-layer mapping for `bounds` at the given `resolution`.
     ///
-    /// Dimensions are `ceil(span / resolution)`, floored at 1 on each axis so a
-    /// zero- or negative-area bounds still yields a 1×1 grid. Use
-    /// [`Mapping::with_layers`] for a multi-layer board; this remains single-layer
-    /// so every existing 2D caller is byte-identical.
+    /// Lines are placed uniformly at the historical cell centres
+    /// (`origin + (i+0.5)·res`), with `ceil(span / resolution)` lines per axis,
+    /// floored at 1 so a zero- or negative-area bounds still yields a 1×1 grid.
+    /// Use [`Mapping::with_layers`] for a multi-layer board; this remains
+    /// single-layer so every existing 2D caller is byte-identical.
     pub fn new(bounds: &Bounds, resolution: f64) -> Self {
         Self::with_layers(bounds, resolution, 1)
     }
 
     /// Build a mapping for `bounds` at `resolution` over `layers` stacked planes.
+    ///
     /// The planar (x, y) sizing is identical to [`Mapping::new`]; only the layer
-    /// axis grows. `layers == 1` is byte-identical to [`Mapping::new`].
+    /// axis grows. `layers == 1` is byte-identical to [`Mapping::new`]. The line
+    /// arrays are a *uniform* set placed at the historical cell centres so cell
+    /// regions, the floor mapping, and obstacle coverage match the old uniform
+    /// grid exactly.
     pub fn with_layers(bounds: &Bounds, resolution: f64, layers: u32) -> Self {
         let span_x = (bounds.max_x - bounds.min_x).max(0.0);
         let span_y = (bounds.max_y - bounds.min_y).max(0.0);
         let w = ((span_x / resolution).ceil() as u32).max(1);
         let h = ((span_y / resolution).ceil() as u32).max(1);
+        let x_lines = uniform_lines(bounds.min_x, resolution, w);
+        let y_lines = uniform_lines(bounds.min_y, resolution, h);
+        Self::from_lines(x_lines, y_lines, layers)
+    }
+
+    /// Build a mapping directly from explicit sorted line arrays over `layers`
+    /// planes. Empty arrays are floored to a single line at 0.0 so `dims` stays
+    /// ≥ 1×1. The caller is responsible for the arrays being sorted ascending and
+    /// deduped; [`Mapping::with_layers`] and the grid-line builder satisfy this.
+    pub fn from_lines(mut x_lines: Vec<f64>, mut y_lines: Vec<f64>, layers: u32) -> Self {
+        if x_lines.is_empty() {
+            x_lines.push(0.0);
+        }
+        if y_lines.is_empty() {
+            y_lines.push(0.0);
+        }
+        let w = x_lines.len() as u32;
+        let h = y_lines.len() as u32;
         Self {
-            origin_x: bounds.min_x,
-            origin_y: bounds.min_y,
-            resolution,
+            x_lines,
+            y_lines,
             dims: Dims::with_layers(w, h, layers),
         }
     }
 
-    /// Continuous centre of cell `cell`. The layer is ignored — every layer shares
-    /// the same planar geometry — so a cell and its via-neighbour on another layer
-    /// map to the same continuous `(x, y)`.
+    /// Continuous coordinate of cell `cell` — the position of its grid lines. The
+    /// layer is ignored (every layer shares the same planar geometry), so a cell
+    /// and its via-neighbour on another layer map to the same continuous `(x, y)`.
     pub fn cell_center(&self, cell: CellIdx) -> (f64, f64) {
         let (x, y) = self.dims.xy(cell);
-        (
-            self.origin_x + (x as f64 + 0.5) * self.resolution,
-            self.origin_y + (y as f64 + 0.5) * self.resolution,
-        )
+        (self.x_lines[x as usize], self.y_lines[y as usize])
     }
 
     /// Layer of `cell` (0 == top). Always 0 for a single-layer mapping.
@@ -185,22 +215,397 @@ impl Mapping {
         self.dims.idx3(cx, cy, l)
     }
 
-    /// Cell `(x, y)` containing a continuous point, clamped into the grid.
+    /// Cell `(x, y)` whose Voronoi region contains a continuous point, clamped into
+    /// the grid. The region of line `i` is the half-open interval bounded by the
+    /// midpoints to its neighbours, so this is the index of the nearest line with
+    /// ties resolved toward the lower index (matching the historical `floor` mapping
+    /// on a uniform line set).
     fn point_to_xy(&self, point: (f64, f64)) -> (u32, u32) {
-        let fx = ((point.0 - self.origin_x) / self.resolution).floor();
-        let fy = ((point.1 - self.origin_y) / self.resolution).floor();
-        (clamp_index(fx, self.dims.w), clamp_index(fy, self.dims.h))
+        (
+            nearest_line(&self.x_lines, point.0),
+            nearest_line(&self.y_lines, point.1),
+        )
+    }
+
+    /// Upper (inclusive) x-cell index touched by a continuous box that ends at `hi`:
+    /// the largest region whose lower Voronoi boundary is strictly less than `hi`
+    /// (half-open, so a box edge exactly on a cell boundary does not spill into the
+    /// next cell). On a uniform line set this equals the old
+    /// `ceil((hi-origin)/res) - 1`.
+    fn x_cell_upper(&self, hi: f64) -> u32 {
+        cell_upper(&self.x_lines, hi)
+    }
+
+    /// Upper (inclusive) y-cell index touched by a box ending at `hi`. See
+    /// [`Mapping::x_cell_upper`].
+    fn y_cell_upper(&self, hi: f64) -> u32 {
+        cell_upper(&self.y_lines, hi)
     }
 }
 
-/// Clamp a (possibly out-of-range / non-finite) floating cell index into
-/// `[0, extent-1]`.
-fn clamp_index(f: f64, extent: u32) -> u32 {
-    if !f.is_finite() || f < 0.0 {
-        return 0;
+/// `count` uniformly spaced lines starting at the first cell centre
+/// `origin + 0.5·res` and stepping by `res` — the historical cell-centre
+/// positions for a uniform grid. `count` is the caller's already-floored
+/// dimension (≥ 1).
+fn uniform_lines(origin: f64, res: f64, count: u32) -> Vec<f64> {
+    (0..count)
+        .map(|i| origin + (i as f64 + 0.5) * res)
+        .collect()
+}
+
+/// Two grid lines closer than this (continuous units) are treated as coincident
+/// and collapsed during dedup, so near-coincident pad/obstacle coordinates do not
+/// produce degenerate zero-width cells. Chosen well below any realistic feature
+/// pitch (sub-micron on a mm board) so genuinely distinct features survive.
+const LINE_EPSILON: f64 = 1e-6;
+
+/// Soft ceiling on the planar cell count (`x_lines.len() · y_lines.len()`). When a
+/// problem's Hanan + fill line set would exceed this, fill lines are thinned (see
+/// [`build_grid_lines`]) and, if still over, a warning is logged; the historical
+/// uniform grid sat around this magnitude, so dense BGAs don't silently blow up the
+/// search space.
+const CELL_BUDGET: usize = 40_000;
+
+/// Build the non-uniform (Hanan-style) grid-line arrays for `srj` — the per-axis
+/// sorted, deduped continuous positions every grid node sits on (plan section 2).
+///
+/// Per axis the line set is the union of:
+/// * every **connection endpoint** coordinate (`points_to_connect`) — this is the
+///   line that makes each pad an *exact* grid node, which is the whole point: a
+///   pad's `cell_center` then equals its continuous coordinate, so the de-raster
+///   `pin_points` snap-back becomes an identity and the pad-exit wiggle disappears;
+/// * every **obstacle edge** (`center ± width/2`, `center ± height/2`) so obstacle
+///   boundaries align to lines and coverage is exact (no partial-cell obstacles);
+/// * the board **bounds** (`min`/`max`), so the grid spans the whole board.
+///
+/// Then **fill lines** are inserted into any gap between adjacent feature lines that
+/// exceeds `track_w + 2·clearance` (the minimum room for a routing channel between
+/// two features), subdividing the gap at ~that spacing so distant features still
+/// have lanes between them — the classic "track between pins" line. Finally the set
+/// is sorted and deduped (lines within [`LINE_EPSILON`] collapse).
+///
+/// `track_w` / `clearance` are the design-rule track width and copper clearance;
+/// `_layers` is accepted for symmetry with the rasteriser (the planar line set is
+/// layer-independent) but unused. The fill spacing and resulting cell count are
+/// capped against [`CELL_BUDGET`]; an over-budget result is logged but still
+/// returned (the router copes, just more slowly).
+fn build_grid_lines(
+    srj: &SimpleRouteJson,
+    _layers: u32,
+    track_w: f64,
+    clearance: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+
+    // Board bounds: the grid must span the whole board.
+    xs.push(srj.bounds.min_x);
+    xs.push(srj.bounds.max_x);
+    ys.push(srj.bounds.min_y);
+    ys.push(srj.bounds.max_y);
+
+    // Every endpoint coordinate — the lines that pin pads to exact nodes.
+    for conn in &srj.connections {
+        for p in &conn.points_to_connect {
+            xs.push(p.x);
+            ys.push(p.y);
+        }
     }
-    let max = extent.saturating_sub(1);
-    (f as u32).min(max)
+
+    // Every obstacle edge, so obstacle boxes land exactly on lines.
+    for obs in &srj.obstacles {
+        xs.push(obs.center.x - obs.width / 2.0);
+        xs.push(obs.center.x + obs.width / 2.0);
+        ys.push(obs.center.y - obs.height / 2.0);
+        ys.push(obs.center.y + obs.height / 2.0);
+    }
+
+    // `xs` / `ys` are now the *feature* lines (pads, obstacle edges, bounds): these
+    // are essential — dropping one moves a pad off-node and reintroduces the pad-exit
+    // wiggle — so the budget enforcement below never touches them.
+    sort_dedup(&mut xs);
+    sort_dedup(&mut ys);
+
+    // Routing-channel fill lines, computed separately so the budget enforcer can thin
+    // them without disturbing the feature lines. Every gap wide enough for a centred,
+    // clearance-legal track gets a midpoint lane (plus parallel lanes for wide gaps);
+    // gaps too tight for a clearance-legal lane get none (route goes around). See
+    // [`fill_gaps`] for the exact per-gap policy.
+    let mut x_fill = fill_lines(&xs, track_w, clearance);
+    let mut y_fill = fill_lines(&ys, track_w, clearance);
+
+    // ENFORCE the cell budget. The feature lines alone fix one factor of the
+    // `x·y` product per axis; we have a fill budget for the other. Thin the fill
+    // (coalescing near-coincident lanes, then dropping the least-important — densest-
+    // packed — lanes) until `xs·ys <= CELL_BUDGET`, keeping every feature line. If the
+    // feature lines alone already blow the budget, that is logged explicitly: no
+    // amount of fill thinning can help and we must not silently proceed as if fine.
+    enforce_budget(&xs, &ys, &mut x_fill, &mut y_fill);
+
+    xs.append(&mut x_fill);
+    ys.append(&mut y_fill);
+    sort_dedup(&mut xs);
+    sort_dedup(&mut ys);
+
+    (xs, ys)
+}
+
+/// Thin the per-axis fill-line sets in place so the final grid honours
+/// [`CELL_BUDGET`] (`x_features·y_features` plus retained fill ≤ budget), keeping
+/// every feature line.
+///
+/// Strategy (fill lines are the only thinnable part — feature lines pin pads to
+/// nodes and must all survive):
+/// 1. Coalesce fill lines that are near-coincident with a feature line or with each
+///    other (within [`LINE_EPSILON`]) — these add cells without adding a distinct
+///    routing lane.
+/// 2. While the combined grid is over budget, drop the *least-important* fill line:
+///    the one whose two neighbours (feature-or-fill) are closest together, i.e. the
+///    most redundant lane in the most crowded channel. Drop alternately from the axis
+///    that currently has more fill, so both axes stay balanced.
+/// 3. If after removing *all* fill the feature lines alone still exceed the budget,
+///    log that explicitly — the search space is irreducibly large and the caller
+///    proceeds knowingly (rather than silently).
+fn enforce_budget(
+    x_features: &[f64],
+    y_features: &[f64],
+    x_fill: &mut Vec<f64>,
+    y_fill: &mut Vec<f64>,
+) {
+    // Step 1: drop fill lines coincident with a feature line (sort_dedup later would
+    // merge them, but they must not count against the budget while we thin).
+    coalesce_fill(x_features, x_fill);
+    coalesce_fill(y_features, y_fill);
+
+    let cells = |xf: usize, yf: usize| -> usize {
+        (x_features.len() + xf).saturating_mul(y_features.len() + yf)
+    };
+
+    if cells(x_fill.len(), y_fill.len()) <= CELL_BUDGET {
+        return;
+    }
+
+    // Step 3 (early check): feature lines alone over budget — fill thinning is futile.
+    let feature_cells = x_features.len().saturating_mul(y_features.len());
+    if feature_cells > CELL_BUDGET {
+        // Drop all fill (it cannot help) and report honestly.
+        let dropped = x_fill.len() + y_fill.len();
+        x_fill.clear();
+        y_fill.clear();
+        eprintln!(
+            "mr-srj: Hanan FEATURE lines alone {}×{} = {feature_cells} cells exceed \
+             budget {CELL_BUDGET}; dropped all {dropped} fill lines but feature set is \
+             irreducible (pads/obstacles) — routing on an over-budget grid. Consider \
+             coarser features/clearance.",
+            x_features.len(),
+            y_features.len(),
+        );
+        return;
+    }
+
+    // Step 2: drop the least-important fill line, alternating axes, until under budget.
+    let mut dropped = 0usize;
+    while cells(x_fill.len(), y_fill.len()) > CELL_BUDGET {
+        // Pick the axis to thin: the one with more fill remaining (keeps balance);
+        // if one axis is empty, thin the other.
+        let thin_x = if x_fill.is_empty() {
+            false
+        } else if y_fill.is_empty() {
+            true
+        } else {
+            x_fill.len() >= y_fill.len()
+        };
+        let (features, fill) = if thin_x {
+            (x_features, &mut *x_fill)
+        } else {
+            (y_features, &mut *y_fill)
+        };
+        if fill.is_empty() {
+            break; // both axes empty — handled by the feature-only check above
+        }
+        drop_least_important(features, fill);
+        dropped += 1;
+    }
+
+    let final_cells = cells(x_fill.len(), y_fill.len());
+    eprintln!(
+        "mr-srj: Hanan grid over budget {CELL_BUDGET}; coalesced/dropped {dropped} fill \
+         lines → {}×{} = {final_cells} cells (kept all {}+{} feature lines).",
+        x_features.len() + x_fill.len(),
+        y_features.len() + y_fill.len(),
+        x_features.len(),
+        y_features.len(),
+    );
+}
+
+/// Remove fill lines that are within [`LINE_EPSILON`] of a feature line or of an
+/// already-kept fill line — they would merge in `sort_dedup` anyway and so should not
+/// count against the budget. `fill` is sorted and deduped against the (sorted)
+/// `features` in place.
+fn coalesce_fill(features: &[f64], fill: &mut Vec<f64>) {
+    sort_dedup(fill);
+    fill.retain(|&f| {
+        // Keep iff no feature line is within epsilon (binary search the sorted set).
+        let i = features.partition_point(|&x| x < f - LINE_EPSILON);
+        !(i < features.len() && (features[i] - f).abs() <= LINE_EPSILON)
+    });
+}
+
+/// Drop the single most-redundant line from sorted `fill`: the fill line sitting in
+/// the *tightest* local channel (smallest distance to its nearest neighbour among the
+/// merged feature+fill lines). Removing the densest-packed lane sheds a cell while
+/// preserving the widest, most useful routing channels. Ties break toward the lower
+/// index for determinism.
+fn drop_least_important(features: &[f64], fill: &mut Vec<f64>) {
+    if fill.is_empty() {
+        return;
+    }
+    // Merge feature+fill once to measure each fill line's neighbour spacing.
+    let mut all: Vec<f64> = Vec::with_capacity(features.len() + fill.len());
+    all.extend_from_slice(features);
+    all.extend_from_slice(fill);
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let mut best_idx = 0usize; // index into `fill`
+    let mut best_gap = f64::INFINITY;
+    for (fi, &f) in fill.iter().enumerate() {
+        // Neighbour spacing of `f` in the merged set = min distance to the line just
+        // below and just above it.
+        let pos = all.partition_point(|&x| x < f); // first index >= f (f itself)
+        let left = if pos > 0 { f - all[pos - 1] } else { f64::INFINITY };
+        // skip past the copy(ies) of f to its upper neighbour
+        let mut up = pos + 1;
+        while up < all.len() && (all[up] - f).abs() <= LINE_EPSILON {
+            up += 1;
+        }
+        let right = if up < all.len() {
+            all[up] - f
+        } else {
+            f64::INFINITY
+        };
+        let nn = left.min(right);
+        if nn < best_gap {
+            best_gap = nn;
+            best_idx = fi;
+        }
+    }
+    fill.remove(best_idx);
+}
+
+/// Sort `v` ascending and collapse runs of lines closer than [`LINE_EPSILON`] into
+/// one (keeping the first). Non-finite values are dropped so they cannot poison the
+/// line array. Leaves `v` empty only if every input was non-finite; callers floor
+/// the empty case via [`Mapping::from_lines`].
+fn sort_dedup(v: &mut Vec<f64>) {
+    v.retain(|x| x.is_finite());
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap()); // finite-only → total order
+    v.dedup_by(|a, b| (*a - *b).abs() <= LINE_EPSILON);
+}
+
+/// Hard cap on fill lines inserted into any one gap, so a pathologically wide empty
+/// board span (e.g. a far-flung connector) cannot explode the line count.
+const MAX_FILL_PER_GAP: usize = 256;
+
+/// Compute the routing-channel fill lines for the sorted, deduped `features` line
+/// set so a track can run *between* two features without colliding with either. The
+/// fill lines are returned separately (NOT merged into `features`) so the budget
+/// enforcer can thin them while keeping every feature line.
+///
+/// The geometry, per gap `g` between two adjacent feature lines (`track_w` = design
+/// track width, `clearance` = the copper clearance the rasteriser will actually
+/// inflate by, `channel = track_w + 2·clearance` = the minimum gap a centred track
+/// needs to keep `clearance` to *both* sides):
+///
+/// * `g >= channel` — a centred lane keeps ≥ `clearance` to both feature edges, so
+///   it is DRC-legal. We always insert the **exact midpoint** (the maximal-clearance
+///   position, where the lane is most robust to the non-uniform halo), and for wider
+///   gaps additionally subdivide at ~`track_w` pitch so distant features still get
+///   multiple parallel routing channels (the "tracks between pins" lines). The free
+///   corridor (gap minus the two clearance halos) is what the router actually uses.
+/// * `track_w <= g < channel` — a track physically fits but a centred lane cannot
+///   keep full `clearance` on *both* sides, so any lane here risks a DRC overlap.
+///   We insert **no** lane: the route goes around through wider neighbouring gaps.
+/// * `g < track_w` — not even a bare track fits; no lane, route goes around.
+fn fill_lines(features: &[f64], track_w: f64, clearance: f64) -> Vec<f64> {
+    // `track_w` must be a usable positive spacing; reject non-finite / non-positive.
+    if features.len() < 2 || !(track_w.is_finite() && track_w > 0.0) {
+        return Vec::new();
+    }
+    let clearance = if clearance.is_finite() && clearance > 0.0 {
+        clearance
+    } else {
+        0.0
+    };
+    // Minimum gap for a centred, clearance-legal lane.
+    let channel = track_w + 2.0 * clearance;
+    // Lane pitch: keep the historical fine fill density (the grid spans open board
+    // area at ~`track_w`), which gives the router ample routing room. These are
+    // candidate grid nodes, not committed copper, so the router still negotiates real
+    // clearance between the tracks that ultimately use them.
+    let pitch = track_w.max(LINE_EPSILON);
+    let mut fill: Vec<f64> = Vec::new();
+    for win in features.windows(2) {
+        let (lo, hi) = (win[0], win[1]);
+        let gap = hi - lo;
+        // No clearance-legal centred lane fits between these two features — a track
+        // here could not keep full clearance to both sides, so insert nothing and let
+        // the route go around through the wider neighbouring gaps. (Two pad edges this
+        // close also have no free corridor between them on the pad layer at all.)
+        if gap < channel {
+            continue;
+        }
+        // Subdivide the gap into equal sub-intervals each ≤ `pitch` wide, placing a
+        // fill line at every interior boundary. `intervals = ceil(gap/pitch)` is
+        // clamped to ≥ 2 so even a gap only just at `channel` gets at least ONE
+        // interior lane (when `intervals == 2` that lane is the exact midpoint, the
+        // maximal-clearance centred lane a tight-pitch pad-escape route needs). Wider
+        // gaps get several parallel lanes so distant features stay finely routable and
+        // open board area carries multiple tracks. Lines that land inside a pad's
+        // inflated clearance halo are unreachable nodes (the grid marks them blocked) —
+        // harmless — while the ones in the free corridor give routing room. The per-gap
+        // count is capped so a wide empty span cannot blow up.
+        let intervals = ((gap / pitch).ceil() as usize).clamp(2, MAX_FILL_PER_GAP + 1);
+        let step = gap / intervals as f64;
+        for k in 1..intervals {
+            fill.push(lo + step * k as f64);
+        }
+    }
+    fill
+}
+
+/// Index of the line in sorted `lines` whose half-open Voronoi region contains
+/// `p`. Region `i` is `[ (lines[i-1]+lines[i])/2 , (lines[i]+lines[i+1])/2 )`, so
+/// the result is the nearest line with midpoint ties broken toward the lower index.
+///
+/// A binary search counts the interior region boundaries `≤ p`; that count is the
+/// containing region index (each boundary before region `i` is the midpoint
+/// `(lines[i-1]+lines[i])/2`). On a uniform cell-centre line set this reproduces
+/// `floor((p - origin)/res)` exactly (each region equals the old half-open cell
+/// `[origin + i·res, origin + (i+1)·res)`). Non-finite or out-of-range `p` clamps
+/// into `[0, len-1]`.
+fn nearest_line(lines: &[f64], p: f64) -> u32 {
+    debug_assert!(!lines.is_empty());
+    if !p.is_finite() {
+        // NaN/inf: clamp to the nearest end deterministically.
+        return if p > 0.0 { lines.len() as u32 - 1 } else { 0 };
+    }
+    // Binary search for the number of interior boundaries `<= p`; that count is the
+    // index of the containing region. The boundary before region `i` (for i in
+    // 1..n) is the midpoint `(lines[i-1]+lines[i])/2`. A region index `idx` is
+    // valid iff every such boundary up to `idx` is `<= p`, so we count boundaries
+    // satisfying `midpoint <= p` — the predicate is monotone in `i`, so a half-open
+    // binary search applies.
+    let n = lines.len();
+    let (mut lo, mut hi) = (0usize, n - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2); // upper-mid; boundary before region `mid`
+        if 0.5 * (lines[mid - 1] + lines[mid]) <= p {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo as u32
 }
 
 /// The cell-space form of a [`SimpleRouteJson`] problem: the obstacle grid, the
@@ -239,15 +644,24 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// right grid plane instead of collapsing onto layer 0. The grid is built with
 /// `layers.len()` planes; `rasterize` is the standard-naming special case.
 ///
-/// `clearance_cells` reserves a copper-to-copper clearance halo around every pad:
-/// when `> 0`, after all pad obstacles are marked the base grid is grown by
-/// `clearance_cells` (planar Chebyshev, per-layer — see
+/// The planar grid is **non-uniform / Hanan**: rather than uniform cells of size
+/// `resolution`, [`build_grid_lines`] draws per-axis lines through every pad
+/// endpoint and obstacle edge (plus the board bounds and fill channels) so each pad
+/// lands on an exact node — this is what removes the pad-exit wiggle (see
+/// [`build_grid_lines`] and `trace_route`). `resolution` no longer sizes the cells;
+/// it is the fill-channel spacing fallback when the problem omits a track width.
+///
+/// `clearance_cells` reserves a copper-to-copper clearance halo around every pad.
+/// The caller passes it as a count of the *old uniform* cells
+/// (`ceil(min_clearance / resolution)`), so its continuous width is
+/// `clearance_cells · resolution`; because the Hanan cells are non-uniform, the base
+/// grid is grown by that **geometric** distance (see
 /// [`mr_grid::GridBuilder::inflate_clearance`]) so a track of another net cannot
-/// enter the halo. To preserve own-pad access through that now-inflated region,
-/// each net's `passable_pads` is correspondingly expanded to include the same
-/// Chebyshev neighbourhood (radius `clearance_cells`, on the endpoint's layer) of
-/// its own pad cells, so the net can still escape its own pads. `clearance_cells
-/// == 0` is byte-identical to no clearance: no inflation, no halo expansion.
+/// enter the halo. To preserve own-pad access through that now-inflated region, each
+/// net's `passable_pads` is correspondingly expanded to the same geometric halo
+/// (line-distance ≤ `clearance_mm` on both axes, on the endpoint's layer) of its own
+/// pad cells, so the net can still escape its own pads. `clearance_cells == 0` is a
+/// no-op: no inflation, no halo expansion.
 pub fn rasterize_with_layers(
     srj: &SimpleRouteJson,
     resolution: f64,
@@ -255,7 +669,42 @@ pub fn rasterize_with_layers(
     clearance_cells: u32,
 ) -> RasterizedProblem {
     let layer_count = layers.len();
-    let mapping = Mapping::with_layers(&srj.bounds, resolution, layer_count);
+    // Non-uniform / Hanan grid: build per-axis lines through every pad endpoint and
+    // obstacle edge (plus bounds + fill channels) so each pad lands on an exact node
+    // — this is what removes the pad-exit wiggle at the source (see `build_grid_lines`
+    // and `trace_route`). The design-rule track width / clearance drive the fill
+    // channel threshold; both fall back to `resolution` when the problem omits them,
+    // so a rule-less fixture still gets sensible routing lanes.
+    let track_w = srj.min_trace_width.filter(|w| *w > 0.0).unwrap_or(resolution);
+    // Effective copper clearance the rasteriser will actually enforce: the halo width
+    // applied below (`clearance_cells · resolution`) — NOT the raw `srj.min_clearance`.
+    // The fill-channel policy MUST use this same value, otherwise it would size routing
+    // lanes against a clearance the inflation does not match (e.g. when the problem
+    // omits a clearance rule but the server still inflates by one trace width), placing
+    // "channels" that the inflated pad halos then swallow — a pure-disconnect regression.
+    let clearance = (clearance_cells as f64 * resolution).max(0.0);
+    // Foreign-copper blocking margin = the **track centreline rule**. A node may host
+    // the *centre* of a `track_w`-wide trace; that trace keeps `clearance` to foreign
+    // copper only if its centre is at least `clearance + track_w/2` from the foreign
+    // edge. The plain `clearance` halo (`inflate_clearance` blocks node *centres* within
+    // `clearance`) therefore under-reserves by `track_w/2` whenever `track_w > clearance`
+    // — the DEFAULT regime when the problem omits a clearance rule (clearance == 0) yet
+    // still has a known trace width. We reserve the extra `track_w/2` so NO routable node
+    // (fill OR feature-derived) sits where a centred trace would overlap a pad/obstacle.
+    //
+    // The extra margin is taken from the *declared* `min_trace_width` only (not the
+    // `resolution` fill fallback): when the problem states no track width there is no
+    // defined trace to reserve against, and forcing the `resolution`-based fallback here
+    // would (a) break the byte-identical contract of `rasterize()`/`clearance_cells == 0`
+    // fixtures that omit `minTraceWidth`, and (b) over-block on coarse-resolution boards.
+    let track_block_mm = srj
+        .min_trace_width
+        .filter(|w| *w > 0.0)
+        .map_or(0.0, |w| w / 2.0);
+    // Total distance every FOREIGN pad/obstacle reserves around itself.
+    let block_margin_mm = clearance + track_block_mm;
+    let (x_lines, y_lines) = build_grid_lines(srj, layer_count, track_w, clearance);
+    let mapping = Mapping::from_lines(x_lines, y_lines, layer_count);
     let mut builder = GridBuilder::new(mapping.dims, 1);
 
     // Collect every connection endpoint as `(x, y, layer)`. These are the pad
@@ -285,8 +734,8 @@ pub fn rasterize_with_layers(
         // square overlaps the box. A box edge that lands exactly on a cell
         // boundary does not spill into the next cell (half-open cells).
         let (x0, y0) = mapping.point_to_xy((min_x, min_y));
-        let x1 = cell_upper(max_x, mapping.origin_x, mapping.resolution, mapping.dims.w);
-        let y1 = cell_upper(max_y, mapping.origin_y, mapping.resolution, mapping.dims.h);
+        let x1 = mapping.x_cell_upper(max_x);
+        let y1 = mapping.y_cell_upper(max_y);
         if x1 < x0 || y1 < y0 {
             continue;
         }
@@ -313,12 +762,26 @@ pub fn rasterize_with_layers(
     // rasterise time — committed vias reserve their keepout halo there, so nothing
     // extra is stamped on the base grid here.
 
-    // Pad clearance: grow every pad obstacle by `clearance_cells` so a foreign
-    // net's track cannot enter the halo. Own-pad access through the halo is
-    // restored below by expanding each net's `passable_pads` to the same
-    // neighbourhood. `clearance_cells == 0` is a no-op (byte-identical base grid).
-    if clearance_cells > 0 {
-        builder.inflate_clearance(clearance_cells);
+    // The continuous grid-line geometry, so the geometric clearance inflation below
+    // (and own-pad halo expansion) measure halo widths in real units over the now
+    // non-uniform lines, not against an equal-cell assumption.
+    let coords = GridCoords::from_lines(mapping.x_lines.clone(), mapping.y_lines.clone());
+
+    // Pad clearance: grow every pad obstacle by the foreign-copper blocking halo so a
+    // foreign net's *centred* track cannot overlap it. That halo is the track-centreline
+    // distance `block_margin_mm = clearance + track_w/2` (see above) — NOT the bare
+    // `clearance`: a node exactly `clearance` from a pad edge would host a centred
+    // `track_w` trace whose copper reaches `clearance - track_w/2 < clearance` of the
+    // pad (a DRC overlap whenever `track_w > clearance`). The Hanan grid's cells are
+    // non-uniform, so we inflate by that geometric distance over `coords` rather than a
+    // cell count (matching `mr_grid::inflate_clearance`'s mm contract). Own-pad access
+    // through the (now wider) halo is restored below by expanding each net's
+    // `passable_pads` to the SAME geometric neighbourhood, so widening the foreign halo
+    // does not over-block a net from escaping its own pad. `block_margin_mm == 0`
+    // (no clearance rule AND no declared trace width) is a no-op: byte-identical base
+    // grid, preserving the `rasterize()` / `clearance_cells == 0` contract.
+    if block_margin_mm > 0.0 {
+        builder.inflate_clearance(block_margin_mm, &coords);
     }
 
     let grid = builder.build();
@@ -327,7 +790,7 @@ pub fn rasterize_with_layers(
         &mapping,
         &srj.obstacles,
         &layers,
-        clearance_cells,
+        block_margin_mm,
     );
 
     RasterizedProblem {
@@ -371,17 +834,18 @@ fn obstacle_layers(obs: &Obstacle, layers: &LayerMap) -> Vec<u32> {
 /// net owning this endpoint is allowed to traverse. The cells are returned in
 /// ascending [`CellIdx`] order, deduplicated, for deterministic serialisation.
 ///
-/// When `clearance_cells > 0` the set is additionally expanded to the planar
-/// Chebyshev neighbourhood (radius `clearance_cells`, on the endpoint's `layer`)
-/// of every own-pad cell — mirroring [`mr_grid::GridBuilder::inflate_clearance`] —
-/// so the net can still reach and escape its own pad through the inflated clearance
-/// halo that now surrounds it. `clearance_cells == 0` leaves the set unchanged.
+/// When `clearance_mm > 0` the set is additionally expanded to the planar
+/// **geometric** Chebyshev neighbourhood (line distance `≤ clearance_mm` on both
+/// axes, on the endpoint's `layer`) of every own-pad cell — mirroring
+/// [`mr_grid::GridBuilder::inflate_clearance`]'s mm-based halo — so the net can still
+/// reach and escape its own pad through the inflated clearance halo that now
+/// surrounds it. `clearance_mm <= 0` leaves the set unchanged.
 fn pad_cells_for_point(
     point: (f64, f64),
     layer: u32,
     mapping: &Mapping,
     obstacles: &[Obstacle],
-    clearance_cells: u32,
+    clearance_mm: f64,
 ) -> Vec<CellIdx> {
     let (px, py) = point;
     // Pad cells as (x, y) on this endpoint's layer; we inflate these planar coords
@@ -397,8 +861,8 @@ fn pad_cells_for_point(
         }
         // Same cell-range logic as the obstacle marking loop.
         let (x0, y0) = mapping.point_to_xy((min_x, min_y));
-        let x1 = cell_upper(max_x, mapping.origin_x, mapping.resolution, mapping.dims.w);
-        let y1 = cell_upper(max_y, mapping.origin_y, mapping.resolution, mapping.dims.h);
+        let x1 = mapping.x_cell_upper(max_x);
+        let y1 = mapping.y_cell_upper(max_y);
         if x1 < x0 || y1 < y0 {
             continue;
         }
@@ -412,19 +876,48 @@ fn pad_cells_for_point(
     let (ex, ey) = mapping.point_to_xy((px, py));
     planar.push((ex, ey));
 
-    // Resolve to layered cells, expanding each pad cell to its Chebyshev
-    // neighbourhood (radius `clearance_cells`) on the endpoint's own layer so the
-    // net can traverse the inflated clearance halo around its own pads.
+    // Resolve to layered cells, expanding each pad cell to its *geometric* Chebyshev
+    // neighbourhood (every line within `clearance_mm` on both axes) on the endpoint's
+    // own layer so the net can traverse the inflated clearance halo around its own
+    // pads. The per-axis in-clearance line bands are computed from the line arrays so
+    // the halo width is the same continuous distance as `inflate_clearance` no matter
+    // how unevenly the Hanan lines fall.
+    //
+    // CLIP: the clearance-halo expansion must NOT unmask a cell that sits inside a
+    // *foreign* pad (an obstacle that does NOT contain this endpoint). On tight-pitch
+    // pin columns the own-pad halo otherwise bleeds into the neighbouring pad, letting
+    // the net drive straight through it (a DRC overlap). Own-pad cells (resolved
+    // above into `planar`) are always kept; only the *expanded* halo ring is clipped.
+    // A cell at line position `(lx, ly)` is foreign-blocked iff it lies inside some
+    // obstacle rect that does not also contain `(px, py)`.
+    let foreign_blocks = |lx: f64, ly: f64| -> bool {
+        obstacles.iter().any(|obs| {
+            let min_x = obs.center.x - obs.width / 2.0;
+            let max_x = obs.center.x + obs.width / 2.0;
+            let min_y = obs.center.y - obs.height / 2.0;
+            let max_y = obs.center.y + obs.height / 2.0;
+            let in_this = lx >= min_x && lx <= max_x && ly >= min_y && ly <= max_y;
+            // Foreign iff this cell is inside the rect but the endpoint is not.
+            let owns = px >= min_x && px <= max_x && py >= min_y && py <= max_y;
+            in_this && !owns
+        })
+    };
+    let own_planar: std::collections::HashSet<(u32, u32)> = planar.iter().copied().collect();
     let mut cells: Vec<CellIdx> = Vec::new();
-    let r = clearance_cells as i64;
+    let clearance = clearance_mm.max(0.0);
     for &(x, y) in &planar {
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
-                if nx < 0 || ny < 0 || nx >= mapping.dims.w as i64 || ny >= mapping.dims.h as i64 {
+        let (x0, x1) = line_band(&mapping.x_lines, x, clearance);
+        let (y0, y1) = line_band(&mapping.y_lines, y, clearance);
+        for ny in y0..=y1 {
+            for nx in x0..=x1 {
+                // Keep own-pad cells unconditionally; clip expanded-halo cells that
+                // fall inside a foreign pad.
+                if !own_planar.contains(&(nx, ny))
+                    && foreign_blocks(mapping.x_lines[nx as usize], mapping.y_lines[ny as usize])
+                {
                     continue;
                 }
-                cells.push(mapping.dims.idx3(nx as u32, ny as u32, layer));
+                cells.push(mapping.dims.idx3(nx, ny, layer));
             }
         }
     }
@@ -433,11 +926,55 @@ fn pad_cells_for_point(
     cells
 }
 
-/// Upper (inclusive) cell index touched by a continuous box that ends at `hi`:
-/// `ceil((hi-origin)/res) - 1`, clamped into `[0, extent-1]`.
-fn cell_upper(hi: f64, origin: f64, res: f64, extent: u32) -> u32 {
-    let edge = ((hi - origin) / res).ceil() - 1.0;
-    clamp_index(edge, extent)
+/// Inclusive `[lo, hi]` range of indices in sorted `lines` whose position is within
+/// `clearance` continuous units of the line at index `seed`. With `clearance == 0`
+/// this is just `[seed, seed]`. The in-clearance indices form a contiguous band
+/// around `seed` (the lines are sorted), found by walking outward from `seed` until
+/// the line distance first exceeds `clearance` — mirroring `mr_grid`'s `line_span`,
+/// so the own-pad halo matches the inflated obstacle halo exactly.
+fn line_band(lines: &[f64], seed: u32, clearance: f64) -> (u32, u32) {
+    let n = lines.len() as u32;
+    debug_assert!(n > 0);
+    let seed = seed.min(n - 1);
+    let pos = lines[seed as usize];
+    let mut lo = seed;
+    while lo > 0 && (pos - lines[lo as usize - 1]).abs() <= clearance {
+        lo -= 1;
+    }
+    let mut hi = seed;
+    while hi + 1 < n && (lines[hi as usize + 1] - pos).abs() <= clearance {
+        hi += 1;
+    }
+    (lo, hi)
+}
+
+/// Upper (inclusive) cell index touched by a continuous box that ends at `hi`,
+/// over the sorted `lines` of one axis: the largest region whose lower Voronoi
+/// boundary is strictly less than `hi`. A box edge that lands exactly on a region
+/// boundary does not spill into the next region (half-open cells). On a uniform
+/// cell-centre line set this reproduces `ceil((hi-origin)/res) - 1`, clamped into
+/// `[0, len-1]`.
+///
+/// The boundary before region `i` (for i in 1..n) is the midpoint
+/// `(lines[i-1]+lines[i])/2`; the predicate `boundary < hi` is monotone in `i`, so
+/// a half-open binary search yields the largest region whose boundary still
+/// undershoots `hi`.
+fn cell_upper(lines: &[f64], hi: f64) -> u32 {
+    debug_assert!(!lines.is_empty());
+    let n = lines.len();
+    if !hi.is_finite() {
+        return if hi > 0.0 { n as u32 - 1 } else { 0 };
+    }
+    let (mut lo, mut hist) = (0usize, n - 1);
+    while lo < hist {
+        let mid = (lo + hist).div_ceil(2); // boundary before region `mid`
+        if 0.5 * (lines[mid - 1] + lines[mid]) < hi {
+            lo = mid;
+        } else {
+            hist = mid - 1;
+        }
+    }
+    lo as u32
 }
 
 /// Decompose every connection into chained two-point nets (plan R8).
@@ -451,7 +988,7 @@ fn decompose_connections(
     mapping: &Mapping,
     obstacles: &[Obstacle],
     layers: &LayerMap,
-    clearance_cells: u32,
+    clearance_mm: f64,
 ) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
@@ -477,14 +1014,14 @@ fn decompose_connections(
                 src_layer,
                 mapping,
                 obstacles,
-                clearance_cells,
+                clearance_mm,
             );
             passable_pads.extend(pad_cells_for_point(
                 (win[1].x, win[1].y),
                 dst_layer,
                 mapping,
                 obstacles,
-                clearance_cells,
+                clearance_mm,
             ));
             passable_pads.sort_unstable();
             passable_pads.dedup();
@@ -663,6 +1200,7 @@ mod tests {
     use super::*;
     use mr_core::RouteResult;
 
+
     /// A small but realistic problem: 10×10 board, one rect obstacle, two
     /// connections (one 2-point, one 3-point).
     const SAMPLE: &str = r#"{
@@ -692,8 +1230,30 @@ mod tests {
     fn rasterize_dims_and_net_count() {
         let srj: SimpleRouteJson = serde_json::from_str(SAMPLE).unwrap();
         let prob = rasterize(&srj, 1.0);
-        // 10/1 = 10 cells per axis; SAMPLE declares layerCount 2.
-        assert_eq!(prob.mapping.dims, Dims::with_layers(10, 10, 2));
+        // Hanan grid: per axis the feature lines are bounds {0,10}, endpoints, and
+        // obstacle edges {4,6}; then `fill_lines` adds a midpoint lane in every gap
+        // ≥ channel (= track_w = resolution = 1.0). With clearance 0 here a unit gap
+        // (e.g. 0↔1) now gets its midpoint (0.5) — the `>=` fix that the old `>`
+        // threshold dropped — and 3-wide gaps (e.g. 1↔4) get two interior lanes
+        // (2,3). x picks up endpoints {1,5,9} → 15 lines; y endpoints are only {1,9}
+        // (GND's three pads share y=9) → 13 lines. SAMPLE declares layerCount 2.
+        assert_eq!(prob.mapping.dims, Dims::with_layers(15, 13, 2));
+        assert_eq!(
+            prob.mapping.x_lines,
+            vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 9.0, 9.5, 10.0]
+        );
+        assert_eq!(
+            prob.mapping.y_lines,
+            vec![0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.5, 10.0]
+        );
+        // Every pad endpoint coordinate is still an exact grid line (the whole point of
+        // the Hanan grid — fill never displaces a feature line).
+        for &c in &[0.0, 1.0, 5.0, 9.0, 10.0, 4.0, 6.0] {
+            assert!(prob.mapping.x_lines.iter().any(|&l| (l - c).abs() < 1e-9));
+        }
+        for &c in &[0.0, 1.0, 9.0, 10.0, 4.0, 6.0] {
+            assert!(prob.mapping.y_lines.iter().any(|&l| (l - c).abs() < 1e-9));
+        }
         // VCC -> 1 net, GND (3 points) -> 2 nets. Total 3.
         assert_eq!(prob.nets.len(), 3);
     }
@@ -703,30 +1263,33 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(SAMPLE).unwrap();
         let prob = rasterize(&srj, 1.0);
         let d = prob.mapping.dims;
-        // Rect spans [4,6]x[4,6] continuous. At res=1 that's cells x=4..=5,
-        // y=4..=5 (cell 4 = [4,5), cell 5 = [5,6); cell 6 = [6,7) does NOT
-        // overlap a box that ends exactly at 6).
-        assert!(prob.grid.is_obstacle(d.idx(4, 4)));
-        assert!(prob.grid.is_obstacle(d.idx(5, 4)));
-        assert!(prob.grid.is_obstacle(d.idx(4, 5)));
-        assert!(prob.grid.is_obstacle(d.idx(5, 5)));
-        // Boundaries / outside stay passable.
-        assert!(!prob.grid.is_obstacle(d.idx(6, 5)));
-        assert!(!prob.grid.is_obstacle(d.idx(3, 5)));
-        assert!(!prob.grid.is_obstacle(d.idx(4, 6)));
+        // Hanan grid: the obstacle box [4,6] is bounded by NODES at 4 and 6, but the
+        // fill lanes 4.5 / 5.5 also fall inside it on the x axis, so the half-open cell
+        // mapping covers x lines {4.0,4.5,5.0,5.5,6.0} = cells 5..=9 and y lines
+        // {4.0,5.0,6.0} = cells 5..=7. Every cell whose line position lies in [4,6] on
+        // both axes is blocked.
+        for y in 5..=7 {
+            for x in 5..=9 {
+                assert!(prob.grid.is_obstacle(d.idx(x, y)), "({x},{y}) blocked");
+            }
+        }
+        // Just outside the box stays passable (lines 3.0 / 7.0 are beyond the edges).
+        assert!(!prob.grid.is_obstacle(d.idx(10, 6))); // x line 7.0
+        assert!(!prob.grid.is_obstacle(d.idx(4, 6))); // x line 3.0
+        assert!(!prob.grid.is_obstacle(d.idx(7, 8))); // y line 7.0
         assert!(!prob.grid.is_obstacle(d.idx(0, 0)));
-        // The obstacle names no layers, so it blocks BOTH of SAMPLE's 2 layers:
-        // a 2x2 block on each layer = 8 cells. The same block is present on
-        // layer 1 at the same planar (x, y).
-        assert!(prob.grid.is_obstacle(d.idx3(4, 4, 1)));
+        // The obstacle names no layers, so it blocks BOTH of SAMPLE's 2 layers: the
+        // same block is present on layer 1 at the same planar (x, y).
         assert!(prob.grid.is_obstacle(d.idx3(5, 5, 1)));
+        assert!(prob.grid.is_obstacle(d.idx3(9, 7, 1)));
+        // 5 x-cells × 3 y-cells = 15 blocked cells per layer × 2 layers.
         let count = prob
             .grid
             .cost
             .iter()
             .filter(|&&c| c == mr_core::OBSTACLE)
             .count();
-        assert_eq!(count, 4 * 2);
+        assert_eq!(count, 15 * 2);
     }
 
     #[test]
@@ -740,10 +1303,12 @@ mod tests {
             .collect();
         assert_eq!(vcc.len(), 1);
         assert_eq!(vcc[0].net, "VCC");
-        // (1,1) -> cell (1,1); (9,1) -> cell (9,1) at res 1.
+        // On the Hanan grid the endpoints land on their own feature lines: x line 1.0
+        // is index 2 and 9.0 is index 12; y line 1.0 is index 2. So (1,1) -> (2,2) and
+        // (9,1) -> (12,2).
         let d = prob.mapping.dims;
-        assert_eq!(vcc[0].src, d.idx(1, 1));
-        assert_eq!(vcc[0].dst, d.idx(9, 1));
+        assert_eq!(vcc[0].src, d.idx(2, 2));
+        assert_eq!(vcc[0].dst, d.idx(12, 2));
     }
 
     #[test]
@@ -759,11 +1324,12 @@ mod tests {
         assert_eq!(gnd[0].net, "GND#0");
         assert_eq!(gnd[1].net, "GND#1");
         let d = prob.mapping.dims;
-        // Chain order: (1,9)->(5,9), then (5,9)->(9,9).
-        assert_eq!(gnd[0].src, d.idx(1, 9));
-        assert_eq!(gnd[0].dst, d.idx(5, 9));
-        assert_eq!(gnd[1].src, d.idx(5, 9));
-        assert_eq!(gnd[1].dst, d.idx(9, 9));
+        // Chain order: (1,9)->(5,9), then (5,9)->(9,9). On the Hanan grid x lines
+        // 1.0/5.0/9.0 are indices 2/7/12 and y line 9.0 is index 10.
+        assert_eq!(gnd[0].src, d.idx(2, 10));
+        assert_eq!(gnd[0].dst, d.idx(7, 10));
+        assert_eq!(gnd[1].src, d.idx(7, 10));
+        assert_eq!(gnd[1].dst, d.idx(12, 10));
     }
 
     #[test]
@@ -866,21 +1432,22 @@ mod tests {
         let prob = rasterize(&srj, 1.0);
         let d = prob.mapping.dims;
         assert_eq!(d.layers, 2);
-        // Rect spans cells x=4..=5, y=4..=5 on the bottom layer (index 1).
-        for y in 4..=5 {
-            for x in 4..=5 {
+        // Hanan lines on the integers 0..=10: rect box [4,6] spans cells x=4..=6,
+        // y=4..=6 on the bottom layer (index 1); the top layer stays free.
+        for y in 4..=6 {
+            for x in 4..=6 {
                 assert!(prob.grid.is_obstacle(d.idx3(x, y, 1)), "bottom blocked");
                 assert!(!prob.grid.is_obstacle(d.idx3(x, y, 0)), "top free");
             }
         }
-        // Exactly the 2x2 block on one layer.
+        // Exactly the 3x3 block on one layer.
         let count = prob
             .grid
             .cost
             .iter()
             .filter(|&&c| c == mr_core::OBSTACLE)
             .count();
-        assert_eq!(count, 4);
+        assert_eq!(count, 9);
     }
 
     /// Track B: a src Point on "top" resolves to a layer-0 cell; on "bottom" it
@@ -901,8 +1468,10 @@ mod tests {
         let prob = rasterize(&srj, 1.0);
         let d = prob.mapping.dims;
         let net = &prob.nets[0];
-        assert_eq!(net.src, d.idx3(1, 1, 0), "top -> layer 0");
-        assert_eq!(net.dst, d.idx3(9, 9, 1), "bottom -> layer 1");
+        // No obstacles, endpoints (1,1)/(9,9): x lines are bounds {0,10}, endpoints
+        // {1,9}, plus fill {0.5, 2..8, 9.5} → 1.0 is index 2 and 9.0 is index 10.
+        assert_eq!(net.src, d.idx3(2, 2, 0), "top -> layer 0");
+        assert_eq!(net.dst, d.idx3(10, 10, 1), "bottom -> layer 1");
     }
 
     /// Track B: an obstacle with no `layers` (or unknown names) blocks ALL layers,
@@ -923,14 +1492,14 @@ mod tests {
         for l in 0..3 {
             assert!(prob.grid.is_obstacle(d.idx3(4, 4, l)), "layer {l} blocked");
         }
-        // 2x2 block on each of 3 layers.
+        // Hanan lines on the integers: 3x3 block on each of 3 layers.
         let count = prob
             .grid
             .cost
             .iter()
             .filter(|&&c| c == mr_core::OBSTACLE)
             .count();
-        assert_eq!(count, 4 * 3);
+        assert_eq!(count, 9 * 3);
     }
 
     /// Track C: a 2-layer path with exactly one layer transition emits exactly one
@@ -1103,6 +1672,84 @@ mod tests {
         assert_eq!(mapping.point_to_cell((100.0, -100.0)), 0);
     }
 
+    /// Phase 1: the uniform constructor populates the line arrays with the historical
+    /// cell-centre positions (`origin + (i+0.5)·res`), one per dimension, and
+    /// `cell_center` reads straight off them — proving the array model reproduces the
+    /// old uniform grid exactly.
+    #[test]
+    fn uniform_lines_match_old_cell_centres() {
+        let bounds = Bounds {
+            min_x: -5.0,
+            max_x: 5.0,
+            min_y: 0.0,
+            max_y: 4.0,
+        };
+        let mapping = Mapping::new(&bounds, 2.0);
+        assert_eq!(mapping.dims, Dims::new(5, 2));
+        assert_eq!(mapping.x_lines.len(), 5);
+        assert_eq!(mapping.y_lines.len(), 2);
+        // Lines sit at the old centres: origin + (i+0.5)*res.
+        assert_eq!(mapping.x_lines, vec![-4.0, -2.0, 0.0, 2.0, 4.0]);
+        assert_eq!(mapping.y_lines, vec![1.0, 3.0]);
+        // cell_center reads the line positions (no +0.5 on top of them).
+        let d = mapping.dims;
+        assert_eq!(mapping.cell_center(d.idx(0, 0)), (-4.0, 1.0));
+        assert_eq!(mapping.cell_center(d.idx(4, 1)), (4.0, 3.0));
+    }
+
+    /// Phase 1: nearest-line `point_to_xy` reproduces the old `floor((p-origin)/res)`
+    /// cell assignment on a uniform line set, including the half-open boundary rule
+    /// (a point exactly on a cell boundary belongs to the upper cell).
+    #[test]
+    fn nearest_line_reproduces_floor_mapping() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 10.0,
+            min_y: 0.0,
+            max_y: 10.0,
+        };
+        let mapping = Mapping::new(&bounds, 1.0); // lines at 0.5,1.5,...,9.5
+        let res = 1.0_f64;
+        for &p in &[0.0, 0.4, 0.999, 1.0, 1.5, 4.2, 9.49, 9.9, 100.0, -3.0] {
+            let expected = {
+                let f = ((p - 0.0) / res).floor();
+                if !f.is_finite() || f < 0.0 {
+                    0
+                } else {
+                    (f as u32).min(mapping.dims.w - 1)
+                }
+            };
+            assert_eq!(
+                mapping.point_to_xy((p, p)).0,
+                expected,
+                "point_to_xy({p}) must match the old floor mapping"
+            );
+        }
+    }
+
+    /// Phase 1: the line model also works on a *non-uniform* set — `point_to_xy`
+    /// picks the nearest line (midpoint ties → lower index) and `cell_upper` honours
+    /// the half-open boundary. Guards the generalisation that phases 2–3 rely on.
+    #[test]
+    fn nonuniform_lines_nearest_and_upper() {
+        // Lines at 0, 1, 10 — a wide gap on the right.
+        let mapping = Mapping::from_lines(vec![0.0, 1.0, 10.0], vec![0.0, 1.0, 10.0], 1);
+        assert_eq!(mapping.dims, Dims::new(3, 3));
+        // Boundaries: between 0 and 1 -> 0.5; between 1 and 10 -> 5.5.
+        assert_eq!(mapping.point_to_xy((0.4, 0.0)).0, 0);
+        assert_eq!(mapping.point_to_xy((0.5, 0.0)).0, 1, "midpoint -> upper index");
+        assert_eq!(mapping.point_to_xy((5.4, 0.0)).0, 1);
+        assert_eq!(mapping.point_to_xy((5.5, 0.0)).0, 2, "midpoint -> upper index");
+        assert_eq!(mapping.point_to_xy((100.0, 0.0)).0, 2, "clamps to last line");
+        // cell_upper: a box ending strictly inside region 1 (< 5.5) tops out at 1;
+        // ending exactly on a boundary excludes the next region.
+        assert_eq!(mapping.x_cell_upper(0.4), 0);
+        assert_eq!(mapping.x_cell_upper(0.5), 0, "edge on 0.5 boundary excludes cell 1");
+        assert_eq!(mapping.x_cell_upper(0.6), 1);
+        assert_eq!(mapping.x_cell_upper(5.5), 1, "edge on 5.5 boundary excludes cell 2");
+        assert_eq!(mapping.x_cell_upper(6.0), 2);
+    }
+
     /// (a) Parse the real-harness shape: `minTraceWidth`, obstacle `layers` /
     /// `connectedTo`, and per-point `layer` / `pcb_port_id` (unknown fields are
     /// ignored, not rejected).
@@ -1213,10 +1860,13 @@ mod tests {
         }"#;
         let srj: SimpleRouteJson = serde_json::from_str(blob).unwrap();
         let prob = rasterize(&srj, 1.0);
-        // Decoy pad at (5,5) contains no endpoint -> still blocked.
-        assert!(prob.grid.is_obstacle(prob.mapping.dims.idx(5, 5)));
+        // Decoy pad centred at (5,5) contains no endpoint -> still blocked. Resolve its
+        // cell through the mapping (the Hanan grid does not put it at integer index
+        // (5,5) any more).
+        let (dx, dy) = prob.mapping.point_to_xy((5.0, 5.0));
+        let decoy = prob.mapping.dims.idx(dx, dy);
+        assert!(prob.grid.is_obstacle(decoy));
         // And it is in no net's passable_pads.
-        let decoy = prob.mapping.dims.idx(5, 5);
         for net in &prob.nets {
             assert!(!net.passable_pads.contains(&decoy));
         }
@@ -1272,9 +1922,10 @@ mod tests {
         }
     }
 
-    /// Pad clearance JSON: two single-cell pads of DIFFERENT nets two cells apart
-    /// on a 7×7 board at res 1 (pad "a" centred at (1.5,3.5) -> cell (1,3); pad "b"
-    /// at (4.5,3.5) -> cell (4,3)). The cells between them are otherwise free.
+    /// Pad clearance JSON: two small pads of DIFFERENT nets on a 7×7 board, pad "a"
+    /// centred at (1.5,3.5) and pad "b" at (4.5,3.5), each 0.5×0.5. On the Hanan grid
+    /// the pad edges + centres become exact lines, so each pad spans a small cell
+    /// block centred on its endpoint rather than a single uniform-grid cell.
     const CLEARANCE_SRJ: &str = r#"{
         "layerCount": 1,
         "bounds": { "minX": 0, "maxX": 7, "minY": 0, "maxY": 7 },
@@ -1290,61 +1941,72 @@ mod tests {
         ]
     }"#;
 
-    /// `clearance_cells = 1`: each pad reserves a 1-cell Chebyshev halo (foreign
-    /// tracks can't enter it), while a net's OWN `passable_pads` includes that halo
-    /// so it can escape.
+    /// `clearance_cells = 1` (→ `clearance_mm = 1·resolution = 1.0` on the Hanan
+    /// grid): each pad reserves a geometric clearance halo (foreign tracks can't
+    /// enter), while a net's OWN `passable_pads` includes that halo so it can escape.
+    /// Asserts the *geometric* invariants — line-distance to the pad cell, not fixed
+    /// uniform-grid indices, since the Hanan grid's cells are non-uniform.
     #[test]
     fn rasterize_pad_clearance_reserves_halo_and_unmasks_own() {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
         let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1);
         let d = prob.mapping.dims;
+        let clearance = 1.0_f64; // clearance_cells (1) · resolution (1.0)
 
-        // Pad "a" rasterises to cell (1,3); its 1-cell halo (cells (0..=2, 2..=4))
-        // is reserved as obstacles. In particular the cells around/adjacent to the
-        // foreign pad are blocked.
-        for y in 2..=4 {
-            for x in 0..=2 {
-                assert!(
-                    prob.grid.is_obstacle(d.idx(x, y)),
-                    "pad-a halo cell ({x},{y}) must be reserved"
-                );
+        // Pad endpoint cells: (1.5,3.5) and (4.5,3.5) land on exact nodes.
+        let (ax, ay) = prob.mapping.point_to_xy((1.5, 3.5));
+        let (bx, by) = prob.mapping.point_to_xy((4.5, 3.5));
+        let pad_a = d.idx(ax, ay);
+        let pad_b = d.idx(bx, by);
+        // The pads themselves are obstacles in the base grid.
+        assert!(prob.grid.is_obstacle(pad_a));
+        assert!(prob.grid.is_obstacle(pad_b));
+
+        // Every cell within `clearance` line-distance (both axes) of a pad cell is
+        // reserved as an obstacle — the geometric Chebyshev halo. Check pad "a".
+        for ny in 0..d.h {
+            for nx in 0..d.w {
+                let dx = (prob.mapping.x_lines[nx as usize] - prob.mapping.x_lines[ax as usize]).abs();
+                let dy = (prob.mapping.y_lines[ny as usize] - prob.mapping.y_lines[ay as usize]).abs();
+                if dx <= clearance && dy <= clearance {
+                    assert!(
+                        prob.grid.is_obstacle(d.idx(nx, ny)),
+                        "pad-a halo cell ({nx},{ny}) must be reserved"
+                    );
+                }
             }
         }
-        // Symmetric for pad "b" at cell (4,3): halo (3..=5, 2..=4).
-        for y in 2..=4 {
-            for x in 3..=5 {
-                assert!(
-                    prob.grid.is_obstacle(d.idx(x, y)),
-                    "pad-b halo cell ({x},{y}) must be reserved"
-                );
-            }
-        }
 
-        // Net "a" can escape its OWN pad: its passable_pads includes the halo
-        // around cell (1,3) — e.g. the cell directly below it, (1,2), which is an
-        // obstacle in the base grid but unmasked for net "a".
+        // Net "a" can escape its OWN pad: its passable_pads includes that same
+        // geometric halo (cells that are obstacles in the base grid but unmasked for
+        // net "a"). Pick the immediate line neighbours around the pad cell.
         let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
-        for (x, y) in [(0, 3), (2, 3), (1, 2), (1, 4)] {
+        let neighbours = [
+            (ax.saturating_sub(1), ay),
+            (ax + 1, ay),
+            (ax, ay.saturating_sub(1)),
+            (ax, ay + 1),
+        ];
+        for (x, y) in neighbours {
+            if x >= d.w || y >= d.h {
+                continue;
+            }
             let cell = d.idx(x, y);
-            assert!(
-                prob.grid.is_obstacle(cell),
-                "halo cell ({x},{y}) is an obstacle in the base grid"
-            );
             assert!(
                 net_a.passable_pads.contains(&cell),
                 "net a must be able to traverse its own-pad halo at ({x},{y})"
             );
         }
-        // Net "a" must NOT be allowed through the foreign pad "b" or its halo.
-        let net_b_core = d.idx(4, 3);
+        // Net "a" must NOT be allowed through the foreign pad "b" core.
         assert!(
-            !net_a.passable_pads.contains(&net_b_core),
+            !net_a.passable_pads.contains(&pad_b),
             "net a must not be allowed through foreign pad b"
         );
     }
 
-    /// `clearance_cells = 0` is byte-identical to the historical rasterisation:
-    /// the same obstacle set and the same `passable_pads` as a no-clearance build.
+    /// `clearance_cells = 0`: the no-clearance build. Grid + nets match `rasterize`
+    /// (no clearance) exactly, and the only obstacles are the two pad blocks with no
+    /// inflation halo grown around them.
     #[test]
     fn rasterize_clearance_zero_is_byte_identical() {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
@@ -1361,13 +2023,596 @@ mod tests {
             "clearance_cells=0 nets/passable_pads must equal the no-clearance build"
         );
 
-        // And no extra obstacles beyond the two 1-cell pads exist.
+        // No inflation halo: the obstacle set is exactly the two pad blocks. On the
+        // Hanan grid each 0.5×0.5 pad (edges + centre line) spans a 3×3 cell block,
+        // so 2 pads = 18 obstacle cells, and they are confined to the pads' rows.
+        let d = zero.mapping.dims;
         let obstacles = zero
             .grid
             .cost
             .iter()
             .filter(|&&c| c == mr_core::OBSTACLE)
             .count();
-        assert_eq!(obstacles, 2, "exactly the two single-cell pads, no halo");
+        assert_eq!(obstacles, 18, "two 3x3 pad blocks, no inflation halo");
+        // Confirm there is no halo above/below the pad block: the row two lines above
+        // the pad-a top edge is free at the pad's column.
+        let (ax, _ay) = zero.mapping.point_to_xy((1.5, 3.5));
+        let top_edge_row = zero.mapping.point_to_xy((1.5, 3.25)).1;
+        if top_edge_row >= 1 {
+            assert!(
+                !zero.grid.is_obstacle(d.idx(ax, top_edge_row - 1)),
+                "no inflation above the pad block"
+            );
+        }
+    }
+
+    /// Two adjacent pads of DIFFERENT nets where the declared track width EXCEEDS the
+    /// clearance (`track_w = 0.3 > clearance = 0.1`) — the regime in which the bare
+    /// `clearance` halo under-reserves. Pad "a" at (2.0,2.0) (right edge x=2.3) and pad
+    /// "b" at (3.3,2.0) (left edge x=3.0) leave a 0.7 gap between their inner edges.
+    /// 0.7 ≥ channel (track_w + 2·clearance = 0.5), so `fill_lines` subdivides it
+    /// (intervals = ceil(0.7/0.3) = 3, step ≈ 0.233): the first fill lane lands at
+    /// x ≈ 2.533, i.e. 0.233 from pad "a"'s edge — OUTSIDE the bare 0.1 clearance halo
+    /// but INSIDE the correct 0.25 (= clearance + track_w/2) centreline margin. That is
+    /// exactly the "free lane just outside the clearance-only halo" the review flagged:
+    /// a centred 0.3 trace there reaches 0.233 − 0.15 = 0.083 of pad "a" (< 0.1 → DRC
+    /// overlap). `minClearance` 0.1, `minTraceWidth` 0.3.
+    const TRACK_GT_CLEARANCE_SRJ: &str = r#"{
+        "minTraceWidth": 0.3,
+        "minClearance": 0.1,
+        "layerCount": 1,
+        "bounds": { "minX": 0, "maxX": 6, "minY": 0, "maxY": 6 },
+        "obstacles": [
+            { "type": "rect", "center": {"x": 2.0, "y": 2.0}, "width": 0.6, "height": 0.6,
+              "connectedTo": ["pad_a"] },
+            { "type": "rect", "center": {"x": 3.3, "y": 2.0}, "width": 0.6, "height": 0.6,
+              "connectedTo": ["pad_b"] }
+        ],
+        "connections": [
+            { "name": "a", "pointsToConnect": [ {"x": 2.0, "y": 2.0}, {"x": 2.0, "y": 5.0} ] },
+            { "name": "b", "pointsToConnect": [ {"x": 3.3, "y": 2.0}, {"x": 3.3, "y": 5.0} ] }
+        ]
+    }"#;
+
+    /// REGRESSION (DRC overlap when `track_w > clearance`): the foreign-copper halo
+    /// must reserve the **track-centreline** distance `clearance + track_w/2`, not just
+    /// `clearance`. Otherwise a *free* (routable) node can sit `clearance` from a pad
+    /// edge, and a centred `track_w` trace placed there reaches `clearance - track_w/2`
+    /// of the foreign pad — a DRC overlap whenever `track_w > clearance`.
+    ///
+    /// Assert the physically-correct invariant directly on the rasterised grid: NO
+    /// routable (non-obstacle) node lies within `clearance + track_w/2` (line-distance,
+    /// both axes) of a FOREIGN pad's copper rect. (A node may be within that distance of
+    /// its OWN pad — own-pad escape is allowed via `passable_pads` — so the check skips
+    /// nodes that fall inside, or in the reserved margin of, the pad they belong to. We
+    /// approximate "foreign" conservatively: a node is offending only if it is free yet
+    /// within the margin of a pad rect it is NOT inside.)
+    #[test]
+    fn track_gt_clearance_reserves_centreline_margin_zero_free_nodes() {
+        let srj: SimpleRouteJson = serde_json::from_str(TRACK_GT_CLEARANCE_SRJ).unwrap();
+        // Drive the SAME entry the live `/solve` + CLI routing path uses, with a real
+        // clearance: clearance_cells = ceil(0.1 / 0.05) = 2 → clearance_mm = 0.1.
+        let resolution = 0.05;
+        let clearance = 0.1_f64;
+        let track_w = 0.3_f64;
+        let margin = clearance + track_w / 2.0; // 0.25 — the track-centreline rule
+        let clearance_cells = (clearance / resolution).ceil() as u32;
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells);
+        let d = prob.mapping.dims;
+
+        // Each pad's copper rect (continuous).
+        let pads: Vec<(f64, f64, f64, f64)> = srj
+            .obstacles
+            .iter()
+            .map(|o| {
+                (
+                    o.center.x - o.width / 2.0,
+                    o.center.x + o.width / 2.0,
+                    o.center.y - o.height / 2.0,
+                    o.center.y + o.height / 2.0,
+                )
+            })
+            .collect();
+
+        // Line-distance from a point to a rect's nearest edge (0 if inside).
+        let dist_to_rect = |x: f64, y: f64, r: &(f64, f64, f64, f64)| -> f64 {
+            let dx = (r.0 - x).max(x - r.1).max(0.0);
+            let dy = (r.2 - y).max(y - r.3).max(0.0);
+            dx.max(dy) // Chebyshev: the halo is a square (both axes ≤ margin)
+        };
+        let inside = |x: f64, y: f64, r: &(f64, f64, f64, f64)| -> bool {
+            x >= r.0 && x <= r.1 && y >= r.2 && y <= r.3
+        };
+
+        let eps = 1e-9;
+        let mut offending = 0usize;
+        for ny in 0..d.h {
+            for nx in 0..d.w {
+                let cell = d.idx(nx, ny);
+                if prob.grid.is_obstacle(cell) {
+                    continue; // reserved node — fine
+                }
+                let (x, y) = (
+                    prob.mapping.x_lines[nx as usize],
+                    prob.mapping.y_lines[ny as usize],
+                );
+                for r in &pads {
+                    // Skip the node's OWN pad (escape via passable_pads is permitted).
+                    if inside(x, y, r) {
+                        continue;
+                    }
+                    // A free node within `margin` of a FOREIGN pad edge is the bug.
+                    if dist_to_rect(x, y, r) < margin - eps {
+                        offending += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            offending, 0,
+            "every routable node must be ≥ clearance+track_w/2 ({margin}) from a foreign \
+             pad — found {offending} free nodes inside the centreline margin (DRC overlap)"
+        );
+
+        // Sanity: the fix must NOT block everything — the board still has routable nodes
+        // (otherwise a trivially-empty grid would also pass the loop above).
+        let free = prob
+            .grid
+            .cost
+            .iter()
+            .filter(|&&c| c != mr_core::OBSTACLE)
+            .count();
+        assert!(free > 0, "fix over-blocked: no routable nodes remain");
+    }
+
+    /// The same fixture must also leave each net able to ESCAPE its own pad: the fix
+    /// widened the foreign halo, so the own-pad `passable_pads` had to widen to match
+    /// (else completion tanks). Assert net "a" can traverse its own-pad neighbourhood.
+    #[test]
+    fn track_gt_clearance_keeps_own_pad_escapable() {
+        let srj: SimpleRouteJson = serde_json::from_str(TRACK_GT_CLEARANCE_SRJ).unwrap();
+        let resolution = 0.05;
+        let clearance_cells = (0.1_f64 / resolution).ceil() as u32;
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells);
+        let d = prob.mapping.dims;
+        let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
+        let (ax, ay) = prob.mapping.point_to_xy((2.0, 2.0));
+        // The four immediate line neighbours of pad-a's centre cell are inside the
+        // (now wider) own-pad halo and must be unmasked for net "a".
+        for (x, y) in [
+            (ax.saturating_sub(1), ay),
+            (ax + 1, ay),
+            (ax, ay.saturating_sub(1)),
+            (ax, ay + 1),
+        ] {
+            if x >= d.w || y >= d.h {
+                continue;
+            }
+            assert!(
+                net_a.passable_pads.contains(&d.idx(x, y)),
+                "net a must traverse its own-pad halo at ({x},{y}) after the widened margin"
+            );
+        }
+        // And never through foreign pad b's core.
+        let (bx, by) = prob.mapping.point_to_xy((3.3, 2.0));
+        assert!(
+            !net_a.passable_pads.contains(&d.idx(bx, by)),
+            "net a must not be allowed through foreign pad b"
+        );
+    }
+
+    /// Phase 3a fixture: an IC pad at an arbitrary sub-grid coordinate plus a target,
+    /// a board with a couple of obstacles at off-integer positions, and a real DRC
+    /// (track width + clearance). Exercises the Hanan line construction end to end.
+    const HANAN_SRJ: &str = r#"{
+        "minTraceWidth": 0.15,
+        "minClearance": 0.2,
+        "layerCount": 1,
+        "bounds": { "minX": 0, "maxX": 20, "minY": 0, "maxY": 20 },
+        "obstacles": [
+            { "type": "rect", "center": {"x": 7.3, "y": 4.1}, "width": 1.2, "height": 0.8 },
+            { "type": "rect", "center": {"x": 12.6, "y": 13.9}, "width": 2.0, "height": 1.0 }
+        ],
+        "connections": [
+            { "name": "net1", "pointsToConnect": [ {"x": 3.14, "y": 2.72}, {"x": 16.5, "y": 17.25} ] }
+        ]
+    }"#;
+
+    /// (a) Every pad-endpoint coordinate maps to a grid node whose `cell_center`
+    /// equals the *exact* pad coordinate — the core Hanan invariant that makes the
+    /// pin-snap an identity and removes the pad-exit wiggle.
+    #[test]
+    fn pad_center_maps_to_exact_node() {
+        let srj: SimpleRouteJson = serde_json::from_str(HANAN_SRJ).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        for conn in &srj.connections {
+            for p in &conn.points_to_connect {
+                let cell = prob.mapping.point_to_cell((p.x, p.y));
+                let (cx, cy) = prob.mapping.cell_center(cell);
+                assert!(
+                    (cx - p.x).abs() <= LINE_EPSILON && (cy - p.y).abs() <= LINE_EPSILON,
+                    "pad ({}, {}) must land on an exact node, got cell_center ({cx}, {cy})",
+                    p.x,
+                    p.y
+                );
+            }
+        }
+    }
+
+    /// (c) The Hanan line set passes through every endpoint coordinate and every
+    /// obstacle edge (`center ± w/2`, `center ± h/2`), plus the board bounds.
+    #[test]
+    fn lines_pass_through_endpoints_and_obstacle_edges() {
+        let srj: SimpleRouteJson = serde_json::from_str(HANAN_SRJ).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        let has = |lines: &[f64], v: f64| lines.iter().any(|&l| (l - v).abs() <= LINE_EPSILON);
+
+        // Board bounds.
+        assert!(has(&prob.mapping.x_lines, 0.0) && has(&prob.mapping.x_lines, 20.0));
+        assert!(has(&prob.mapping.y_lines, 0.0) && has(&prob.mapping.y_lines, 20.0));
+
+        // Every endpoint coordinate is a line on its axis.
+        for conn in &srj.connections {
+            for p in &conn.points_to_connect {
+                assert!(has(&prob.mapping.x_lines, p.x), "x line through endpoint {}", p.x);
+                assert!(has(&prob.mapping.y_lines, p.y), "y line through endpoint {}", p.y);
+            }
+        }
+
+        // Every obstacle edge is a line on its axis.
+        for obs in &srj.obstacles {
+            for ex in [obs.center.x - obs.width / 2.0, obs.center.x + obs.width / 2.0] {
+                assert!(has(&prob.mapping.x_lines, ex), "x line through obstacle edge {ex}");
+            }
+            for ey in [obs.center.y - obs.height / 2.0, obs.center.y + obs.height / 2.0] {
+                assert!(has(&prob.mapping.y_lines, ey), "y line through obstacle edge {ey}");
+            }
+        }
+    }
+
+    /// (b) The first trace segment leaving a pad is collinear with the second — no
+    /// dogleg. Because the pad sits on its own node, the `pin_points` snap-back is an
+    /// identity, so a path that leaves the pad straight stays straight after
+    /// de-rasterisation (the old uniform grid offset the pad from its cell centre,
+    /// bending the first segment into an S — that is now gone).
+    #[test]
+    fn first_segment_leaving_pad_is_collinear() {
+        let srj: SimpleRouteJson = serde_json::from_str(HANAN_SRJ).unwrap();
+        let prob = rasterize(&srj, 1.0);
+        // The src pad cell and its two horizontal neighbours on the same row form a
+        // straight exit lane (all share the pad's y line). Build that path manually
+        // (mr-srj has no router) and de-rasterise it.
+        let src = prob.nets[0].src;
+        let (sx, sy) = prob.mapping.dims.xy(src);
+        assert!(sx + 2 < prob.mapping.dims.w, "room for a straight exit");
+        let d = prob.mapping.dims;
+        let path = vec![
+            src,
+            d.idx(sx + 1, sy),
+            d.idx(sx + 2, sy),
+        ];
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: prob.nets[0].net.clone(),
+                path,
+                cost: 2,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+        };
+        let traces = to_solution_layered(
+            &board,
+            &prob.mapping,
+            &prob.pin_points,
+            0.15,
+            &prob.layers,
+        );
+        let pts: Vec<(f64, f64)> = traces[0]
+            .route
+            .iter()
+            .map(|p| match p {
+                RoutePoint::Wire { x, y, .. } => (*x, *y),
+                RoutePoint::Via { x, y, .. } => (*x, *y),
+            })
+            .collect();
+        assert_eq!(pts.len(), 3);
+        // First vertex is the exact pad coordinate (snap-back identity).
+        let p0 = &srj.connections[0].points_to_connect[0];
+        assert!(
+            (pts[0].0 - p0.x).abs() <= LINE_EPSILON && (pts[0].1 - p0.y).abs() <= LINE_EPSILON,
+            "first vertex must be the exact pad coord, got {:?}",
+            pts[0]
+        );
+        // Collinearity: cross product of (p1-p0) and (p2-p0) is ~0 → no dogleg.
+        let cross = (pts[1].0 - pts[0].0) * (pts[2].1 - pts[0].1)
+            - (pts[1].1 - pts[0].1) * (pts[2].0 - pts[0].0);
+        assert!(
+            cross.abs() <= 1e-9,
+            "first two segments must be collinear (no pad-exit dogleg), cross = {cross}"
+        );
+    }
+
+    // ---- FIX 2 (fill coverage) + FIX 3 (cell budget) ----
+
+    /// FIX 2 (A): two adjacent pads whose inner gap comfortably exceeds the routing
+    /// channel (`track_w + 2·clearance`) MUST get a fill lane in the free corridor
+    /// between them — the previous `gap > channel` (strict) policy could drop the lane
+    /// for a gap that exactly equalled the channel, disconnecting the net. The lane
+    /// must sit ≥ clearance from both pad edges (so a track on it keeps clearance).
+    #[test]
+    fn fill_inserts_routable_channel_between_adjacent_pads() {
+        let track_w = 0.1;
+        let clearance = 0.1;
+        let channel = track_w + 2.0 * clearance; // 0.3
+                                                  // Two 0.4-wide pads centred at x=0 and x=1.0: inner edges 0.2 and 0.8,
+                                                  // gap 0.6 > channel. Free corridor (edges + clearance) is [0.3, 0.7].
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(clearance),
+            obstacles: vec![
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 1.0, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+            ],
+            connections: vec![],
+            bounds: Bounds { min_x: -1.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
+        };
+        let (xs, _ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        // At least one fill line falls strictly inside the free corridor [0.3, 0.7]
+        // (≥ clearance from both pad edges), so a track of another net can run there.
+        let lane = xs.iter().find(|&&x| x > 0.3 + LINE_EPSILON && x < 0.7 - LINE_EPSILON);
+        assert!(
+            lane.is_some(),
+            "expected a routing lane in the [0.3,0.7] corridor between the pads, got {xs:?}"
+        );
+        // The boundary case: a gap exactly equal to the channel still yields a lane —
+        // and there the single subdivision lands on the exact midpoint.
+        // A gap only just above the channel still yields a lane (the old `gap > channel`
+        // strict skip risked dropping near-boundary channels → disconnect). Pads 0.4
+        // wide whose inner edges are 0.32 apart (just over channel 0.30): centres ±0.36.
+        let srj2 = SimpleRouteJson {
+            obstacles: vec![
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: -0.36, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.36, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+            ],
+            ..srj.clone()
+        };
+        let (xs2, _) = build_grid_lines(&srj2, 1, track_w, clearance);
+        // Inner edges at -0.16 and 0.16 (gap 0.32 > channel) → a lane in the free
+        // corridor [-0.06, 0.06] (≥ clearance from both edges).
+        assert!(
+            xs2.iter().any(|&x| x.abs() <= 0.06 + LINE_EPSILON),
+            "a gap just above the channel must still get a clearance-legal lane, got {xs2:?}"
+        );
+        assert!(
+            channel > 0.0,
+            "sanity: channel is the gap that just admits a clearance-legal lane"
+        );
+    }
+
+    /// FIX 2 (A): two pads closer than `track_w` (no track fits at all) get NO fill
+    /// lane between them — a lane there would be a DRC overlap — so the route must go
+    /// around. The surrounding (wider) gaps still carry channels.
+    #[test]
+    fn fill_no_lane_when_pads_too_tight_but_go_around_exists() {
+        let track_w = 0.1;
+        let clearance = 0.1;
+        // Pads 0.4 wide centred at x=0 and x=0.42: inner edges 0.2 and 0.22, gap 0.02
+        // (< track_w) — physically unroutable between them.
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(clearance),
+            obstacles: vec![
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.42, y: 0.0, layer: None },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+            ],
+            connections: vec![],
+            bounds: Bounds { min_x: -2.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
+        };
+        let (xs, _) = build_grid_lines(&srj, 1, track_w, clearance);
+        // No fill line inside the unroutable 0.02-wide gap [0.2, 0.22].
+        assert!(
+            !xs.iter().any(|&x| x > 0.2 + LINE_EPSILON && x < 0.22 - LINE_EPSILON),
+            "must NOT place a lane in a sub-track gap, got {xs:?}"
+        );
+        // But a go-around lane exists in the wide open board area beyond the pads
+        // (e.g. between the right pad edge 0.62 and the +2.0 bound).
+        assert!(
+            xs.iter().any(|&x| x > 0.62 + LINE_EPSILON && x < 2.0 - LINE_EPSILON),
+            "a go-around channel must exist in the open area, got {xs:?}"
+        );
+    }
+
+    /// FIX 3: a dense pad field whose Hanan + fill grid would exceed [`CELL_BUDGET`]
+    /// is brought back UNDER budget by thinning fill lines, while every feature line
+    /// (pad edges) is kept. This proves the budget is ENFORCED, not merely warned.
+    #[test]
+    fn cell_budget_is_enforced_by_thinning_fill() {
+        // A field of 0.4mm pads on a 0.5mm pitch, big enough that the fill grid would
+        // blow past the budget. Track 0.1 / clearance 0.1 → channel 0.3, so the
+        // 0.1-wide inter-pad gaps get no fill but the board interior between rows does.
+        let track_w = 0.1;
+        let clearance = 0.1;
+        let n = 60; // 60×60 pads → ~120 feature lines + dense fill per axis
+        let pitch = 0.5;
+        let mut obstacles = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                obstacles.push(Obstacle {
+                    kind: "rect".into(),
+                    center: Point {
+                        x: i as f64 * pitch,
+                        y: j as f64 * pitch,
+                        layer: None,
+                    },
+                    width: 0.4,
+                    height: 0.4,
+                    layers: vec![],
+                    connected_to: vec![],
+                });
+            }
+        }
+        let span = (n as f64 - 1.0) * pitch;
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(clearance),
+            obstacles,
+            connections: vec![],
+            bounds: Bounds {
+                min_x: -1.0,
+                max_x: span + 1.0,
+                min_y: -1.0,
+                max_y: span + 1.0,
+            },
+        };
+
+        // What the FEATURE lines alone cost (the irreducible floor): pad edges + bounds.
+        let mut xf: Vec<f64> = vec![-1.0, span + 1.0];
+        for i in 0..n {
+            xf.push(i as f64 * pitch - 0.2);
+            xf.push(i as f64 * pitch + 0.2);
+        }
+        sort_dedup(&mut xf);
+        let feature_cells = xf.len().saturating_mul(xf.len());
+        assert!(
+            feature_cells <= CELL_BUDGET,
+            "test precondition: feature lines ({}²={feature_cells}) must fit the budget \
+             so fill-thinning can succeed",
+            xf.len()
+        );
+
+        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        let cells = xs.len().saturating_mul(ys.len());
+        assert!(
+            cells <= CELL_BUDGET,
+            "budget must be ENFORCED: {}×{} = {cells} cells should be ≤ {CELL_BUDGET}",
+            xs.len(),
+            ys.len(),
+        );
+        // Every pad-edge feature line survives the thinning (pads stay on-node).
+        for i in 0..n {
+            for edge in [i as f64 * pitch - 0.2, i as f64 * pitch + 0.2] {
+                assert!(
+                    xs.iter().any(|&x| (x - edge).abs() <= LINE_EPSILON),
+                    "feature line {edge} must be kept after budget thinning"
+                );
+            }
+        }
+    }
+
+    /// FIX 3: when the FEATURE lines alone exceed the budget, thinning fill cannot
+    /// help — `build_grid_lines` must still return a usable grid (all features) rather
+    /// than panicking or hanging, and the over-budget condition is surfaced (logged).
+    #[test]
+    fn cell_budget_feature_lines_alone_over_budget_returns_all_features() {
+        let track_w = 0.1;
+        let clearance = 0.0;
+        // 250 pads in a line on each axis with distinct coordinates → ~500 feature
+        // lines per axis → 500² = 250k cells from features alone, well over budget.
+        let n = 250;
+        let mut obstacles = Vec::new();
+        for i in 0..n {
+            obstacles.push(Obstacle {
+                kind: "rect".into(),
+                center: Point {
+                    x: i as f64,
+                    y: i as f64,
+                    layer: None,
+                },
+                width: 0.4,
+                height: 0.4,
+                layers: vec![],
+                connected_to: vec![],
+            });
+        }
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(clearance),
+            obstacles,
+            connections: vec![],
+            bounds: Bounds {
+                min_x: -1.0,
+                max_x: n as f64,
+                min_y: -1.0,
+                max_y: n as f64,
+            },
+        };
+        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        // Feature lines alone exceed the budget; we still get them all (every pad edge
+        // present so pads stay on-node), and fill is fully dropped.
+        assert!(xs.len().saturating_mul(ys.len()) > CELL_BUDGET);
+        for i in 0..n {
+            for edge in [i as f64 - 0.2, i as f64 + 0.2] {
+                assert!(
+                    xs.iter().any(|&x| (x - edge).abs() <= LINE_EPSILON),
+                    "feature line {edge} must always survive"
+                );
+            }
+        }
+    }
+
+    /// `enforce_budget` thins fill (keeping every feature line) until the product is
+    /// under budget, exercising the coalesce + least-important-drop path directly.
+    #[test]
+    fn enforce_budget_keeps_features_and_drops_redundant_fill() {
+        // Few features, a flood of fill on the x axis only.
+        let x_features = vec![0.0, 10.0];
+        let y_features = vec![0.0, 1.0, 2.0];
+        let mut x_fill: Vec<f64> = (1..=5000).map(|k| k as f64 * 0.001).collect();
+        let mut y_fill: Vec<f64> = Vec::new();
+        enforce_budget(&x_features, &y_features, &mut x_fill, &mut y_fill);
+        let cells = (x_features.len() + x_fill.len()) * (y_features.len() + y_fill.len());
+        assert!(
+            cells <= CELL_BUDGET,
+            "enforce_budget must bring the product under the ceiling, got {cells}"
+        );
+        // Feature lines are untouched.
+        assert_eq!(x_features, vec![0.0, 10.0]);
+        assert_eq!(y_features, vec![0.0, 1.0, 2.0]);
     }
 }

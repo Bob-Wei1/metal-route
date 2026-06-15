@@ -21,7 +21,7 @@ pub mod bench;
 pub mod drc;
 use std::collections::HashMap;
 
-use mr_core::{BoardRoute, CellIdx, LayerMap, Router, ViaModel};
+use mr_core::{BoardRoute, CellIdx, GridCoords, LayerMap, Router, ViaModel};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
 use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
 use mr_srj::{rasterize_with_layers, to_solution_layered, Mapping, RoutePoint, SimpleRouteJson};
@@ -262,11 +262,18 @@ pub fn route_problem(
     // Only the negotiated backend places vias; give it a through-hole model over
     // the routed stackup. Lee/Ripup route per-layer with no layer changes.
     let via_model = ViaModel::through_hole(problem.mapping.dims.layers);
+    // The board's continuous grid-line geometry, so the negotiated router prices
+    // planar steps by their real length. On a uniform grid this is byte-identical to
+    // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
+    // the true pitch.
+    let coords =
+        GridCoords::from_lines(problem.mapping.x_lines.clone(), problem.mapping.y_lines.clone());
     let board = match router {
         RouterKind::Lee => LeeRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Negotiated => NegotiatedRouter::new()
             .with_via_model(via_model)
+            .with_coords(coords)
             .route(&problem.grid, &problem.nets),
     }
     .context("router failed")?;
@@ -731,10 +738,18 @@ pub fn route_dsn_problem(
     let grid_h = problem.mapping.dims.h;
     let grid_layers = problem.mapping.dims.layers;
 
+    // Continuous grid-line geometry: prices planar steps by real length (uniform-grid
+    // byte-identical, Hanan-grid pitch-aware).
+    let coords =
+        GridCoords::from_lines(problem.mapping.x_lines.clone(), problem.mapping.y_lines.clone());
     let start = std::time::Instant::now();
     let board = NegotiatedRouter::new()
         .with_via_model(via_model)
-        .with_clearance_cells(clearance_cells)
+        // Geometric clearance over the (possibly non-uniform) line arrays — the same
+        // mm budget the rasteriser inflated foreign pads by — so inter-net spacing is
+        // a real distance, not a cell count that varies with local pitch.
+        .with_clearance_mm(stats.min_clearance_mm)
+        .with_coords(coords)
         .route(&problem.grid, &problem.nets)
         .context("router failed")?;
     let wall_s = start.elapsed().as_secs_f64();
@@ -892,8 +907,13 @@ mod tests {
         // Two 2-point connections -> two nets, both routable on this open board.
         assert_eq!(summary.total, 2);
         assert_eq!(summary.routed, 2);
-        assert_eq!(summary.grid_w, 10);
-        assert_eq!(summary.grid_h, 10);
+        // Non-uniform / Hanan grid (Phase 3): lines fall on the bounds, every pad
+        // endpoint, every obstacle edge ({4,6}), plus fill channels. `fill_lines` now
+        // adds a midpoint lane in every gap ≥ channel (the coverage fix), so a unit gap
+        // (e.g. 0↔1) gets its midpoint 0.5 and 3-wide gaps (e.g. 1↔4) get 2,3 — the
+        // union is {0,0.5,1,2,3,4,5,6,7,8,9,9.5,10} = 13 lines per axis.
+        assert_eq!(summary.grid_w, 13);
+        assert_eq!(summary.grid_h, 13);
         assert!(summary.total_cost > 0);
 
         assert_eq!(traces.len(), 2);

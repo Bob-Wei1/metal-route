@@ -45,14 +45,22 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError, ViaModel,
-    OBSTACLE,
+    BoardRoute, CellIdx, Cost, Grid, GridCoords, NetEndpoints, RouteResult, Router, RouterError,
+    ViaModel, OBSTACLE,
 };
 
-use crate::dijkstra::{astar_buf, SearchBuf};
+use crate::dijkstra::{astar_buf, edge_cost, SearchBuf, COST_SCALE};
 
-/// Fixed-point cost scale: the base cost of stepping onto a passable cell.
-pub const SCALE: Cost = 16;
+/// Fixed-point cost scale: the base cost of one unit of planar travel.
+///
+/// Numerically equal to [`COST_SCALE`] (`16`): a planar step of unit geometric
+/// length costs `SCALE`, and on a non-uniform grid a step of length `len` costs
+/// `round(len * COST_SCALE)` (see [`edge_cost`]). All congestion penalties below are
+/// expressed in multiples of `SCALE`, so they keep their strength *relative to the
+/// geometric base step* regardless of the board's physical pitch. On a uniform grid
+/// every step has length 1, so the base step is exactly `SCALE` and the whole cost
+/// model is byte-identical to the pre-geometric router.
+pub const SCALE: Cost = COST_SCALE as Cost;
 
 /// Soft clearance penalty (TritonRoute `objCost`-style): the extra price a net pays
 /// to step onto a cell that lies in *another* group's committed clearance halo
@@ -99,9 +107,6 @@ pub const MAX_ITERS: u32 = 60;
 /// (index-ordered merge) regardless of net count.
 const PARALLEL_NEGOTIATION_THRESHOLD: usize = 16;
 
-/// Free-cell cost used when unmasking a net's own pad cells (mirrors the base grid
-/// convention used by `GridBuilder`, which fills passable cells with cost 1).
-const FREE_COST: Cost = 1;
 
 /// Bounded rip-up-and-reroute budget multipliers (see [`ripup_legalize`]). The
 /// global budget caps the total number of rip-up operations; the per-net cap
@@ -225,22 +230,39 @@ impl PadSet {
 #[derive(Debug, Default, Clone)]
 pub struct NegotiatedRouter {
     via_model: Option<ViaModel>,
-    /// Planar Chebyshev clearance radius (in cells) reserved around committed
-    /// copper during legalization to keep *other* nets away — a net's committed
-    /// track owns not just its path cells but a halo of this radius on each cell's
-    /// own layer, so foreign nets must stay at least this far from it (minimum
-    /// spacing). `0` = disabled, i.e. today's behaviour (only the path cells are
-    /// owned). The halo never overwrites a cell already owned by another group and
-    /// never claims a base-obstacle cell, so it cannot wall a foreign net off from
-    /// its own pad.
-    clearance_cells: u32,
+    /// Continuous grid-line geometry used to price a planar step by its real length
+    /// (`round(len * COST_SCALE)`) instead of a uniform unit hop. `None` (the
+    /// default) means "no geometry supplied": the search falls back to
+    /// [`GridCoords::uniform`] over the grid's `dims`, where every step has unit
+    /// length and the base step is exactly [`SCALE`] — byte-identical to the
+    /// pre-geometric router. On a non-uniform / Hanan grid the caller supplies the
+    /// board's line arrays via [`NegotiatedRouter::with_coords`].
+    coords: Option<GridCoords>,
+    /// Geometric clearance distance (continuous units, e.g. mm) reserved around
+    /// committed copper during legalization to keep *other* nets away — a net's
+    /// committed track owns not just its path cells but a halo extending this far on
+    /// each cell's own layer, measured over the [`coords`](NegotiatedRouter#structfield.coords)
+    /// line arrays, so foreign nets must stay at least this far from it (minimum
+    /// spacing). `0.0` = disabled, i.e. the original behaviour (only the path cells
+    /// are owned). The halo never overwrites a cell already owned by another group
+    /// and never claims a base-obstacle cell, so it cannot wall a foreign net off
+    /// from its own pad.
+    ///
+    /// On a [`GridCoords::uniform`] grid (unit-spaced lines) a clearance of `n` is
+    /// byte-identical to the former `n`-cell Chebyshev radius, so
+    /// [`with_clearance_cells`](NegotiatedRouter::with_clearance_cells) (which sets
+    /// this to `n as f64`) reproduces the pre-geometric tests exactly. On a
+    /// non-uniform / Hanan grid the geometric distance is what keeps real
+    /// copper-to-copper spacing (a cell count there spans a variable physical width).
+    clearance_mm: f64,
 }
 
 impl NegotiatedRouter {
     pub fn new() -> Self {
         Self {
             via_model: None,
-            clearance_cells: 0,
+            coords: None,
+            clearance_mm: 0.0,
         }
     }
 
@@ -251,13 +273,35 @@ impl NegotiatedRouter {
         self
     }
 
-    /// Set the planar Chebyshev clearance radius (in cells) reserved around
-    /// committed copper, so distinct nets keep a minimum spacing of `n` cells.
-    /// Builder-style; returns the configured router. `0` (the default) disables the
-    /// halo and reproduces the byte-identical pre-clearance behaviour. See the
-    /// [`clearance_cells`](NegotiatedRouter#structfield.clearance_cells) field.
+    /// Supply the board's continuous grid-line geometry so planar steps are priced
+    /// by their real length (`round(len * COST_SCALE)`) rather than as uniform unit
+    /// hops. Builder-style; returns the configured router. Without it the router
+    /// uses [`GridCoords::uniform`] and is byte-identical to the pre-geometric
+    /// behaviour. See the [`coords`](NegotiatedRouter#structfield.coords) field.
+    pub fn with_coords(mut self, coords: GridCoords) -> Self {
+        self.coords = Some(coords);
+        self
+    }
+
+    /// Set the geometric clearance distance (continuous units, e.g. mm) reserved
+    /// around committed copper, so distinct nets keep at least this much spacing,
+    /// measured over the supplied [`coords`](NegotiatedRouter::with_coords) line
+    /// arrays. Builder-style; returns the configured router. `0.0` (the default)
+    /// disables the halo and reproduces the byte-identical pre-clearance behaviour.
+    /// See the [`clearance_mm`](NegotiatedRouter#structfield.clearance_mm) field.
+    pub fn with_clearance_mm(mut self, mm: f64) -> Self {
+        self.clearance_mm = mm.max(0.0);
+        self
+    }
+
+    /// Back-compat shim for callers/tests that express clearance as a cell count on a
+    /// uniform grid: a radius of `n` cells equals a geometric distance of `n` over
+    /// [`GridCoords::uniform`]'s unit-spaced lines, so this is exactly
+    /// [`with_clearance_mm`](NegotiatedRouter::with_clearance_mm)`(n as f64)` and
+    /// stays byte-identical to the former Chebyshev halo on a uniform grid. On a
+    /// non-uniform grid prefer `with_clearance_mm` with the real distance.
     pub fn with_clearance_cells(mut self, n: u32) -> Self {
-        self.clearance_cells = n;
+        self.clearance_mm = n as f64;
         self
     }
 }
@@ -279,22 +323,71 @@ fn unit_cost(path: &[CellIdx]) -> Cost {
     path.len().saturating_sub(1) as Cost
 }
 
-/// Manhattan distance between two cells, scaled by [`SCALE`], plus the layer
-/// distance priced at the cheapest legal via step (`min_via_cost`). Admissible
-/// for the 3D per-cell cost model: every planar step costs at least `SCALE` and
-/// every layer change costs at least `min_via_cost`, so reaching `b` from `a`
-/// requires at least `|dx|+|dy|` planar steps and `|layer(a)-layer(b)|` via
-/// steps. The estimate therefore never overestimates and keeps A* optimal while
-/// pruning the frontier. On a single-layer grid the layer term is always 0.
-fn manhattan_scaled(dims: mr_core::Dims, a: CellIdx, b: CellIdx, min_via_cost: Cost) -> Cost {
+/// Lower bound on the planar A* cost between two cells in fixed-point [`Cost`] units,
+/// plus the layer distance priced at the cheapest legal via step (`min_via_cost`).
+///
+/// # Admissibility (why a *sum of per-gap* `edge_cost`, not one `edge_cost` of the sum)
+///
+/// The search pays a planar step `u -> v` a base of `edge_cost(gap_uv) =
+/// round(COST_SCALE * gap_uv)` (plus non-negative congestion). So the planar base paid
+/// along ANY real path from `a` to `b` is `Σ_steps round(COST_SCALE * g_i)` over its
+/// per-step line gaps `g_i >= 0`. A heuristic is admissible iff it never exceeds that
+/// minimum.
+///
+/// The previous form `edge_cost(manhattan_len(a, b)) = round(COST_SCALE * Σ_axis Δ)`
+/// rounds the AGGREGATE length once. Because `round(Σ x_i)` can exceed `Σ round(x_i)`
+/// (round-of-sum > sum-of-rounds — e.g. two gaps of `1.5/16` each round to `0`, but
+/// their sum `3/16` rounds to `0`… and conversely `0.5/16` twice rounds to `0+0=0`
+/// while their sum `1/16` rounds to `1`), the old heuristic could OVERESTIMATE the
+/// per-step total the search actually pays on non-integer line spacings, making A*
+/// inadmissible and letting `astar_buf`'s "break on pop dst" return a non-optimal path.
+///
+/// The fix sums `edge_cost` over EACH grid-line gap along the two straight axis legs
+/// from `a` to `b`: `Σ_{x lines in [ax,bx)} edge_cost(gap) + Σ_{y lines in [ay,by)}
+/// edge_cost(gap)`. This is EXACTLY the planar base the search pays on a monotone
+/// (staircase) path between the cells, and any non-monotone path covers a superset of
+/// gaps (it must retrace), so it can only cost more. Hence this sum is `<=` the planar
+/// base of every real path — a guaranteed lower bound, in the same fixed-point units
+/// as the edge cost (the admissibility requirement for A* optimality). The via term is
+/// already admissible (`>= min_via_cost` per layer change) and is preserved as-is.
+///
+/// On a uniform grid every gap is `1.0`, `edge_cost(1.0) == COST_SCALE`, and the sum is
+/// `COST_SCALE * (dx + dy)` — byte-identical to the historical `(dx + dy) * SCALE` and
+/// to the old `edge_cost(manhattan_len)` there (the round-of-sum / sum-of-rounds gap
+/// only opens on non-integer spacings). The layer term is always 0 on a single-layer
+/// grid.
+fn manhattan_scaled(
+    dims: mr_core::Dims,
+    coords: &GridCoords,
+    a: CellIdx,
+    b: CellIdx,
+    min_via_cost: Cost,
+) -> Cost {
     let (ax, ay) = dims.xy(a);
     let (bx, by) = dims.xy(b);
-    let dx = ax.abs_diff(bx);
-    let dy = ay.abs_diff(by);
+    let planar = axis_leg_cost(&coords.x_lines, ax, bx)
+        .saturating_add(axis_leg_cost(&coords.y_lines, ay, by));
     let dl = dims.layer_of(a).abs_diff(dims.layer_of(b));
-    (dx + dy)
-        .saturating_mul(SCALE)
-        .saturating_add(dl.saturating_mul(min_via_cost))
+    planar.saturating_add(dl.saturating_mul(min_via_cost))
+}
+
+/// Sum of per-gap `edge_cost`s along one axis from line index `i` to line index `j`
+/// (order-independent) — i.e. `Σ edge_cost(|lines[k+1] - lines[k]|)` over every adjacent
+/// line gap strictly between the two indices. This is precisely the base cost the search
+/// accrues stepping straight along that axis, the per-step rounding the aggregate-length
+/// heuristic failed to account for. Out-of-range / mismatched indices fall back to unit
+/// spacing via [`GridCoords::x_of`]-style `.get(...).unwrap_or` semantics, mirrored here
+/// so a coords/grid size mismatch degrades to uniform pricing rather than panicking.
+#[inline]
+fn axis_leg_cost(lines: &[f64], i: u32, j: u32) -> Cost {
+    let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+    let mut total: Cost = 0;
+    for k in lo..hi {
+        let a = lines.get(k as usize).copied().unwrap_or(k as f64);
+        let b = lines.get(k as usize + 1).copied().unwrap_or((k + 1) as f64);
+        total = total.saturating_add(edge_cost((b - a).abs()));
+    }
+    total
 }
 
 impl Router for NegotiatedRouter {
@@ -326,6 +419,15 @@ impl Router for NegotiatedRouter {
             .via_model
             .clone()
             .unwrap_or_else(|| ViaModel::through_hole(dims.layers));
+
+        // Effective grid geometry: the caller's line arrays, or a uniform unit grid
+        // over `dims`. The uniform fallback prices every planar step at exactly
+        // `SCALE`, so a router given no coords is byte-identical to the pre-geometric
+        // behaviour. Referenced by `&` in every per-net search closure below.
+        let coords = self
+            .coords
+            .clone()
+            .unwrap_or_else(|| GridCoords::uniform(dims));
 
         // Reusable search workspace and own-pad membership set, sized once to the
         // board and reused across every per-net search (no per-net O(n) work).
@@ -360,7 +462,7 @@ impl Router for NegotiatedRouter {
         let mut present_halo: Vec<u32> = vec![0; n_cells];
         // Whether the clearance mechanism is active at all. Drives both the
         // `present_halo` pricing and the incremental-skip gating below.
-        let clearance_active = self.clearance_cells > 0 || via_model.keepout > 0;
+        let clearance_active = self.clearance_mm > 0.0 || via_model.keepout > 0;
         // Current routed path per net (empty == not currently routed).
         let mut paths: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
 
@@ -465,7 +567,7 @@ impl Router for NegotiatedRouter {
                     halo_dirty[c as usize] = false;
                 }
                 halo_dirty_cells.clear();
-                let clearance_cells = self.clearance_cells;
+                let clearance_mm = self.clearance_mm;
                 // Borrow the snapshots immutably for the duration of the parallel map.
                 // Each worker thread keeps its OWN reusable `SearchBuf` + `PadSet`
                 // scratch via `map_init` (never shared across threads). The closure
@@ -477,6 +579,7 @@ impl Router for NegotiatedRouter {
                 let nets_ref = nets;
                 let windows_ref = &windows;
                 let via_ref = &via_model;
+                let coords_ref = &coords;
                 let mut routed_paths: Vec<(usize, Option<Vec<CellIdx>>)> = dirty
                     .par_iter()
                     .map_init(
@@ -490,6 +593,7 @@ impl Router for NegotiatedRouter {
                             let routed = route_negotiated(
                                 buf,
                                 grid,
+                                coords_ref,
                                 pad_set,
                                 present_snap,
                                 halo_snap,
@@ -504,6 +608,7 @@ impl Router for NegotiatedRouter {
                                 route_negotiated(
                                     buf,
                                     grid,
+                                    coords_ref,
                                     pad_set,
                                     present_snap,
                                     halo_snap,
@@ -534,7 +639,7 @@ impl Router for NegotiatedRouter {
                     for &c in &paths[i] {
                         present[c as usize] = present[c as usize].saturating_sub(1);
                     }
-                    for_each_halo_cell(dims, grid, &paths[i], clearance_cells, &via_model, |c| {
+                    for_each_halo_cell(dims, &coords, grid, &paths[i], clearance_mm, &via_model, |c| {
                         present_halo[c as usize] = present_halo[c as usize].saturating_sub(1);
                         halo_delta[c as usize] -= 1;
                         halo_touched_cells.push(c);
@@ -546,9 +651,10 @@ impl Router for NegotiatedRouter {
                             }
                             for_each_halo_cell(
                                 dims,
+                                &coords,
                                 grid,
                                 &path,
-                                clearance_cells,
+                                clearance_mm,
                                 &via_model,
                                 |c| {
                                     present_halo[c as usize] =
@@ -606,9 +712,10 @@ impl Router for NegotiatedRouter {
                     if clearance_active {
                         for_each_halo_cell(
                             dims,
+                            &coords,
                             grid,
                             &paths[i],
-                            self.clearance_cells,
+                            self.clearance_mm,
                             &via_model,
                             |c| {
                                 present_halo[c as usize] =
@@ -625,6 +732,7 @@ impl Router for NegotiatedRouter {
                     let routed = route_negotiated(
                         &mut buf,
                         grid,
+                        &coords,
                         &pad_set,
                         &present,
                         &present_halo,
@@ -639,6 +747,7 @@ impl Router for NegotiatedRouter {
                         route_negotiated(
                             &mut buf,
                             grid,
+                            &coords,
                             &pad_set,
                             &present,
                             &present_halo,
@@ -658,9 +767,10 @@ impl Router for NegotiatedRouter {
                         if clearance_active {
                             for_each_halo_cell(
                                 dims,
+                                &coords,
                                 grid,
                                 &path,
-                                self.clearance_cells,
+                                self.clearance_mm,
                                 &via_model,
                                 |c| {
                                     present_halo[c as usize] =
@@ -768,13 +878,14 @@ impl Router for NegotiatedRouter {
                         let net = &nets[i];
                         pad_set.load(&net.passable_pads);
                         let routed = route_legal(
-                            buf, grid, pad_set, &no_owner, &no_halo, -1, net.src, net.dst,
-                            windows[i], &via_model,
+                            buf, grid, &coords, pad_set, &no_owner, &no_halo, -1, net.src,
+                            net.dst, windows[i], &via_model,
                         )
                         .or_else(|| {
                             route_legal(
                                 buf,
                                 grid,
+                                &coords,
                                 pad_set,
                                 &no_owner,
                                 &no_halo,
@@ -854,6 +965,7 @@ impl Router for NegotiatedRouter {
                 |(buf, pad_set), (idx, order)| {
                     let committed = legalize_in_order(
                         grid,
+                        &coords,
                         buf,
                         pad_set,
                         nets,
@@ -863,7 +975,7 @@ impl Router for NegotiatedRouter {
                         order,
                         n_cells,
                         &via_model,
-                        self.clearance_cells,
+                        self.clearance_mm,
                     );
                     let routed = committed.iter().filter(|c| c.is_some()).count();
                     let total_cost: Cost = committed
@@ -928,6 +1040,7 @@ impl Router for NegotiatedRouter {
         let committed = if best_routed < n_nets {
             let rip = ripup_legalize(
                 grid,
+                &coords,
                 &mut buf,
                 &mut pad_set,
                 nets,
@@ -938,7 +1051,7 @@ impl Router for NegotiatedRouter {
                 &multi_committed,
                 n_cells,
                 &via_model,
-                self.clearance_cells,
+                self.clearance_mm,
             );
             let rip_routed = rip.iter().filter(|c| c.is_some()).count();
             if rip_routed > best_routed {
@@ -973,16 +1086,21 @@ impl Router for NegotiatedRouter {
 }
 
 /// Route one net for the negotiation phase using on-the-fly congestion pricing —
-/// no grid clone. The cost to ENTER cell `c` is
-/// `SCALE + history[c] + pfac*SCALE*present[c]`, capped strictly below [`OBSTACLE`]
-/// (`present` already excludes this net's own occupancy). A cell is blocked iff it
-/// is a base obstacle that is NOT one of the net's own pads, or it lies outside
-/// `window`. The own endpoints are forced passable. Returns the windowed shortest
-/// path and its (priced) cost, or `None`.
+/// no grid clone. The price of the planar move `u -> v` is
+/// `edge_cost(len(u,v)) + history[v] + pfac*SCALE*present[v]` (+ the clearance halo
+/// term), capped strictly below [`OBSTACLE`] (`present` already excludes this net's
+/// own occupancy). The planar base is the move's GEOMETRIC length from `coords`
+/// rather than a uniform `SCALE`, so steps over a wide channel cost more than steps
+/// over a fine pitch; on a uniform grid every step is length 1 and the base is
+/// exactly `SCALE` (byte-identical). A cell is blocked iff it is a base obstacle that
+/// is NOT one of the net's own pads, or it lies outside `window`. The own endpoints
+/// are forced passable. Returns the windowed shortest path and its (priced) cost, or
+/// `None`.
 #[allow(clippy::too_many_arguments)]
 fn route_negotiated(
     buf: &mut SearchBuf,
     base: &Grid,
+    coords: &GridCoords,
     pads: &PadSet,
     present: &[u32],
     present_halo: &[u32],
@@ -994,15 +1112,16 @@ fn route_negotiated(
     via_model: &ViaModel,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
-    // Price to ENTER cell `c`: planar base `SCALE`, plus permanent history, the
-    // present-congestion penalty, and the clearance penalty (TritonRoute `objCost`
-    // analog) — `pfac * CLEARANCE_NEG_WEIGHT * present_halo[c]`, i.e. how many OTHER
-    // nets' clearance footprints cover `c`, scaled by the growing present-factor so
-    // the negotiation spreads nets apart over iterations. Capped below OBSTACLE.
-    // `present_halo` is all-zero when clearance is inactive, so this term vanishes
-    // (byte-identical default). Vias reuse this same congestion + clearance of the
-    // destination cell but substitute the planar `SCALE` base with the via's
-    // `step_cost` so layer changes also negotiate — see `via_step` below.
+    // Price to MOVE onto cell `c` over a base step cost `base_cost` (the planar
+    // geometric edge length for a planar move, or the via `step_cost` for a layer
+    // change): the base plus permanent history, the present-congestion penalty, and
+    // the clearance penalty (TritonRoute `objCost` analog) —
+    // `pfac * CLEARANCE_NEG_WEIGHT * present_halo[c]`, i.e. how many OTHER nets'
+    // clearance footprints cover `c`, scaled by the growing present-factor so the
+    // negotiation spreads nets apart over iterations. Capped below OBSTACLE. The
+    // congestion weights are multiples of `SCALE`, so they keep their strength
+    // relative to the geometric base step at any pitch. `present_halo` is all-zero
+    // when clearance is inactive, so that term vanishes (byte-identical default).
     let priced_with_base = |c: CellIdx, base_cost: u64| -> Cost {
         let ci = c as usize;
         let priced = base_cost
@@ -1013,7 +1132,12 @@ fn route_negotiated(
             );
         priced.min(OBSTACLE as u64 - 1) as Cost
     };
-    let cost_fn = |c: CellIdx| -> Cost { priced_with_base(c, SCALE as u64) };
+    // Edge-aware planar base: the geometric length of the move `u -> v`, in the same
+    // fixed-point units as the heuristic. On a uniform grid this is the constant
+    // `SCALE`, so `cost_fn` reduces to the historical `priced_with_base(v, SCALE)`.
+    let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
+        priced_with_base(v, edge_cost(coords.manhattan_len(dims, u, v)) as u64)
+    };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
             return true;
@@ -1036,7 +1160,7 @@ fn route_negotiated(
             None
         }
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, c, dst, via_model.step_cost);
+    let h = |c: CellIdx| manhattan_scaled(dims, coords, c, dst, via_model.step_cost);
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
@@ -1054,14 +1178,17 @@ fn route_negotiated(
 ///     halo costs nothing (same-net override). The penalized cost is capped strictly
 ///     below [`OBSTACLE`].
 ///
-/// The net's own pads are unmasked to [`FREE_COST`], its endpoints are always
-/// enterable, and the search is confined to `window`. `owner`/`halo` may each be
-/// empty to mean "no owners / no halo" (the alone-path case). Returns the windowed
-/// shortest path and its (possibly penalized) cost, or `None`.
+/// Every passable step is priced by its GEOMETRIC length (`edge_cost` from `coords`)
+/// rather than the grid's per-cell value, so the planar base ignores whether a cell
+/// is an unmasked own-pad or ordinary copper — its endpoints are always enterable and
+/// the search is confined to `window`. `owner`/`halo` may each be empty to mean "no
+/// owners / no halo" (the alone-path case). Returns the windowed shortest path and
+/// its (possibly penalized) cost, or `None`.
 #[allow(clippy::too_many_arguments)]
 fn route_legal(
     buf: &mut SearchBuf,
     base: &Grid,
+    coords: &GridCoords,
     pads: &PadSet,
     owner: &[i64],
     halo: &[i64],
@@ -1074,30 +1201,19 @@ fn route_legal(
     let dims = base.dims;
     let has_owner = !owner.is_empty();
     let has_halo = !halo.is_empty();
-    // Base passable cost of cell `c` (own pads / obstacle-endpoints unmasked to
-    // FREE_COST), before any soft clearance penalty.
-    let base_cost = |ci: CellIdx| -> Cost {
-        if ci == src || ci == dst {
-            if base.is_obstacle(ci) {
-                FREE_COST
-            } else {
-                base.cost_at(ci)
-            }
-        } else if base.is_obstacle(ci) {
-            // Reachable here only when it is one of the net's own pads (else
-            // blocked_fn rejected it); unmask to FREE_COST.
-            FREE_COST
-        } else {
-            base.cost_at(ci)
-        }
-    };
-    let cost_fn = |c: CellIdx| -> Cost {
-        let base_c = base_cost(c);
+    // Edge-aware planar base: the geometric length of the move `u -> v` in fixed-point
+    // units (same units as the heuristic), replacing the old uniform per-cell base.
+    // On a uniform grid every step is length 1, so the base is the constant `SCALE`
+    // (the legalizer reports `unit_cost(path)` — path length — so this magnitude only
+    // affects the path CHOICE, never the emitted cost). The soft clearance penalty is
+    // layered on top for a foreign halo cell, exactly as before.
+    let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
+        let base_c = edge_cost(coords.manhattan_len(dims, u, v));
         // Soft clearance penalty: entering a foreign group's halo cell that is not
         // real copper. Own-group halo (and own copper) costs nothing extra. Capped
         // strictly below OBSTACLE so a penalized cell is never an impassable one.
         if has_halo {
-            let ci = c as usize;
+            let ci = v as usize;
             let h = halo[ci];
             let is_copper = has_owner && owner[ci] >= 0;
             if h >= 0 && h != own_group && !is_copper {
@@ -1135,7 +1251,7 @@ fn route_legal(
             None
         }
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, c, dst, via_model.step_cost);
+    let h = |c: CellIdx| manhattan_scaled(dims, coords, c, dst, via_model.step_cost);
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
@@ -1147,15 +1263,24 @@ fn route_legal(
 /// (so the negotiation `present_halo` field and the legalization `halo` map share
 /// one shape):
 ///   * **Planar clearance halo.** For each path cell, on that cell's OWN layer, the
-///     `(2r+1)x(2r+1)` Chebyshev box of radius `r = clearance_cells`. Base-obstacle
+///     [`geom_box`] band of geometric radius `r = clearance` (continuous units over
+///     `coords`; the `(2r+1)x(2r+1)` Chebyshev box on a uniform grid). Base-obstacle
 ///     cells are SKIPPED (a halo never claims an obstacle / foreign pad).
 ///   * **Via keepout halo.** At each via (two consecutive path cells sharing `(x,y)`
-///     but differing in layer), on BOTH spanned layers, the Chebyshev box of radius
-///     `max(clearance_cells, via_model.keepout)`. Base-obstacle cells are SKIPPED.
+///     but differing in layer), on BOTH spanned layers, the geometric box of radius
+///     `max(clearance, via_model.keepout as f64)`. Base-obstacle cells are SKIPPED.
 ///
-/// When `clearance_cells == 0` AND `via_model.keepout == 0` every radius is 0, so
+/// When `clearance == 0.0` AND `via_model.keepout == 0` every radius is 0, so
 /// `visit` is never called and the footprint is empty — the property that keeps the
-/// `clearance_cells == 0` router byte-identical.
+/// clearance-off router byte-identical.
+///
+/// NON-UNIFORM GRID NOTE: the halo radius is a *geometric distance* (`clearance`,
+/// continuous units) measured over `coords`, NOT a cell count, so on a Hanan grid
+/// it spans the same physical width everywhere regardless of local line density —
+/// matching [`mr_grid::GridBuilder::inflate_clearance`]'s hard-obstacle model. On a
+/// [`GridCoords::uniform`] grid (unit-spaced lines) a `clearance` of `n` reproduces
+/// the former `n`-cell Chebyshev box exactly (byte-identical). The via keepout is
+/// likewise geometric (`via_model.keepout as f64` continuous units).
 ///
 /// NOTE: unlike [`stamp_owner`] this does NOT skip cells already owned/claimed (it
 /// has no ownership view); it visits the geometric footprint and leaves
@@ -1164,24 +1289,26 @@ fn route_legal(
 /// and `stamp_owner` layers its own `owner == -1 && halo == -1` guard on top.
 fn for_each_halo_cell(
     dims: mr_core::Dims,
+    coords: &GridCoords,
     base: &Grid,
     path: &[CellIdx],
-    clearance_cells: u32,
+    clearance: f64,
     via_model: &ViaModel,
     mut visit: impl FnMut(CellIdx),
 ) {
-    // Visit the planar Chebyshev box of radius `r` around `(cx, cy)` on `layer`,
-    // skipping base obstacles (a halo never claims an obstacle / foreign pad).
-    let box_cells = |cx: u32, cy: u32, layer: u32, r: u32, visit: &mut dyn FnMut(CellIdx)| {
-        if r == 0 {
+    // Visit the planar geometric box of radius `r` (continuous units) around
+    // `(cx, cy)` on `layer`, skipping base obstacles (a halo never claims an
+    // obstacle / foreign pad). The per-axis index band is computed over the `coords`
+    // line arrays, so on a uniform grid this is the `(2r+1)x(2r+1)` Chebyshev box and
+    // on a Hanan grid it is the set of lines within `r` continuous units.
+    let box_cells = |cx: u32, cy: u32, layer: u32, r: f64, visit: &mut dyn FnMut(CellIdx)| {
+        if r <= 0.0 {
             return;
         }
-        let x0 = cx.saturating_sub(r);
-        let y0 = cy.saturating_sub(r);
-        let x1 = (cx + r).min(dims.w.saturating_sub(1));
-        let y1 = (cy + r).min(dims.h.saturating_sub(1));
-        for ny in y0..=y1 {
-            for nx in x0..=x1 {
+        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
+        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
+        for ny in y0..y1 {
+            for nx in x0..x1 {
                 let n = dims.idx3(nx, ny, layer);
                 if !base.is_obstacle(n) {
                     visit(n);
@@ -1193,14 +1320,14 @@ fn for_each_halo_cell(
     // Planar clearance halo around each path cell, on that cell's own layer.
     for &c in path {
         let (cx, cy, cl) = dims.xyz(c);
-        box_cells(cx, cy, cl, clearance_cells, &mut visit);
+        box_cells(cx, cy, cl, clearance, &mut visit);
     }
 
     // Via keepout: a via is a consecutive same-(x,y), layer-changing step. At each
     // via (x,y) visit the larger of the planar clearance and the via keepout on both
     // layers the via spans.
-    let via_r = clearance_cells.max(via_model.keepout);
-    if via_r > 0 {
+    let via_r = clearance.max(via_model.keepout as f64);
+    if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
             let (bx, by, bl) = dims.xyz(w[1]);
@@ -1210,6 +1337,34 @@ fn for_each_halo_cell(
             }
         }
     }
+}
+
+/// Half-open `[lo, hi)` range of line indices in `lines` (sorted ascending,
+/// non-empty, length `count`) within `r` continuous units of the seed line at index
+/// `seed`. The in-clearance indices form a contiguous band (lines are sorted), so we
+/// walk outward from `seed` and stop at the first line strictly farther than `r`.
+///
+/// This is the negotiation-halo twin of `mr_grid`'s `line_span`: on a
+/// [`GridCoords::uniform`] grid (unit-spaced lines) `geom_box(.., seed, r)` returns
+/// `[seed - floor(r), seed + floor(r) + 1)`, i.e. the former Chebyshev cell box of
+/// radius `r`, keeping the uniform path byte-identical. Only `lines[..count]` is
+/// consulted so a defensive coords array longer than `dims` never reads past the grid.
+fn geom_box(lines: &[f64], count: u32, seed: u32, r: f64) -> (u32, u32) {
+    let n = (lines.len() as u32).min(count);
+    if n == 0 {
+        return (0, 0);
+    }
+    let seed = seed.min(n - 1);
+    let pos = lines[seed as usize];
+    let mut lo = seed;
+    while lo > 0 && (pos - lines[(lo - 1) as usize]).abs() <= r {
+        lo -= 1;
+    }
+    let mut hi = seed + 1;
+    while hi < n && (lines[hi as usize] - pos).abs() <= r {
+        hi += 1;
+    }
+    (lo, hi)
 }
 
 /// Fold a committed `path` into the ownership maps, separating HARD copper from the
@@ -1230,8 +1385,9 @@ fn for_each_halo_cell(
 ///    unconditionally (matches the pre-clearance behaviour — the path always wins
 ///    its own cells).
 /// 2. **Planar clearance halo.** For each path cell, on that cell's OWN layer,
-///    visit every cell `n` within Chebyshev radius `clearance_cells` (the
-///    `(2r+1)x(2r+1)` planar box). Set `halo[n] = group` ONLY IF `owner[n] == -1`
+///    visit every cell `n` within geometric distance `clearance` over `coords` (the
+///    [`geom_box`] band; on a uniform grid this is the `(2r+1)x(2r+1)` Chebyshev
+///    box). Set `halo[n] = group` ONLY IF `owner[n] == -1`
 ///    (the cell is not real copper — a halo never overwrites copper ownership) AND
 ///    `halo[n] == -1` (still free halo) AND `!base.is_obstacle(n)`. Overlap
 ///    tie-break: the FIRST group to claim a free halo cell keeps it (`halo[n] == -1`
@@ -1244,38 +1400,40 @@ fn for_each_halo_cell(
 ///    under the identical rule — a via pad is wider than a track, so it reserves a
 ///    larger neighbourhood.
 ///
-/// CRITICAL: when `clearance_cells == 0` AND `via_model.keepout == 0` this marks
+/// CRITICAL: when `clearance == 0.0` AND `via_model.keepout == 0` this marks
 /// *exactly* the path cells into `owner` and writes NOTHING into `halo` (a radius-0
 /// box is skipped; the via halo radius is likewise 0). `halo` stays all `-1`, so
 /// [`route_legal`]'s soft cost adds nothing and the default router is byte-identical
-/// to the pre-clearance implementation.
+/// to the pre-clearance implementation. `clearance` is a geometric distance over
+/// `coords` (continuous units); on a uniform grid `n` reproduces the former `n`-cell
+/// Chebyshev halo — see [`geom_box`].
 #[allow(clippy::too_many_arguments)]
 fn stamp_owner(
     owner: &mut [i64],
     halo: &mut [i64],
     base: &Grid,
     dims: mr_core::Dims,
+    coords: &GridCoords,
     path: &[CellIdx],
     group: i64,
-    clearance_cells: u32,
+    clearance: f64,
     via_model: &ViaModel,
 ) {
-    // Stamp a planar Chebyshev halo of radius `r` around `(cx, cy)` on `layer` into
-    // the `halo` map, claiming only cells that are not real copper (`owner == -1`),
-    // not yet claimed by any group's halo (`halo == -1`, first-claim-wins), and not
-    // base obstacles. The centre cell is included, but a path cell already has
-    // `owner == group`, so the `owner == -1` guard skips it (its halo entry stays
-    // free — own-group halo is irrelevant since own-group cells cost nothing).
-    let stamp_halo = |owner: &[i64], halo: &mut [i64], cx: u32, cy: u32, layer: u32, r: u32| {
-        if r == 0 {
+    // Stamp a planar geometric halo of radius `r` (continuous units, over `coords`)
+    // around `(cx, cy)` on `layer` into the `halo` map, claiming only cells that are
+    // not real copper (`owner == -1`), not yet claimed by any group's halo
+    // (`halo == -1`, first-claim-wins), and not base obstacles. The centre cell is
+    // included, but a path cell already has `owner == group`, so the `owner == -1`
+    // guard skips it (its halo entry stays free — own-group halo is irrelevant since
+    // own-group cells cost nothing).
+    let stamp_halo = |owner: &[i64], halo: &mut [i64], cx: u32, cy: u32, layer: u32, r: f64| {
+        if r <= 0.0 {
             return;
         }
-        let x0 = cx.saturating_sub(r);
-        let y0 = cy.saturating_sub(r);
-        let x1 = (cx + r).min(dims.w.saturating_sub(1));
-        let y1 = (cy + r).min(dims.h.saturating_sub(1));
-        for ny in y0..=y1 {
-            for nx in x0..=x1 {
+        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
+        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
+        for ny in y0..y1 {
+            for nx in x0..x1 {
                 let n = dims.idx3(nx, ny, layer);
                 if owner[n as usize] == -1 && halo[n as usize] == -1 && !base.is_obstacle(n) {
                     halo[n as usize] = group;
@@ -1291,14 +1449,14 @@ fn stamp_owner(
     // 2: stamp the planar clearance halo around each path cell.
     for &c in path {
         let (cx, cy, cl) = dims.xyz(c);
-        stamp_halo(owner, halo, cx, cy, cl, clearance_cells);
+        stamp_halo(owner, halo, cx, cy, cl, clearance);
     }
 
     // 3: via keepout. A via is a consecutive same-(x,y), layer-changing step. At
     // each via (x,y) stamp the larger of the planar clearance and the via keepout
     // on every layer the via spans (both endpoints' layers).
-    let via_r = clearance_cells.max(via_model.keepout);
-    if via_r > 0 {
+    let via_r = clearance.max(via_model.keepout as f64);
+    if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
             let (bx, by, bl) = dims.xyz(w[1]);
@@ -1321,24 +1479,24 @@ fn free_owner(
     owner: &mut [i64],
     halo: &mut [i64],
     dims: mr_core::Dims,
+    coords: &GridCoords,
     path: &[CellIdx],
     group: i64,
-    clearance_cells: u32,
+    clearance: f64,
     via_model: &ViaModel,
 ) {
     // Release halo cells this group claimed (only `halo[n] == group`; first-claim
     // tie-break may have awarded an overlapping cell to another group, which we must
-    // not clear). Copper path cells are released separately below.
-    let clear_halo = |halo: &mut [i64], cx: u32, cy: u32, layer: u32, r: u32| {
-        if r == 0 {
+    // not clear). Copper path cells are released separately below. The scan mirrors
+    // `stamp_owner`'s geometric `geom_box` exactly so no halo cell leaks across a rip.
+    let clear_halo = |halo: &mut [i64], cx: u32, cy: u32, layer: u32, r: f64| {
+        if r <= 0.0 {
             return;
         }
-        let x0 = cx.saturating_sub(r);
-        let y0 = cy.saturating_sub(r);
-        let x1 = (cx + r).min(dims.w.saturating_sub(1));
-        let y1 = (cy + r).min(dims.h.saturating_sub(1));
-        for ny in y0..=y1 {
-            for nx in x0..=x1 {
+        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
+        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
+        for ny in y0..y1 {
+            for nx in x0..x1 {
                 let n = dims.idx3(nx, ny, layer);
                 if halo[n as usize] == group {
                     halo[n as usize] = -1;
@@ -1356,11 +1514,11 @@ fn free_owner(
     }
     for &c in path {
         let (cx, cy, cl) = dims.xyz(c);
-        clear_halo(halo, cx, cy, cl, clearance_cells);
+        clear_halo(halo, cx, cy, cl, clearance);
     }
 
-    let via_r = clearance_cells.max(via_model.keepout);
-    if via_r > 0 {
+    let via_r = clearance.max(via_model.keepout as f64);
+    if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
             let (bx, by, bl) = dims.xyz(w[1]);
@@ -1387,6 +1545,7 @@ fn free_owner(
 #[allow(clippy::too_many_arguments)]
 fn legalize_in_order(
     grid: &Grid,
+    coords: &GridCoords,
     buf: &mut SearchBuf,
     pad_set: &mut PadSet,
     nets: &[NetEndpoints],
@@ -1396,7 +1555,7 @@ fn legalize_in_order(
     group_order: &[usize],
     n_cells: usize,
     via_model: &ViaModel,
-    clearance_cells: u32,
+    clearance: f64,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -1454,7 +1613,12 @@ fn legalize_in_order(
             Some(b)
         })
         .collect();
-    let infl = clearance_cells.max(via_model.keepout);
+    // Conservative cell-count inflation of the per-group bbox for the staging
+    // (which groups may legalize in the same parallel stage) heuristic ONLY: a
+    // too-small value merely co-schedules groups the per-stage in-order hard-blocking
+    // commit still resolves correctly, so a geometric-distance approximation is safe
+    // here. `clearance.ceil()` matches the old cell count exactly on a uniform grid.
+    let infl = (clearance.ceil() as u32).max(via_model.keepout);
     let conflict = |a: usize, b: usize| -> bool {
         match (gbox[a], gbox[b]) {
             (Some(a), Some(b)) => {
@@ -1500,6 +1664,7 @@ fn legalize_in_order(
         // prior stages. Per-thread scratch via `map_init`; reads only `&` snapshots.
         let owner_ref: &[i64] = &owner;
         let halo_ref: &[i64] = &halo;
+        let coords_ref = coords;
         let mut phase_a: Vec<Option<Vec<CellIdx>>> = batch_nets
             .par_iter()
             .map_init(
@@ -1519,8 +1684,8 @@ fn legalize_in_order(
                     } else {
                         ps.load(&net.passable_pads);
                         route_legal(
-                            b, grid, ps, owner_ref, halo_ref, gi, net.src, net.dst, windows[i],
-                            via_model,
+                            b, grid, coords_ref, ps, owner_ref, halo_ref, gi, net.src, net.dst,
+                            windows[i], via_model,
                         )
                         .map(|(p, _)| p)
                     }
@@ -1541,6 +1706,7 @@ fn legalize_in_order(
                         route_legal(
                             buf,
                             grid,
+                            coords,
                             pad_set,
                             &owner,
                             &halo,
@@ -1566,9 +1732,10 @@ fn legalize_in_order(
                         &mut halo,
                         grid,
                         dims,
+                        coords,
                         path,
                         gi,
-                        clearance_cells,
+                        clearance,
                         via_model,
                     );
                 }
@@ -1606,6 +1773,7 @@ fn legalize_in_order(
 #[allow(clippy::too_many_arguments)]
 fn ripup_legalize(
     grid: &Grid,
+    coords: &GridCoords,
     buf: &mut SearchBuf,
     pad_set: &mut PadSet,
     nets: &[NetEndpoints],
@@ -1616,7 +1784,7 @@ fn ripup_legalize(
     seed_committed: &Committed,
     n_cells: usize,
     via_model: &ViaModel,
-    clearance_cells: u32,
+    clearance: f64,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -1655,9 +1823,10 @@ fn ripup_legalize(
                 &mut halo,
                 grid,
                 dims,
+                coords,
                 path,
                 group_ids[i] as i64,
-                clearance_cells,
+                clearance,
                 via_model,
             );
         }
@@ -1718,9 +1887,10 @@ fn ripup_legalize(
                         owner,
                         halo,
                         dims,
+                        coords,
                         &path,
                         g as i64,
-                        clearance_cells,
+                        clearance,
                         via_model,
                     );
                 }
@@ -1773,13 +1943,15 @@ fn ripup_legalize(
         // many purely-local nets.
         pad_set.load(&net.passable_pads);
         let routed = route_legal(
-            buf, grid, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i], via_model,
+            buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
+            via_model,
         )
         .or_else(|| {
             if needs_full[i] {
                 route_legal(
                     buf,
                     grid,
+                    coords,
                     pad_set,
                     &owner,
                     &halo,
@@ -1800,9 +1972,10 @@ fn ripup_legalize(
                 &mut halo,
                 grid,
                 dims,
+                coords,
                 &path,
                 gi,
-                clearance_cells,
+                clearance,
                 via_model,
             );
             committed[i] = Some(path);
@@ -1860,13 +2033,15 @@ fn ripup_legalize(
 
         // Re-route i now that the victim's cells are free.
         let rerouted = route_legal(
-            buf, grid, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i], via_model,
+            buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
+            via_model,
         )
         .or_else(|| {
             if needs_full[i] {
                 route_legal(
                     buf,
                     grid,
+                    coords,
                     pad_set,
                     &owner,
                     &halo,
@@ -1886,9 +2061,10 @@ fn ripup_legalize(
                 &mut halo,
                 grid,
                 dims,
+                coords,
                 &path,
                 gi,
-                clearance_cells,
+                clearance,
                 via_model,
             );
             committed[i] = Some(path);
@@ -2343,10 +2519,13 @@ mod tests {
 
         // Single-layer board: the via model is inert (no via neighbours exist).
         let via_model = ViaModel::through_hole(dims.layers);
+        // Abstract Dims-only grid: uniform unit coords reproduce unit-hop pricing.
+        let coords = GridCoords::uniform(dims);
 
         // Order [0,1] = A first: B should be stranded.
         let c_ab = legalize_in_order(
             &grid,
+            &coords,
             &mut buf,
             &mut pad_set,
             &nets_ab,
@@ -2356,7 +2535,7 @@ mod tests {
             &[0, 1],
             n_cells,
             &via_model,
-            0,
+            0.0,
         );
         assert!(c_ab[0].is_some(), "A commits in A-first order");
         assert!(
@@ -2367,6 +2546,7 @@ mod tests {
         // Order [1,0] = B first: both route.
         let c_ba = legalize_in_order(
             &grid,
+            &coords,
             &mut buf,
             &mut pad_set,
             &nets_ab,
@@ -2376,7 +2556,7 @@ mod tests {
             &[1, 0],
             n_cells,
             &via_model,
-            0,
+            0.0,
         );
         assert!(
             c_ba[0].is_some() && c_ba[1].is_some(),
@@ -2808,5 +2988,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- heuristic admissibility (lower-bound) property ----------------------
+    //
+    // The search pays, per planar step `u -> v`, a base of `edge_cost(gap_uv)` (plus
+    // non-negative congestion/via terms). So the planar base paid along any real path
+    // is the SUM of per-step roundings `Σ edge_cost(g_i)`. The heuristic must never
+    // exceed that, or A* (with `astar_buf`'s break-on-pop-dst) can return a non-optimal
+    // path. The old `edge_cost(manhattan_len(a, b))` rounded the AGGREGATE length once,
+    // and round-of-sum can exceed sum-of-rounds, so it could overestimate on
+    // non-integer line spacings. These tests pin the lower-bound property the new
+    // per-axis summed form (`manhattan_scaled`) guarantees, and exhibit a concrete
+    // spacing where the OLD form violated it.
+
+    /// What the search actually pays in planar base cost along a sequence of cells:
+    /// `Σ edge_cost(manhattan_len(step))` over consecutive pairs — the exact per-step
+    /// rounding `astar_buf`'s `cost_fn` accrues (congestion-free).
+    fn summed_path_base(dims: Dims, coords: &GridCoords, path: &[CellIdx]) -> Cost {
+        path.windows(2)
+            .map(|w| edge_cost(coords.manhattan_len(dims, w[0], w[1])))
+            .fold(0u32, Cost::saturating_add)
+    }
+
+    /// The OLD (inadmissible) heuristic: a single rounding of the aggregate length.
+    fn old_manhattan_planar(dims: Dims, coords: &GridCoords, a: CellIdx, b: CellIdx) -> Cost {
+        edge_cost(coords.manhattan_len(dims, a, b))
+    }
+
+    #[test]
+    fn heuristic_is_lower_bound_collinear_and_l_shaped() {
+        // Sweep a range of non-integer gap patterns on a single layer (no via term),
+        // and assert the heuristic never exceeds the per-step summed path base for
+        // both a straight (collinear) path and an L-shaped path between the corners.
+        let gap_sets: &[&[f64]] = &[
+            &[0.5, 0.5, 0.5, 0.5],          // halves: round-of-sum vs sum-of-rounds
+            &[0.03125, 0.03125, 0.03125],   // 0.5/16 each: each rounds to 0, sum doesn't
+            &[1.5, 2.5, 0.5, 3.5],
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            &[0.46875, 0.46875, 0.46875],   // 7.5/16 each
+            &[2.0, 2.0, 2.0],               // integers: must match exactly (uniform-like)
+        ];
+        for xs in gap_sets {
+            for ys in gap_sets {
+                let x_lines = cumsum(xs);
+                let y_lines = cumsum(ys);
+                let dims = Dims::new(x_lines.len() as u32, y_lines.len() as u32);
+                let coords = GridCoords::from_lines(x_lines.clone(), y_lines.clone());
+                let a = dims.idx(0, 0);
+                let b = dims.idx(dims.w - 1, dims.h - 1);
+
+                let h = manhattan_scaled(dims, &coords, a, b, 0);
+
+                // Collinear leg along x (then y handled by the y-only pair below).
+                let x_only = manhattan_scaled(dims, &coords, dims.idx(0, 0), dims.idx(dims.w - 1, 0), 0);
+                let x_path: Vec<CellIdx> = (0..dims.w).map(|x| dims.idx(x, 0)).collect();
+                assert!(
+                    x_only <= summed_path_base(dims, &coords, &x_path),
+                    "collinear-x heuristic must be a lower bound: h={x_only} > path"
+                );
+
+                // L-shaped path: straight along x to the far column, then up in y.
+                let mut l_path: Vec<CellIdx> = (0..dims.w).map(|x| dims.idx(x, 0)).collect();
+                l_path.extend((1..dims.h).map(|y| dims.idx(dims.w - 1, y)));
+                let l_cost = summed_path_base(dims, &coords, &l_path);
+                assert!(
+                    h <= l_cost,
+                    "L-shaped heuristic must be a lower bound: h={h} > path={l_cost} \
+                     (xs={xs:?}, ys={ys:?})"
+                );
+
+                // The other L (up first, then across) — same corners, also a lower bound.
+                let mut l_path2: Vec<CellIdx> = (0..dims.h).map(|y| dims.idx(0, y)).collect();
+                l_path2.extend((1..dims.w).map(|x| dims.idx(x, dims.h - 1)));
+                let l_cost2 = summed_path_base(dims, &coords, &l_path2);
+                assert!(
+                    h <= l_cost2,
+                    "L-shaped(2) heuristic must be a lower bound: h={h} > path={l_cost2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn old_heuristic_could_overestimate_but_new_does_not() {
+        // Concrete witness: three gaps of 0.4/16 mm each. Per-step the search pays
+        // edge_cost(0.4/16) = round(0.4) = 0 per step → 0 total. The aggregate is
+        // 1.2/16 → edge_cost = round(1.2) = 1. So the OLD heuristic returns 1 > 0,
+        // overestimating (inadmissible: round-of-sum > sum-of-rounds). The new summed
+        // heuristic returns 0 == 0.
+        let g = 0.4 / COST_SCALE;
+        let x_lines = cumsum(&[g, g, g]); // 4 lines, 3 gaps
+        let dims = Dims::new(x_lines.len() as u32, 1);
+        let coords = GridCoords::from_lines(x_lines, vec![0.0]);
+        let a = dims.idx(0, 0);
+        let b = dims.idx(dims.w - 1, 0);
+        let path: Vec<CellIdx> = (0..dims.w).map(|x| dims.idx(x, 0)).collect();
+        let summed = summed_path_base(dims, &coords, &path);
+
+        let old = old_manhattan_planar(dims, &coords, a, b);
+        let new = manhattan_scaled(dims, &coords, a, b, 0);
+
+        assert_eq!(summed, 0, "search pays 0 per-step here");
+        assert!(
+            old > summed,
+            "old heuristic must overestimate in this witness: old={old} summed={summed}"
+        );
+        assert!(
+            new <= summed,
+            "new heuristic must stay a lower bound: new={new} summed={summed}"
+        );
+    }
+
+    #[test]
+    fn heuristic_uniform_grid_byte_identical() {
+        // On a uniform unit grid the new summed heuristic must equal both the old
+        // aggregate form and the historical (dx + dy) * SCALE, preserving byte-identity.
+        let dims = Dims::new(7, 5);
+        let coords = GridCoords::uniform(dims);
+        for &(ax, ay, bx, by) in &[(0u32, 0u32, 6u32, 4u32), (3, 1, 3, 4), (0, 2, 6, 2)] {
+            let a = dims.idx(ax, ay);
+            let b = dims.idx(bx, by);
+            let new = manhattan_scaled(dims, &coords, a, b, 0);
+            let old = old_manhattan_planar(dims, &coords, a, b);
+            let expected = (ax.abs_diff(bx) + ay.abs_diff(by)) * SCALE;
+            assert_eq!(new, old, "uniform: new must equal old aggregate form");
+            assert_eq!(new, expected, "uniform: new must equal (dx+dy)*SCALE");
+        }
+    }
+
+    /// Prefix sums starting at 0.0 → a sorted line array of `gaps.len() + 1` lines.
+    fn cumsum(gaps: &[f64]) -> Vec<f64> {
+        let mut lines = Vec::with_capacity(gaps.len() + 1);
+        let mut acc = 0.0;
+        lines.push(acc);
+        for &g in gaps {
+            acc += g;
+            lines.push(acc);
+        }
+        lines
     }
 }

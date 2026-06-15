@@ -19,7 +19,14 @@ impl AStarRouter {
         Self
     }
 
-    /// Manhattan distance between two cells under the canonical mapping.
+    /// Manhattan distance between two cells under the canonical mapping, in CELL
+    /// units (one per hop). [`AStarRouter`] prices a step by `grid.cost_at(v)` (the
+    /// abstract per-cell grid cost, `1` on a unit grid), NOT by the geometric
+    /// `COST_SCALE` used by [`crate::NegotiatedRouter`]: it has no continuous
+    /// geometry ([`mr_core::GridCoords`]) to draw lengths from. So the heuristic
+    /// stays in those same cell units — admissible and consistent against unit step
+    /// cost — keeping `cost == path.len() - 1` and the A*-equals-Lee invariant. The
+    /// geometric, length-aware heuristic lives in `negotiated.rs::manhattan_scaled`.
     fn manhattan(grid: &Grid, a: CellIdx, b: CellIdx) -> Cost {
         let (ax, ay) = grid.dims.xy(a);
         let (bx, by) = grid.dims.xy(b);

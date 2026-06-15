@@ -42,7 +42,7 @@ use axum::{
     routing::{get, post},
     Json, Router as AxumRouter,
 };
-use mr_core::{LayerMap, Router, RouterError};
+use mr_core::{GridCoords, LayerMap, Router, RouterError};
 use mr_srj::{rasterize_with_layers, to_solution_layered, PcbTrace, SimpleRouteJson};
 use serde::{Deserialize, Serialize};
 
@@ -66,11 +66,18 @@ pub const DEFAULT_LAYER: &str = "top";
 /// only connectivity + non-overlap, so multi-layer routes are legal.
 pub const DEFAULT_SOLVE_LAYERS: u32 = 2;
 
-/// Builds a routing backend for a given per-problem clearance budget (in grid
-/// cells). Clearance is resolution-dependent, so it cannot be baked into a single
-/// shared router; instead `main.rs` supplies this factory and `lib.rs` stays
-/// backend-agnostic (a Metal backend can honour or ignore `clearance_cells`).
-pub type RouterFactory = Arc<dyn Fn(u32) -> Box<dyn Router + Send + Sync> + Send + Sync>;
+/// Builds a routing backend for a given per-problem geometric clearance budget (in
+/// continuous units, e.g. mm) and the problem's non-uniform grid [`GridCoords`] (the
+/// Hanan line arrays). Both are board-dependent, so they cannot be baked into a
+/// single shared router; instead `main.rs` supplies this factory and `lib.rs`
+/// stays backend-agnostic (a Metal backend can honour or ignore either input).
+/// The CPU [`NegotiatedRouter`](mr_cpu::NegotiatedRouter) prices A* moves by the
+/// geometric step length read off these coords AND keeps the inter-net clearance
+/// halo at `clearance_mm` over the same coords, so passing the real Hanan coords
+/// (rather than a uniform fallback) is what keeps cost/heuristic/spacing correct on
+/// the non-uniform grid.
+pub type RouterFactory =
+    Arc<dyn Fn(f64, GridCoords) -> Box<dyn Router + Send + Sync> + Send + Sync>;
 
 /// Shared `/solve` state: the router factory plus the layer + clearance policy.
 ///
@@ -183,7 +190,13 @@ async fn solve(
         clearance_cells,
     );
 
-    let router = (state.make_router)(clearance_cells);
+    // The rasteriser built a non-uniform (Hanan) grid; hand the router the same
+    // line arrays so its geometric cost + heuristic match the actual cell spacing.
+    let coords = GridCoords::from_lines(
+        problem.mapping.x_lines.clone(),
+        problem.mapping.y_lines.clone(),
+    );
+    let router = (state.make_router)(clearance_mm, coords);
     let board = match router.route(&problem.grid, &problem.nets) {
         Ok(b) => b,
         Err(e) => return router_error_response(e),
@@ -286,7 +299,13 @@ mod tests {
     /// Factory mirroring `main.rs`: builds a `NegotiatedRouter` at the requested
     /// clearance budget (in cells).
     fn test_factory() -> RouterFactory {
-        Arc::new(|cc| Box::new(NegotiatedRouter::new().with_clearance_cells(cc)))
+        Arc::new(|mm, coords| {
+            Box::new(
+                NegotiatedRouter::new()
+                    .with_clearance_mm(mm)
+                    .with_coords(coords),
+            )
+        })
     }
 
     /// App wired to the test router at the default solve-layer budget, clearance
