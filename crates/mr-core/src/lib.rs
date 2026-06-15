@@ -463,6 +463,15 @@ pub struct BoardRoute {
     pub results: Vec<RouteResult>,
     pub unrouted: Vec<String>,
     pub congestion: Vec<u32>,
+    /// The router's ground-truth electrical-net group id for each entry of
+    /// `results`, aligned 1:1. Nets sharing a group id were permitted to share /
+    /// abut copper (no clearance enforced between them); distinct group ids are
+    /// mutually foreign. Empty when a construction site does not track grouping
+    /// (e.g. single-net routers, hand-built test literals) — consumers must fall
+    /// back to geometric reconstruction in that case. `#[serde(default)]` keeps
+    /// older serialized boards readable.
+    #[serde(default)]
+    pub groups: Vec<u32>,
 }
 
 impl BoardRoute {

@@ -102,9 +102,9 @@ pub fn solution_to_drc_board(
         }
     }
     // Per-trace net name: prefer the real base-net tag threaded through from the
-    // router (`PcbTrace::net`, the connection's net with `#seg` stripped — so
-    // junction-grouped siblings share one identity). Fall back to the union-find
-    // component label only for untagged (e.g. hand-built test) traces.
+    // router (`PcbTrace::net`, the router's `g<groupid>` — so junction-grouped
+    // siblings share one identity). Fall back to the union-find component label only
+    // for untagged (e.g. hand-built test) traces.
     let mut net_name: Vec<String> = Vec::with_capacity(traces.len());
     let mut root_name: BTreeMap<usize, String> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
@@ -117,6 +117,54 @@ pub fn solution_to_drc_board(
             }
         };
         net_name.push(name);
+    }
+
+    // Ground-truth electrical-net relabel via the SRJ obstacles' `connectedTo`
+    // connectivity nets. A pad declares the single `connectivity_netNNNN` it belongs
+    // to; every trace that TERMINATES on such a pad is, by construction, that net.
+    // Many separately-grouped router nets legitimately solder to one shared junction
+    // pad (a GND/power pad lists dozens of `source_trace`s under ONE connectivity
+    // net): the router keeps them in distinct groups, so the bare `g<id>` labels make
+    // them mutually foreign and their copper meeting AT the shared pad trips a false
+    // clearance hit. Relabelling every trace whose endpoint lands on a connectivity
+    // pad — and the pad itself — to `c<net>` collapses that physical net to ONE
+    // identity, so own-pad and sibling-at-pad contact is immune while genuinely
+    // foreign copper stays foreign. Traces that touch no connectivity pad keep their
+    // router group label.
+    let conn_pads: Vec<(&mr_srj::Obstacle, &str)> = srj
+        .obstacles
+        .iter()
+        .filter_map(|o| mr_srj::obstacle_connectivity_net(o).map(|n| (o, n)))
+        .collect();
+    let connectivity_at = |x: f64, y: f64| -> Option<String> {
+        // Prefer the smallest containing connectivity pad: a terminal landing pad
+        // nested in a larger pour is the point's true net, not the pour it overlaps.
+        conn_pads
+            .iter()
+            .filter(|(o, _)| {
+                (x - o.center.x).abs() <= o.width / 2.0 + 1e-6
+                    && (y - o.center.y).abs() <= o.height / 2.0 + 1e-6
+            })
+            .min_by(|(a, _), (b, _)| {
+                (a.width * a.height)
+                    .partial_cmp(&(b.width * b.height))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, n)| format!("c{n}"))
+    };
+    for (i, t) in traces.iter().enumerate() {
+        // Endpoints first, then any vertex: a trace's terminals carry its net; only
+        // if neither endpoint lands on a connectivity pad do we leave the group label.
+        let ends = [t.route.first(), t.route.last()];
+        let endpoint_net = ends.into_iter().flatten().find_map(|rp| {
+            let (x, y) = match rp {
+                RoutePoint::Wire { x, y, .. } | RoutePoint::Via { x, y, .. } => (*x, *y),
+            };
+            connectivity_at(x, y)
+        });
+        if let Some(c) = endpoint_net {
+            net_name[i] = c;
+        }
     }
     // Trace vertices tagged with their net, for pad-net resolution below.
     let mut tagged_vertices: Vec<(f64, f64, String)> = Vec::new();
@@ -181,6 +229,10 @@ pub fn solution_to_drc_board(
     // and keeps net `None` (conflicts with every net — never hides a real short).
     for o in &srj.obstacles {
         let net = pad_net(o, &tagged_vertices);
+        // A pad declaring a connectivity net is labelled `c<net>` to match the
+        // traces relabelled above, so the pad is immune to EVERY trace of its own
+        // electrical net (including the many sub-nets that share a junction pad). A
+        // pad with no connectivity net falls back to the trace-containment tag.
         if o.layers.is_empty() {
             // Unlayered obstacle: place it on layer 0 so it is still checked.
             let l = idx.intern("");
@@ -224,9 +276,16 @@ fn quantize(v: f64) -> i64 {
     (v * 10_000.0).round() as i64
 }
 
-/// The net of the trace that terminates inside obstacle `o`, if any. Matches when a
-/// tagged trace vertex lies within the obstacle's axis-aligned rect (inclusive).
+/// The electrical net of obstacle `o`. Prefer the ground-truth `connectivity_netNNNN`
+/// it declares (labelled `c<net>` to match the connectivity-relabelled traces), so a
+/// pad is immune to its own net even when several router sub-nets share it. With no
+/// declared connectivity net, fall back to the net of whichever tagged trace vertex
+/// lands inside the pad rect (inclusive); failing that, `None` (foreign / keepout —
+/// conflicts with every net, never hiding a real short).
 fn pad_net(o: &mr_srj::Obstacle, tagged: &[(f64, f64, String)]) -> Option<String> {
+    if let Some(n) = mr_srj::obstacle_connectivity_net(o) {
+        return Some(format!("c{n}"));
+    }
     let (hw, hh) = (o.width / 2.0, o.height / 2.0);
     let (cx, cy) = (o.center.x, o.center.y);
     tagged
@@ -367,6 +426,67 @@ mod tests {
         assert!(
             board.check().is_empty(),
             "a pad must be immune to the net that terminates inside it"
+        );
+    }
+
+    #[test]
+    fn shared_connectivity_pad_immunises_sibling_subnets() {
+        // Two separately-grouped traces (distinct router `g` labels) both terminate
+        // on ONE junction pad declaring `connectivity_net7`. They run within
+        // clearance of each other AT the pad. Because the pad and both traces resolve
+        // to the same `c<net>` identity via `connectedTo`, this must NOT violate —
+        // it is one electrical net meeting at its own pad.
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 10.0, "minY": -1.0, "maxY": 10.0},
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.6, "height": 0.6, "layers": ["top"],
+                "connectedTo": ["pcb_smtpad_0", "connectivity_net7", "source_port_1"]
+            }],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        // Both traces END inside the pad at (0,0) but carry DIFFERENT group labels,
+        // and run parallel 0.05 apart (well within clearance) leaving the pad.
+        let traces = vec![
+            PcbTrace::new(vec![wire(10.0, 0.0), wire(0.0, 0.0)]).with_net("g0"),
+            PcbTrace::new(vec![wire(10.0, 0.05), wire(0.0, 0.0)]).with_net("g1"),
+        ];
+        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let board = solution_to_drc_board(&srj, &traces, rules, 1);
+        assert!(
+            board.check().is_empty(),
+            "sub-nets sharing a connectivity pad must be one electrical net: {:?}",
+            board.check()
+        );
+    }
+
+    #[test]
+    fn distinct_connectivity_nets_still_conflict() {
+        // Two traces on DIFFERENT connectivity nets running sub-clearance must STILL
+        // violate — the relabel must not blanket-immunise everything.
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 10.0, "minY": -1.0, "maxY": 10.0},
+            "obstacles": [
+                {"type": "rect", "center": {"x": 0.0, "y": 0.0}, "width": 0.4, "height": 0.4,
+                 "layers": ["top"], "connectedTo": ["connectivity_net1"]},
+                {"type": "rect", "center": {"x": 0.0, "y": 0.15}, "width": 0.4, "height": 0.4,
+                 "layers": ["top"], "connectedTo": ["connectivity_net2"]}
+            ],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let traces = vec![
+            PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)]).with_net("g0"),
+            PcbTrace::new(vec![wire(0.0, 0.15), wire(10.0, 0.15)]).with_net("g1"),
+        ];
+        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let board = solution_to_drc_board(&srj, &traces, rules, 1);
+        assert!(
+            !board.check().is_empty(),
+            "different connectivity nets within clearance must still violate"
         );
     }
 

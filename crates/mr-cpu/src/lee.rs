@@ -66,6 +66,7 @@ impl Router for LeeRouter {
             results,
             unrouted,
             congestion,
+            groups: Vec::new(),
         })
     }
 }

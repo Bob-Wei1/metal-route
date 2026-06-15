@@ -510,6 +510,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         }
         connections.push(Connection {
             name: net_name.clone(),
+            root_connection_name: None,
             points_to_connect: points,
         });
     }

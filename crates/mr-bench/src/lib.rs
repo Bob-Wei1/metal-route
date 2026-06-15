@@ -183,6 +183,7 @@ mod tests {
                 results,
                 unrouted: Vec::new(),
                 congestion,
+                groups: Vec::new(),
             })
         }
     }

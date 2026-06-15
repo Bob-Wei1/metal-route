@@ -75,6 +75,7 @@ impl Router for AStarRouter {
             results,
             unrouted,
             congestion,
+            groups: Vec::new(),
         })
     }
 }

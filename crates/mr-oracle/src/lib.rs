@@ -150,6 +150,7 @@ mod tests {
             results,
             unrouted: vec![],
             congestion,
+            groups: vec![],
         }
     }
 
@@ -262,6 +263,7 @@ mod tests {
             results: vec![rr("b", &[1, 2], 2), rr("a", &[0, 1], 2)],
             unrouted: vec![],
             congestion: vec![1, 2, 1],
+            groups: vec![],
         };
         assert!(
             are_equivalent(&a, &b),
@@ -278,6 +280,7 @@ mod tests {
             results: vec![rr("a", &[0, 1], 2)],
             unrouted: vec![],
             congestion: vec![1, 1, 0],
+            groups: vec![],
         };
         let d = compare(&a, &b);
         assert!(!are_equivalent(&a, &b));

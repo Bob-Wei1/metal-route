@@ -102,6 +102,14 @@ pub struct Obstacle {
 #[serde(rename_all = "camelCase")]
 pub struct Connection {
     pub name: String,
+    /// The electrical net this connection belongs to. The tscircuit reroute pass
+    /// fans one copper net out into many separately-named MST-edge connections
+    /// (e.g. `source_net_2_..._mst0`, `..._mst1`, …) that all share this single
+    /// `rootConnectionName` (e.g. `source_net_2`). Edges of one root are the SAME
+    /// net and may legally share / abut copper. Absent on plain single-segment
+    /// problems, where each connection is its own net.
+    #[serde(default)]
+    pub root_connection_name: Option<String>,
     pub points_to_connect: Vec<Point>,
 }
 
@@ -1002,10 +1010,22 @@ fn decompose_connections(
             let dst_layer = point_layer(&win[1], layers);
             let src = mapping.point_to_cell_layer((win[0].x, win[0].y), src_layer);
             let dst = mapping.point_to_cell_layer((win[1].x, win[1].y), dst_layer);
-            let net = if segments == 1 {
+            // Per-segment net label. The router's `group_of` collapses everything
+            // before the first `#` into one group (same-net sub-connections that may
+            // share copper). When the connection declares a `rootConnectionName`, we
+            // lead with it so EVERY MST-edge connection of one electrical net shares
+            // a group — even when their endpoints don't land on a single shared grid
+            // cell — and append the original name (+ seg) after a `#` to keep the
+            // label unique for diagnostics. Without a root we keep the historical
+            // scheme exactly (`conn.name` / `conn.name#seg`).
+            let seg_suffix = if segments == 1 {
                 conn.name.clone()
             } else {
                 format!("{}#{}", conn.name, seg)
+            };
+            let net = match &conn.root_connection_name {
+                Some(root) if !root.is_empty() => format!("{root}#{seg_suffix}"),
+                _ => seg_suffix,
             };
             // Union of the src and dst pad cells (each on its endpoint's layer),
             // sorted + deduped.
@@ -1034,6 +1054,15 @@ fn decompose_connections(
         }
     }
     nets
+}
+
+/// The `connectivity_netNNNN` id of an obstacle (its electrical-net membership),
+/// if it declares one in `connected_to`. A pad declares at most one.
+pub fn obstacle_connectivity_net(o: &Obstacle) -> Option<&str> {
+    o.connected_to
+        .iter()
+        .find(|id| id.starts_with("connectivity_net"))
+        .map(|s| s.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,13 +1161,18 @@ pub fn to_solution_layered(
     trace_width: f64,
     layers: &LayerMap,
 ) -> Vec<PcbTrace> {
-    // Electrical-net grouping for net-aware DRC, mirroring the router's own grouping
-    // (`NegotiatedRouter::route`): two results are the same net iff they share a
-    // `group_of` name key (`<conn>#<seg>` -> `<conn>`) OR a shared endpoint CELL (a
-    // junction pad where separately-named connections — e.g. `source_net_1` and
-    // `source_trace_5` — meet). Tagging each trace with its group root makes the DRC's
-    // same-net immunity match exactly which copper the router permitted to touch.
-    let net_group = group_results(&board.results);
+    // Electrical-net grouping for net-aware DRC. Prefer the router's GROUND-TRUTH
+    // group ids (`BoardRoute::groups`, aligned 1:1 with `results`): nets sharing a
+    // group id were permitted by the router to share / abut copper. Tagging each
+    // trace with `g<groupid>` makes the DRC's same-net immunity EXACTLY match what
+    // the router allowed, so post-hoc reconstruction can never miss a transitive
+    // junction chain. Fall back to the geometric/name reconstruction
+    // (`group_results`) only for legacy or hand-built boards that carry no group ids.
+    let net_group: Vec<String> = if board.groups.len() == board.results.len() {
+        board.groups.iter().map(|g| format!("g{g}")).collect()
+    } else {
+        group_results(&board.results)
+    };
     board
         .results
         .iter()
@@ -1176,7 +1210,7 @@ fn group_results(results: &[RouteResult]) -> Vec<String> {
         }
         r
     }
-    let mut union = |parent: &mut [usize], a: usize, b: usize| {
+    let union = |parent: &mut [usize], a: usize, b: usize| {
         let (ra, rb) = (find(parent, a), find(parent, b));
         if ra != rb {
             if ra < rb {
@@ -1420,6 +1454,33 @@ mod tests {
     }
 
     #[test]
+    fn root_connection_name_collapses_into_one_group() {
+        // Two separately-named connections sharing a `rootConnectionName` are one
+        // electrical net: their decomposed net labels must share the `group_of`
+        // prefix (the part before the first `#`) so the router groups them — even
+        // though their endpoints never touch a common cell.
+        let srj: SimpleRouteJson = serde_json::from_str(
+            r#"{
+                "layerCount": 1,
+                "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
+                "obstacles": [],
+                "connections": [
+                    { "name": "n_mst0", "rootConnectionName": "NET", "pointsToConnect": [{"x":1,"y":1},{"x":4,"y":1}] },
+                    { "name": "n_mst1", "rootConnectionName": "NET", "pointsToConnect": [{"x":6,"y":8},{"x":9,"y":8}] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let prob = rasterize(&srj, 1.0);
+        assert_eq!(prob.nets.len(), 2);
+        let group = |s: &str| s.split('#').next().unwrap().to_string();
+        assert_eq!(group(&prob.nets[0].net), "NET");
+        assert_eq!(group(&prob.nets[1].net), "NET");
+        // The full labels stay distinct for diagnostics.
+        assert_ne!(prob.nets[0].net, prob.nets[1].net);
+    }
+
+    #[test]
     fn to_solution_emits_cell_center_wire_points() {
         // 10x10 grid at res 1, origin (0,0). 3-cell horizontal path on row 0.
         let bounds = Bounds {
@@ -1439,6 +1500,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let pins = HashMap::new();
         let traces = to_solution(&board, &mapping, &pins, 0.2, "top");
@@ -1478,6 +1540,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let pins = HashMap::new();
         let traces = to_solution(&board, &mapping, &pins, 0.1, "top");
@@ -1619,6 +1682,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let pins = HashMap::new();
         let traces = to_solution_layered(&board, &mapping, &pins, 0.2, &layers);
@@ -1681,6 +1745,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let traces = to_solution_layered(&board, &mapping, &HashMap::new(), 0.1, &layers);
         let route = &traces[0].route;
@@ -1719,6 +1784,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let traces = to_solution(&board, &mapping, &HashMap::new(), 0.2, "top");
         assert_eq!(traces[0].route.len(), 3);
@@ -1985,6 +2051,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let traces = to_solution(&board, &mapping, &pins, 0.1, "top");
         let r = &traces[0].route;
@@ -2386,6 +2453,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
         let traces = to_solution_layered(
             &board,

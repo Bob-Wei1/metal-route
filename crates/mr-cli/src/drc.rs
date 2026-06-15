@@ -346,6 +346,7 @@ mod tests {
             }],
             unrouted: vec![],
             congestion: vec![],
+            groups: vec![],
         };
 
         build_drc_board(

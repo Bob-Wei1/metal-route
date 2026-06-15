@@ -201,6 +201,7 @@ impl Router for RipUpRouter {
             results,
             unrouted,
             congestion,
+            groups: Vec::new(),
         })
     }
 }

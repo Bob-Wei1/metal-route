@@ -148,6 +148,7 @@ impl Router for MetalRouter {
             results,
             unrouted,
             congestion,
+            groups: Vec::new(),
         })
     }
 }

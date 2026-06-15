@@ -1122,16 +1122,23 @@ impl Router for NegotiatedRouter {
         } else {
             multi_committed
         };
-        // Assemble in input net order for determinism.
+        // Assemble in input net order for determinism. Carry the router's actual
+        // electrical-net group id alongside each routed net (aligned 1:1 with
+        // `results`) so downstream DRC can grant same-net copper the exact same
+        // immunity the router permitted, rather than re-deriving grouping post-hoc.
         let mut results: Vec<RouteResult> = Vec::new();
+        let mut groups: Vec<u32> = Vec::new();
         let mut unrouted: Vec<String> = Vec::new();
         for (i, net) in nets.iter().enumerate() {
             match &committed[i] {
-                Some(path) => results.push(RouteResult {
-                    net: net.net.clone(),
-                    path: path.clone(),
-                    cost: unit_cost(path),
-                }),
+                Some(path) => {
+                    results.push(RouteResult {
+                        net: net.net.clone(),
+                        path: path.clone(),
+                        cost: unit_cost(path),
+                    });
+                    groups.push(group_ids[i] as u32);
+                }
                 None => unrouted.push(net.net.clone()),
             }
         }
@@ -1141,6 +1148,7 @@ impl Router for NegotiatedRouter {
             results,
             unrouted,
             congestion,
+            groups,
         })
     }
 }
@@ -2278,6 +2286,33 @@ mod tests {
         assert_eq!(pa.last().copied(), Some(a.dst));
         assert_eq!(pb.first().copied(), Some(b.src));
         assert_eq!(pb.last().copied(), Some(b.dst));
+    }
+
+    /// `BoardRoute::groups` is exported aligned 1:1 with `results`, carries the
+    /// router's ground-truth electrical-net group id, and gives `#`-sibling nets the
+    /// SAME id while a foreign net gets a different one. The DRC relies on this to
+    /// grant same-net copper exactly the immunity the router permitted.
+    #[test]
+    fn route_exports_aligned_group_ids() {
+        let dims = Dims::new(8, 8);
+        let grid = GridBuilder::new(dims, 1).build();
+        // `g#0` and `g#1` share the `group_of` prefix `g` → one group. `foreign` is
+        // its own group.
+        let s0 = net("g#0", dims.idx(0, 0), dims.idx(7, 0));
+        let s1 = net("g#1", dims.idx(0, 2), dims.idx(7, 2));
+        let f = net("foreign", dims.idx(0, 5), dims.idx(7, 5));
+        let br = NegotiatedRouter::new()
+            .route(&grid, &[s0, s1, f])
+            .unwrap();
+        assert!(br.unrouted.is_empty(), "all nets must route: {br:?}");
+        assert_eq!(br.groups.len(), br.results.len(), "groups align 1:1 with results");
+        // Map back from results (which are in input order here) to assert grouping.
+        let g_of = |name: &str| {
+            let i = br.results.iter().position(|r| r.net == name).unwrap();
+            br.groups[i]
+        };
+        assert_eq!(g_of("g#0"), g_of("g#1"), "`#`-siblings share a group id");
+        assert_ne!(g_of("g#0"), g_of("foreign"), "a foreign net is a distinct group");
     }
 
     /// A net must detour around a foreign net's pad (a hard obstacle it does not

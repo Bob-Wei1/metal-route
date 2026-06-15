@@ -289,7 +289,11 @@ fn route_board(
                     violations.len(),
                     same
                 );
-                for v in violations.iter().take(12) {
+                let cap: usize = std::env::var("DRC_DEBUG_CAP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12);
+                for v in violations.iter().take(cap) {
                     eprintln!(
                         "  {:?} L{} @({:.3},{:.3}) nets=({},{}) measured={:.4} required={:.4}",
                         v.class, v.layer, v.location.0, v.location.1, v.nets.0, v.nets.1, v.measured, v.required
