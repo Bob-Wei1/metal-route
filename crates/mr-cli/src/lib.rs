@@ -304,7 +304,12 @@ pub fn route_problem(
 
     // Only the negotiated backend places vias; give it a through-hole model over
     // the routed stackup. Lee/Ripup route per-layer with no layer changes.
-    let via_model = ViaModel::through_hole(problem.mapping.dims.layers);
+    // The via's annular ring (pad radius + board clearance, in mm) is reserved as a
+    // keepout so a committed via never sits clearance-illegally close to foreign
+    // copper. SimpleRouteJson route_problem applies no pad clearance, but a via still
+    // needs its own pad-radius ring; use the board min-clearance when declared.
+    let mut via_model = ViaModel::through_hole(problem.mapping.dims.layers);
+    via_model.keepout_mm = VIA_PAD_MM / 2.0 + srj.min_clearance.unwrap_or(0.0).max(0.0);
     // The board's continuous grid-line geometry, so the negotiated router prices
     // planar steps by their real length. On a uniform grid this is byte-identical to
     // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
@@ -817,8 +822,9 @@ pub fn route_dsn_problem(
     //   * pad rasterisation (`rasterize_with_layers`, this crate's `mr-srj`) reserves
     //     the same halo around every pad while still letting each net escape its own
     //     pads via `passable_pads`.
-    // Committed vias likewise reserve a keepout halo (`ViaModel.keepout`) sized for
-    // the via pad plus clearance. This supersedes the M2.4 "disabled legalization
+    // Committed vias likewise reserve a keepout halo (`ViaModel.keepout_mm`, in mm)
+    // sized for the via pad plus clearance, and the committing legalization pass
+    // enforces it HARD. This supersedes the M2.4 "disabled legalization
     // halo" experiment: clearance now lives in the negotiation phase + the pad/via
     // grid, not a post-hoc legalization fold. Plane-antipad modelling (the via-
     // through-plane fix) is independent and stays on.
@@ -828,11 +834,10 @@ pub fn route_dsn_problem(
         0
     };
     let mut via_model = ViaModel::through_hole(layer_map.len());
-    via_model.keepout = if resolution > 0.0 {
-        ((VIA_PAD_MM / 2.0 + stats.min_clearance_mm) / resolution).ceil() as u32
-    } else {
-        0
-    };
+    // Via annular-ring keepout in CONTINUOUS mm (the unit the router's halo code
+    // expects): the via pad radius plus the board min-clearance. No `/resolution`
+    // cell conversion — that was a unit bug on the non-uniform Hanan grid.
+    via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm;
     let problem = rasterize_with_layers(&srj, resolution, layer_map, clearance_cells);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;

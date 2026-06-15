@@ -62,18 +62,14 @@ use crate::dijkstra::{astar_buf, edge_cost, SearchBuf, COST_SCALE};
 /// model is byte-identical to the pre-geometric router.
 pub const SCALE: Cost = COST_SCALE as Cost;
 
-/// Soft clearance penalty (TritonRoute `objCost`-style): the extra price a net pays
-/// to step onto a cell that lies in *another* group's committed clearance halo
-/// during legalization. Clearance is a SOFT cost, not a hard block — a net must
-/// never be DROPPED merely because the only route home crosses a foreign net's
-/// spacing halo. Instead it routes through the halo at this high penalty (a recorded
-/// clearance violation), preserving connectivity. Foreign COPPER (committed path
-/// cells) remains a HARD block; two distinct nets must never overlap.
-///
-/// Chosen large relative to [`SCALE`] (`16 * SCALE`) so the A* search strongly
-/// prefers any clearance-legal detour but will violate as a last resort. The priced
-/// cost is always capped strictly below [`OBSTACLE`] so a penalized cell is never
-/// confused with an impassable one.
+/// Historical soft clearance penalty (TritonRoute `objCost`-style). Inter-net
+/// clearance is now a STRICTLY HARD constraint in the committing legalization pass
+/// ([`route_legal`] hard-blocks foreign halo cells), so a net that cannot reach its
+/// dst clearance-cleanly is left unrouted/congested rather than violating spacing.
+/// This constant is retained for API stability and reference; `route_legal` no
+/// longer prices it. The iterative NEGOTIATION phase still uses a separate SOFT
+/// pressure ([`CLEARANCE_NEG_WEIGHT`]) to spread nets so legalization can succeed.
+#[allow(dead_code)]
 pub const CLEARANCE_PENALTY: Cost = 16 * SCALE;
 
 /// Soft clearance weight priced into the NEGOTIATION search (TritonRoute `objCost`
@@ -90,7 +86,7 @@ pub const CLEARANCE_PENALTY: Cost = 16 * SCALE;
 /// soft starting point that the per-iteration `pfac` ramp amplifies. Like every other
 /// negotiation cost it is capped strictly below [`OBSTACLE`] so a penalized cell is
 /// never confused with an impassable one. When `clearance_cells == 0` AND
-/// `via_model.keepout == 0` the halo field stays all-zero and this term contributes
+/// `via_model.keepout_mm == 0.0` the halo field stays all-zero and this term contributes
 /// nothing, keeping the default router byte-identical to the pre-clearance behaviour.
 pub const CLEARANCE_NEG_WEIGHT: Cost = SCALE;
 
@@ -520,12 +516,12 @@ impl Router for NegotiatedRouter {
         // added here (see the inc/dec sites in the loop below, both via
         // `for_each_halo_cell`). So during net i's search `present_halo` excludes net i
         // = every OTHER net's clearance footprint, exactly like `present`. When
-        // `clearance_cells == 0 && via_model.keepout == 0` the footprint is empty so
+        // `clearance_cells == 0 && via_model.keepout_mm == 0.0` the footprint is empty so
         // this stays all-zero and contributes nothing (byte-identical default).
         let mut present_halo: Vec<u32> = vec![0; n_cells];
         // Whether the clearance mechanism is active at all. Drives both the
         // `present_halo` pricing and the incremental-skip gating below.
-        let clearance_active = self.clearance_mm > 0.0 || via_model.keepout > 0;
+        let clearance_active = self.clearance_mm > 0.0 || via_model.keepout_mm > 0.0;
         // Current routed path per net (empty == not currently routed).
         let mut paths: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
 
@@ -942,7 +938,7 @@ impl Router for NegotiatedRouter {
                         pad_set.load(&net.passable_pads);
                         let routed = route_legal(
                             buf, grid, &coords, pad_set, &no_owner, &no_halo, -1, net.src,
-                            net.dst, windows[i], &via_model,
+                            net.dst, windows[i], &via_model, self.clearance_mm,
                         )
                         .or_else(|| {
                             route_legal(
@@ -957,6 +953,7 @@ impl Router for NegotiatedRouter {
                                 net.dst,
                                 Window::full(dims),
                                 &via_model,
+                                self.clearance_mm,
                             )
                         });
                         match routed {
@@ -1229,24 +1226,27 @@ fn route_negotiated(
 
 /// Route one net for legalization / rip-up using on-the-fly costs — no grid clone.
 ///
-/// Clearance is a SOFT cost, COPPER a HARD block:
+/// Clearance AND copper are BOTH HARD blocks here (this is the committing pass; a
+/// route it returns is guaranteed clearance-clean, so a net that cannot reach `dst`
+/// without violating clearance returns `None` and is reported unrouted/congested by
+/// the caller — never silently committed in violation):
 ///   * `owner` — committed COPPER. A cell owned by a group other than `own_group`
 ///     is a HARD obstacle (two distinct nets may never overlap). Cells owned by
 ///     `own_group` (siblings) and free cells are passable at their base cost.
 ///   * `halo`  — foreign clearance / via-keepout halo. A cell with `halo[c]` a
-///     foreign group (`>= 0 && != own_group`) AND `owner[c] < 0` (not real copper)
-///     is passable but priced [`CLEARANCE_PENALTY`] above its base cost (a recorded
-///     clearance violation), so the search prefers a clearance-legal route but will
-///     enter the halo as a last resort rather than leave the net unrouted. Own-group
-///     halo costs nothing (same-net override). The penalized cost is capped strictly
-///     below [`OBSTACLE`].
+///     foreign group (`>= 0 && != own_group`) that is NOT also this net's own copper
+///     is a HARD obstacle too — the legalizer must not place copper inside another
+///     net's required spacing. Own-group halo costs nothing (same-net override).
+///   * `src`/`dst` stay forced-passable (a net's own pads must remain reachable).
 ///
 /// Every passable step is priced by its GEOMETRIC length (`edge_cost` from `coords`)
 /// rather than the grid's per-cell value, so the planar base ignores whether a cell
 /// is an unmasked own-pad or ordinary copper — its endpoints are always enterable and
 /// the search is confined to `window`. `owner`/`halo` may each be empty to mean "no
-/// owners / no halo" (the alone-path case). Returns the windowed shortest path and
-/// its (possibly penalized) cost, or `None`.
+/// owners / no halo" (the alone-path case). When `halo` is empty the foreign-halo
+/// hard block and the via annular-ring guard are both inert, so the clearance-off
+/// fast path is byte-identical to the pre-clearance router. Returns the windowed
+/// shortest path and its cost, or `None`.
 #[allow(clippy::too_many_arguments)]
 fn route_legal(
     buf: &mut SearchBuf,
@@ -1260,6 +1260,7 @@ fn route_legal(
     dst: CellIdx,
     window: Window,
     via_model: &ViaModel,
+    clearance: f64,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
     let has_owner = !owner.is_empty();
@@ -1268,51 +1269,88 @@ fn route_legal(
     // units (same units as the heuristic), replacing the old uniform per-cell base.
     // On a uniform grid every step is length 1, so the base is the constant `SCALE`
     // (the legalizer reports `unit_cost(path)` — path length — so this magnitude only
-    // affects the path CHOICE, never the emitted cost). The soft clearance penalty is
-    // layered on top for a foreign halo cell, exactly as before.
-    let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
-        let base_c = edge_cost(coords.manhattan_len(dims, u, v));
-        // Soft clearance penalty: entering a foreign group's halo cell that is not
-        // real copper. Own-group halo (and own copper) costs nothing extra. Capped
-        // strictly below OBSTACLE so a penalized cell is never an impassable one.
-        if has_halo {
-            let ci = v as usize;
-            let h = halo[ci];
-            let is_copper = has_owner && owner[ci] >= 0;
-            if h >= 0 && h != own_group && !is_copper {
-                return (base_c as u64)
-                    .saturating_add(CLEARANCE_PENALTY as u64)
-                    .min(OBSTACLE as u64 - 1) as Cost;
-            }
-        }
-        base_c
-    };
+    // affects the path CHOICE, never the emitted cost). Clearance is now HARD (handled
+    // in `blocked_fn`), so `cost_fn` is the pure geometric base.
+    let cost_fn =
+        |u: CellIdx, v: CellIdx| -> Cost { edge_cost(coords.manhattan_len(dims, u, v)) };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
             return true;
         }
         // Foreign-group COPPER cells are hard obstacles, even at this net's
-        // endpoints — distinct nets may never overlap. Foreign HALO is NOT blocked
-        // here (it is priced softly in `cost_fn` instead).
+        // endpoints — distinct nets may never overlap.
         if has_owner {
             let o = owner[c as usize];
             if o >= 0 && o != own_group {
                 return true;
             }
         }
+        // Endpoints (this net's own pads) stay reachable. Checked AFTER foreign copper
+        // (two nets may never share a cell) but BEFORE the foreign-halo block, so a pad
+        // sitting in another net's halo can still be entered to terminate the route.
         if c == src || c == dst {
             return false;
         }
+        // Foreign-group HALO is now a HARD obstacle: committing copper inside another
+        // net's required spacing is a clearance violation, so this pass refuses it. A
+        // foreign halo cell that is ALSO this net's own copper (`owner == own_group`)
+        // is not blocked. When `halo` is empty this branch is inert (fast path).
+        if has_halo {
+            let h = halo[c as usize];
+            let own_copper = has_owner && owner[c as usize] == own_group;
+            if h >= 0 && h != own_group && !own_copper {
+                return true;
+            }
+        }
         base.is_obstacle(c) && !pads.contains(c)
+    };
+    // Via annular-ring radius: a placed via's pad reserves `max(clearance, keepout)`
+    // around itself on both spanned layers. When this is <= 0 (clearance-off fast
+    // path) the guard is skipped entirely and behaviour is byte-identical.
+    let via_r = clearance.max(via_model.keepout_mm);
+    let ring_guard = has_halo && via_r > 0.0;
+    // True iff a via landing at `(cx, cy)` on `layer` would put its annular ring over
+    // foreign copper or a foreign halo cell — in which case the via step is rejected.
+    // The endpoint cells (src/dst) are exempt so a via may still land on the net's own
+    // pad. Scans the geometric `geom_box` band of radius `via_r` over `coords`.
+    let ring_conflict = |cx: u32, cy: u32, layer: u32| -> bool {
+        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, via_r);
+        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, via_r);
+        for ny in y0..y1 {
+            for nx in x0..x1 {
+                let n = dims.idx3(nx, ny, layer);
+                if n == src || n == dst {
+                    continue;
+                }
+                let ni = n as usize;
+                let o = if has_owner { owner[ni] } else { -1 };
+                if o >= 0 && o != own_group {
+                    return true; // ring overlaps foreign copper
+                }
+                let hh = halo[ni];
+                if hh >= 0 && hh != own_group && !(o == own_group) {
+                    return true; // ring overlaps a foreign halo cell
+                }
+            }
+        }
+        false
     };
     // A via step is legal per the model; it costs the via's `step_cost` (foreign
     // owners / endpoints are already rejected by `blocked_fn` on the destination).
+    // Additionally reject the step when the via's annular ring at `v` would overlap
+    // foreign copper/halo on EITHER spanned layer.
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
-        if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v)) {
-            Some(via_model.step_cost)
-        } else {
-            None
+        let (lu, lv) = (dims.layer_of(u), dims.layer_of(v));
+        if !via_model.is_step_legal(lu, lv) {
+            return None;
         }
+        if ring_guard {
+            let (vx, vy, _) = dims.xyz(v);
+            if ring_conflict(vx, vy, lu) || ring_conflict(vx, vy, lv) {
+                return None;
+            }
+        }
+        Some(via_model.step_cost)
     };
     let h = |c: CellIdx| manhattan_scaled(dims, coords, c, dst, via_model.step_cost);
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
@@ -1331,9 +1369,9 @@ fn route_legal(
 ///     cells are SKIPPED (a halo never claims an obstacle / foreign pad).
 ///   * **Via keepout halo.** At each via (two consecutive path cells sharing `(x,y)`
 ///     but differing in layer), on BOTH spanned layers, the geometric box of radius
-///     `max(clearance, via_model.keepout as f64)`. Base-obstacle cells are SKIPPED.
+///     `max(clearance, via_model.keepout_mm)`. Base-obstacle cells are SKIPPED.
 ///
-/// When `clearance == 0.0` AND `via_model.keepout == 0` every radius is 0, so
+/// When `clearance == 0.0` AND `via_model.keepout_mm == 0.0` every radius is 0, so
 /// `visit` is never called and the footprint is empty — the property that keeps the
 /// clearance-off router byte-identical.
 ///
@@ -1343,7 +1381,7 @@ fn route_legal(
 /// matching [`mr_grid::GridBuilder::inflate_clearance`]'s hard-obstacle model. On a
 /// [`GridCoords::uniform`] grid (unit-spaced lines) a `clearance` of `n` reproduces
 /// the former `n`-cell Chebyshev box exactly (byte-identical). The via keepout is
-/// likewise geometric (`via_model.keepout as f64` continuous units).
+/// likewise geometric (`via_model.keepout_mm` continuous units).
 ///
 /// NOTE: unlike [`stamp_owner`] this does NOT skip cells already owned/claimed (it
 /// has no ownership view); it visits the geometric footprint and leaves
@@ -1389,7 +1427,7 @@ fn for_each_halo_cell(
     // Via keepout: a via is a consecutive same-(x,y), layer-changing step. At each
     // via (x,y) visit the larger of the planar clearance and the via keepout on both
     // layers the via spans.
-    let via_r = clearance.max(via_model.keepout as f64);
+    let via_r = clearance.max(via_model.keepout_mm);
     if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
@@ -1438,9 +1476,9 @@ fn geom_box(lines: &[f64], count: u32, seed: u32, r: f64) -> (u32, u32) {
 ///   * `owner` — the committed PATH cells (the actual copper). A foreign group's
 ///     `owner` cell is a HARD block: two distinct nets must never overlap.
 ///   * `halo`  — the clearance / via-keepout cells around the copper. A foreign
-///     group's `halo` cell is a SOFT cost ([`CLEARANCE_PENALTY`]) in
-///     [`route_legal`], never a hard block, so a net may route through it as a last
-///     resort (a recorded clearance violation) instead of going unrouted.
+///     group's `halo` cell is a HARD block in [`route_legal`] (the committing pass):
+///     copper may never be placed inside another net's required spacing, so a net
+///     that cannot route clear is left unrouted/congested rather than violating.
 ///
 /// Exact stamping rule, applied for the committed `path` belonging to `group`:
 ///
@@ -1459,11 +1497,11 @@ fn geom_box(lines: &[f64], count: u32, seed: u32, r: f64) -> (u32, u32) {
 ///    though here the penalty is only soft).
 /// 3. **Via keepout.** A via is detected as two consecutive path cells sharing the
 ///    same `(x, y)` but differing in layer. At each such `(x, y)`, on *every* layer
-///    the via spans, stamp a halo of radius `max(clearance_cells, via_model.keepout)`
+///    the via spans, stamp a halo of radius `max(clearance, via_model.keepout_mm)`
 ///    under the identical rule — a via pad is wider than a track, so it reserves a
 ///    larger neighbourhood.
 ///
-/// CRITICAL: when `clearance == 0.0` AND `via_model.keepout == 0` this marks
+/// CRITICAL: when `clearance == 0.0` AND `via_model.keepout_mm == 0.0` this marks
 /// *exactly* the path cells into `owner` and writes NOTHING into `halo` (a radius-0
 /// box is skipped; the via halo radius is likewise 0). `halo` stays all `-1`, so
 /// [`route_legal`]'s soft cost adds nothing and the default router is byte-identical
@@ -1518,7 +1556,7 @@ fn stamp_owner(
     // 3: via keepout. A via is a consecutive same-(x,y), layer-changing step. At
     // each via (x,y) stamp the larger of the planar clearance and the via keepout
     // on every layer the via spans (both endpoints' layers).
-    let via_r = clearance.max(via_model.keepout as f64);
+    let via_r = clearance.max(via_model.keepout_mm);
     if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
@@ -1580,7 +1618,7 @@ fn free_owner(
         clear_halo(halo, cx, cy, cl, clearance);
     }
 
-    let via_r = clearance.max(via_model.keepout as f64);
+    let via_r = clearance.max(via_model.keepout_mm);
     if via_r > 0.0 {
         for w in path.windows(2) {
             let (ax, ay, al) = dims.xyz(w[0]);
@@ -1626,8 +1664,8 @@ fn legalize_in_order(
     // HARD obstacle for net i iff its owner is a group other than i's.
     let mut owner: Vec<i64> = vec![-1; n_cells];
     // Owning group per committed clearance-HALO cell, or -1 for free: a foreign
-    // halo cell is a SOFT cost (CLEARANCE_PENALTY) in `route_legal`, never a hard
-    // block, so a net routes through it as a last resort rather than being dropped.
+    // halo cell is a HARD block in `route_legal` (the committing pass), so copper is
+    // never placed inside another net's spacing — an unroutable net is dropped.
     let mut halo: Vec<i64> = vec![-1; n_cells];
     let mut committed: Committed = vec![None; n_nets];
 
@@ -1681,7 +1719,7 @@ fn legalize_in_order(
     // too-small value merely co-schedules groups the per-stage in-order hard-blocking
     // commit still resolves correctly, so a geometric-distance approximation is safe
     // here. `clearance.ceil()` matches the old cell count exactly on a uniform grid.
-    let infl = (clearance.ceil() as u32).max(via_model.keepout);
+    let infl = clearance.max(via_model.keepout_mm).ceil() as u32;
     let conflict = |a: usize, b: usize| -> bool {
         match (gbox[a], gbox[b]) {
             (Some(a), Some(b)) => {
@@ -1748,7 +1786,7 @@ fn legalize_in_order(
                         ps.load(&net.passable_pads);
                         route_legal(
                             b, grid, coords_ref, ps, owner_ref, halo_ref, gi, net.src, net.dst,
-                            windows[i], via_model,
+                            windows[i], via_model, clearance,
                         )
                         .map(|(p, _)| p)
                     }
@@ -1778,6 +1816,7 @@ fn legalize_in_order(
                             nets[i].dst,
                             Window::full(dims),
                             via_model,
+                            clearance,
                         )
                         .map(|(p, _)| p)
                     }
@@ -1874,8 +1913,8 @@ fn ripup_legalize(
     let mut committed: Committed = seed_committed.clone();
     // Owning group per committed COPPER cell, or -1 for free: a foreign-group copper
     // cell is a HARD obstacle for net i. Owning group per clearance-HALO cell, or -1:
-    // a foreign-group halo cell is a SOFT cost (CLEARANCE_PENALTY) in `route_legal`,
-    // never a hard block, so a stranded net routes through the halo as a last resort.
+    // a foreign-group halo cell is ALSO a HARD block in `route_legal`, so a stranded
+    // net that cannot route clear is left unrouted rather than violating spacing.
     let mut owner: Vec<i64> = vec![-1; n_cells];
     let mut halo: Vec<i64> = vec![-1; n_cells];
     // Stamp the seeded commits into owner/halo so the residue routes against them.
@@ -2007,7 +2046,7 @@ fn ripup_legalize(
         pad_set.load(&net.passable_pads);
         let routed = route_legal(
             buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
-            via_model,
+            via_model, clearance,
         )
         .or_else(|| {
             if needs_full[i] {
@@ -2023,6 +2062,7 @@ fn ripup_legalize(
                     net.dst,
                     Window::full(dims),
                     via_model,
+                    clearance,
                 )
             } else {
                 None
@@ -2097,7 +2137,7 @@ fn ripup_legalize(
         // Re-route i now that the victim's cells are free.
         let rerouted = route_legal(
             buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
-            via_model,
+            via_model, clearance,
         )
         .or_else(|| {
             if needs_full[i] {
@@ -2113,6 +2153,7 @@ fn ripup_legalize(
                     net.dst,
                     Window::full(dims),
                     via_model,
+                    clearance,
                 )
             } else {
                 None
@@ -2816,21 +2857,20 @@ mod tests {
         );
     }
 
-    /// SOFT clearance recovers connectivity: with a HARD halo net B would be DROPPED
-    /// (no clearance-legal path to its target), but with the soft penalty B now
-    /// ROUTES — through A's clearance halo, at a recorded violation. B's copper still
-    /// shares NO cell with A's copper (distinct nets never overlap), yet at least one
-    /// B cell lies within `clearance_cells` of an A cell (it entered the halo).
+    /// HARD clearance: `route_legal` (the committing pass) never commits copper into
+    /// a foreign net's clearance halo. On a congested fixture where the only route
+    /// home for net B would have to cross A's halo, B is now left UNROUTED rather than
+    /// silently violating clearance — the accepted trade. Whatever DOES route stays
+    /// clearance-clean (no path cell within the halo radius of a foreign net).
     #[test]
-    fn soft_clearance_recovers_dropped_net() {
+    fn hard_clearance_drops_net_rather_than_violate() {
         // 3 wide, 5 tall. Net A runs straight down column 1, rows 0..=3 — a vertical
         // wall of copper that leaves only the single cell (1,4) free in column 1. Net
         // B must cross from (0,2) to (2,2): the ONLY copper-free crossing of column 1
         // is through (1,4), which is Chebyshev-adjacent to A's copper at (1,3) — i.e.
-        // squarely inside A's clearance halo. With a HARD halo (radius 1) that cell
-        // (and its approaches) would be blocked, walling B off from its target and
-        // DROPPING it. With the SOFT penalty B routes through the halo instead (a
-        // recorded violation), so connectivity survives.
+        // squarely inside A's clearance halo. With a HARD halo (radius 1) that cell is
+        // blocked for B, walling it off from its target. B MUST be dropped, not routed
+        // through the halo. (Under the old soft cost B routed through at a violation.)
         let dims = Dims::new(3, 5);
         let a = NetEndpoints {
             net: "a".into(),
@@ -2846,37 +2886,72 @@ mod tests {
             .route(&grid, &[a.clone(), b.clone()])
             .unwrap();
 
-        // Both nets route — B is NOT dropped despite needing to enter A's halo.
+        // Exactly one net must be left unrouted: B cannot reach its target without
+        // violating A's clearance, so the hard constraint drops it (congested).
+        assert!(
+            !br.unrouted.is_empty(),
+            "hard clearance must leave the congested net unrouted, not violate: {br:?}"
+        );
+
+        // Whatever routed is clearance-clean: no committed path cell sits within the
+        // clearance radius of a DIFFERENT net's copper.
+        for r1 in &br.results {
+            for r2 in &br.results {
+                if r1.net == r2.net {
+                    continue;
+                }
+                assert!(
+                    !within_one(dims, &r1.path, &r2.path),
+                    "committed copper must never violate clearance: {r1:?} vs {r2:?}"
+                );
+            }
+        }
+    }
+
+    /// Empty-clearance fast path is UNCHANGED by the hardening: on the exact same
+    /// congested fixture, with `clearance = 0` and the default (keepout 0) via model,
+    /// the halo is empty so `route_legal`'s foreign-halo hard block and via-ring guard
+    /// are both inert — BOTH nets route (B passes through (1,4) freely), reproducing
+    /// the pre-clearance behaviour byte-identically.
+    #[test]
+    fn hard_clearance_fast_path_unchanged_when_clearance_zero() {
+        let dims = Dims::new(3, 5);
+        let a = NetEndpoints {
+            net: "a".into(),
+            src: dims.idx(1, 0),
+            dst: dims.idx(1, 3),
+            passable_pads: Vec::new(),
+        };
+        let grid = GridBuilder::new(dims, 1).build();
+        let b = net("b", dims.idx(0, 2), dims.idx(2, 2));
+
+        let br = NegotiatedRouter::new()
+            .with_clearance_cells(0)
+            .route(&grid, &[a.clone(), b.clone()])
+            .unwrap();
+
+        // No halo at all → both nets route (B is NOT dropped); copper stays disjoint.
         assert!(
             br.unrouted.is_empty(),
-            "soft clearance must recover connectivity for B: {br:?}"
+            "clearance-0 fast path: both nets must route (halo inert): {br:?}"
         );
         assert_eq!(br.results.len(), 2);
         let ra = br.results.iter().find(|r| r.net == "a").expect("A routes");
         let rb = br.results.iter().find(|r| r.net == "b").expect("B routes");
-
-        // B's copper is still hard-disjoint from A's copper.
         assert!(
             disjoint(&ra.path, &rb.path),
             "distinct nets must never overlap copper: {ra:?} {rb:?}"
         );
-
-        // B did enter A's clearance halo: some B cell is within Chebyshev radius
-        // `clearance_cells` (1) of an A cell — i.e. the recovered route is a
-        // clearance violation, exactly what the soft cost permits as a last resort.
-        assert!(
-            within_one(dims, &rb.path, &ra.path),
-            "B must route THROUGH A's clearance halo (a recorded violation): {rb:?}"
-        );
     }
 
-    /// Via keepout is now a SOFT cost too: a placed via's neighbourhood is PREFERRED
-    /// clear, not forced. On a 2-layer board whose only layer-0 corridor is walled,
-    /// net A must via up at a chokepoint to cross. With `via_model.keepout = 1` and
-    /// ample room for B to via up at a DIFFERENT row, the router routes BOTH nets and
-    /// prefers to keep B's committed copper out of A's reserved via neighbourhood —
-    /// because a clearance-legal route is available at modest extra cost. We assert
-    /// both route and B's copper shares no cell of A's via 8-neighbourhood.
+    /// Via keepout: a placed via reserves an annular ring around itself. Soft pressure
+    /// steers nets apart during negotiation; the committing legalization pass enforces
+    /// the ring HARD (no foreign copper may sit inside it). On a 2-layer board whose
+    /// only layer-0 corridor is walled, net A must via up at a chokepoint to cross.
+    /// With `via_model.keepout_mm = 1.0` and ample room for B to via up at a DIFFERENT
+    /// row, the router routes BOTH nets and keeps B's committed copper out of A's
+    /// reserved via neighbourhood. We assert both route and B's copper shares no cell
+    /// of A's via 8-neighbourhood.
     #[test]
     fn via_keepout_prefers_clear_neighbourhood_when_room() {
         // 5 wide, 5 tall, 2 layers. Wall the WHOLE of layer 0 column x=2 so the only
@@ -2901,7 +2976,8 @@ mod tests {
 
         let vm = {
             let mut m = ViaModel::through_hole(2);
-            m.keepout = 1;
+            // Uniform unit grid: 1.0 mm keepout == the former 1-cell Chebyshev box.
+            m.keepout_mm = 1.0;
             m
         };
         let br = NegotiatedRouter::new()

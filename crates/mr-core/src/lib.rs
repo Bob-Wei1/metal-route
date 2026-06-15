@@ -310,16 +310,17 @@ pub enum ViaClass {
 /// A* step between adjacent layers; this model gates which steps are legal and
 /// prices them. Contiguous vertical runs are later classified into a [`ViaClass`]
 /// span for output and DRC.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViaModel {
     /// Total layers the model is defined over.
     pub layers: u32,
     /// Cost of a single adjacent-layer step, in the same fixed-point units as a
     /// router's planar step cost. A via that crosses `k` layers pays `k` steps.
     pub step_cost: Cost,
-    /// Keepout radius (in cells) a placed via reserves around itself on the layers
-    /// it passes through. `0` means "use the board clearance".
-    pub keepout: u32,
+    /// Keepout radius (continuous mm) a placed via reserves around itself on the
+    /// layers it passes through — the annular-ring radius the router keeps foreign
+    /// copper/halo clear of. `0.0` means "use the board clearance".
+    pub keepout_mm: f64,
     /// Legal adjacent steps as inclusive `(lo, hi)` layer pairs with `hi == lo+1`.
     /// `None` means every adjacent step is legal (the through-hole default).
     allowed_steps: Option<Vec<(u32, u32)>>,
@@ -331,12 +332,13 @@ impl ViaModel {
     pub const DEFAULT_STEP_COST: Cost = 160;
 
     /// Through-hole model over `layers`: every adjacent step legal, default cost,
-    /// no extra keepout.
+    /// no extra keepout (`keepout_mm == 0.0` preserves the byte-identical
+    /// clearance-off fast path).
     pub fn through_hole(layers: u32) -> Self {
         Self {
             layers: layers.max(1),
             step_cost: Self::DEFAULT_STEP_COST,
-            keepout: 0,
+            keepout_mm: 0.0,
             allowed_steps: None,
         }
     }
@@ -348,7 +350,7 @@ impl ViaModel {
         Self {
             layers: layers.max(1),
             step_cost,
-            keepout: 0,
+            keepout_mm: 0.0,
             allowed_steps: Some(steps),
         }
     }
