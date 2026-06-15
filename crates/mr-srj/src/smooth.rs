@@ -45,9 +45,10 @@ const MAX_CHAMFER_MM: f64 = 1.0;
 const COLLINEAR_EPS: f64 = 1e-9;
 /// Numerical slack when comparing a candidate gap to the original gap.
 const GAP_EPS: f64 = 1e-9;
-/// Approximate via barrel radius used for clearance against vias (PcbTrace vias
-/// carry no geometry of their own).
-const VIA_RADIUS: f64 = 0.25;
+/// Via pad radius used for clearance against vias (PcbTrace vias carry no geometry
+/// of their own). Matches the real signal-via annular pad: `VIA_PAD_MM / 2.0`
+/// (`mr_cli::VIA_PAD_MM == 0.45`, not visible from this crate — keep in sync).
+const VIA_RADIUS: f64 = 0.225;
 
 /// A foreign feature a candidate trace edge must stay clear of. The stored gap
 /// helpers return the distance from a segment *centre-line* to the feature's
