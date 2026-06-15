@@ -10,6 +10,7 @@
 //! The SVG renderer is deliberately dependency-free Rust (no Node / `circuit-to-svg`)
 //! so the gallery reproduces from a clean checkout with just `cargo run`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -17,8 +18,15 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::drc::default_rules;
+use crate::drc_board::solution_to_drc_board;
 use crate::{default_resolution, parse_srj, route_problem, RouteDiagnostics, RouterKind, UnroutedReason};
+use mr_drc::Violation;
 use mr_srj::{Obstacle, PcbTrace, RoutePoint, SimpleRouteJson};
+
+/// Copper-to-copper clearance (mm) assumed when a board omits `minClearance` —
+/// the same default the DSN ingest uses, so the corpus DRC mirrors `route-dsn`.
+const DEFAULT_CLEARANCE_MM: f64 = 0.15;
 
 /// Arguments for the `bench-corpus` subcommand.
 #[derive(Debug, clap::Parser)]
@@ -98,6 +106,13 @@ pub struct BoardResult {
     pub unrouted: Vec<UnroutedNet>,
     /// Peak per-cell occupancy across routed copper — a congestion proxy.
     pub congestion_peak: u32,
+    /// Total geometric DRC violations in the routed solution (0 on skip/error).
+    /// The benchmark previously NEVER ran DRC, so clearance/via shorts were
+    /// produced but invisible; this makes them a first-class, serialized metric.
+    pub drc_violations: usize,
+    /// DRC violations broken down by [`mr_drc::ViolationClass`] (debug name →
+    /// count), e.g. `{"Clearance": 3, "AnnularRing": 1}`. Empty when clean.
+    pub drc_by_class: BTreeMap<String, usize>,
 }
 
 impl BoardResult {
@@ -198,13 +213,23 @@ fn predicted_cells(srj: &SimpleRouteJson, resolution: Option<f64>, layers: Optio
     w.saturating_mul(h).saturating_mul(l)
 }
 
-/// Route one board, returning its [`BoardResult`] plus the traces (for SVG).
+/// Tally a violation slice by its [`mr_drc::ViolationClass`] debug name.
+fn drc_class_breakdown(violations: &[Violation]) -> BTreeMap<String, usize> {
+    let mut by_class = BTreeMap::new();
+    for v in violations {
+        *by_class.entry(format!("{:?}", v.class)).or_insert(0) += 1;
+    }
+    by_class
+}
+
+/// Route one board, returning its [`BoardResult`], the traces (for SVG), the
+/// route diagnostics, and the geometric DRC violations found in the solution.
 fn route_board(
     corpus: &str,
     board: &str,
     srj: &SimpleRouteJson,
     args: &CorpusArgs,
-) -> (BoardResult, Vec<PcbTrace>, RouteDiagnostics) {
+) -> (BoardResult, Vec<PcbTrace>, RouteDiagnostics, Vec<Violation>) {
     let nets_total: usize = srj
         .connections
         .iter()
@@ -227,9 +252,12 @@ fn route_board(
                 error: Some(format!("skipped: predicted {cells} cells > max-cells")),
                 unrouted: Vec::new(),
                 congestion_peak: 0,
+                drc_violations: 0,
+                drc_by_class: BTreeMap::new(),
             },
             Vec::new(),
             RouteDiagnostics::default(),
+            Vec::new(),
         );
     }
 
@@ -245,6 +273,17 @@ fn route_board(
                 .map(|(name, reason)| UnroutedNet { name: name.clone(), reason: *reason })
                 .collect();
             let congestion_peak = diag.congestion.iter().copied().max().unwrap_or(0);
+
+            // Run a real geometric DRC over what the router actually drew. The
+            // benchmark never did this before, so clearance/via shorts were
+            // produced but invisible. Build the physical board from the emitted
+            // solution and check it.
+            let clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM);
+            let rules = default_rules(clearance);
+            let layers = args.layers.unwrap_or(srj.layer_count);
+            let violations = solution_to_drc_board(srj, &traces, rules, layers).check();
+            let drc_by_class = drc_class_breakdown(&violations);
+
             (
                 BoardResult {
                     corpus: corpus.to_string(),
@@ -259,9 +298,12 @@ fn route_board(
                     error: None,
                     unrouted,
                     congestion_peak,
+                    drc_violations: violations.len(),
+                    drc_by_class,
                 },
                 traces,
                 diag,
+                violations,
             )
         }
         Err(e) => (
@@ -278,9 +320,12 @@ fn route_board(
                 error: Some(format!("error: {e}")),
                 unrouted: Vec::new(),
                 congestion_peak: 0,
+                drc_violations: 0,
+                drc_by_class: BTreeMap::new(),
             },
             Vec::new(),
             RouteDiagnostics::default(),
+            Vec::new(),
         ),
     }
 }
@@ -330,6 +375,8 @@ pub fn run_corpus(args: &CorpusArgs) -> Result<CorpusReport> {
                 error: Some(msg),
                 unrouted: Vec::new(),
                 congestion_peak: 0,
+                drc_violations: 0,
+                drc_by_class: BTreeMap::new(),
             };
 
             let bytes = match std::fs::read(file) {
@@ -341,13 +388,13 @@ pub fn run_corpus(args: &CorpusArgs) -> Result<CorpusReport> {
                 Err(e) => return (err_result(format!("parse failed: {e}")), None),
             };
 
-            let (result, traces, diag) = route_board(&corpus, &board, &srj, args);
+            let (result, traces, diag, violations) = route_board(&corpus, &board, &srj, args);
             // Render SVG content here (CPU-bound, parallel-safe); the actual file
             // write happens sequentially below to keep I/O ordered and fallible.
             let svg = args
                 .svg_out
                 .as_ref()
-                .map(|_| render_svg(&srj, &traces, &result, &diag));
+                .map(|_| render_svg(&srj, &traces, &result, &diag, &violations));
             (result, svg)
         })
         .collect();
@@ -488,6 +535,7 @@ fn render_svg(
     traces: &[PcbTrace],
     res: &BoardResult,
     diag: &RouteDiagnostics,
+    violations: &[Violation],
 ) -> String {
     let b = &srj.bounds;
     let (w, h) = (b.max_x - b.min_x, b.max_y - b.min_y);
@@ -548,6 +596,11 @@ fn render_svg(
         }
     }
 
+    // DRC violations — conspicuous red markers ON TOP of all copper, one per
+    // violation at its reported location. A hollow red ring plus an X so a
+    // clearance short / via violation is impossible to miss against the copper.
+    s.push_str(&drc_overlay(violations, stroke));
+
     s.push_str("</g>");
 
     // Caption (outside the flip so text is upright).
@@ -557,14 +610,21 @@ fn render_svg(
     } else {
         "#f85149"
     };
+    // Append the DRC violation count so the schematic SVG is honest about the
+    // clearance/via shorts the router produced (previously invisible).
+    let drc_suffix = if res.drc_violations > 0 {
+        format!(" — {} DRC", res.drc_violations)
+    } else {
+        String::new()
+    };
     let label = res
         .error
         .as_deref()
-        .map(|e| format!("{} — {}", res.board, e))
+        .map(|e| format!("{} — {}{}", res.board, e, drc_suffix))
         .unwrap_or_else(|| {
             format!(
-                "{} — {}/{} nets ({:.0}%) {:.0}ms",
-                res.board, res.nets_routed, res.nets_total, pct, res.wall_ms
+                "{} — {}/{} nets ({:.0}%) {:.0}ms{}",
+                res.board, res.nets_routed, res.nets_total, pct, res.wall_ms, drc_suffix
             )
         });
     s.push_str(&format!(
@@ -624,14 +684,23 @@ fn trace_path(t: &PcbTrace, color: &str, stroke: f64) -> String {
         match rp {
             RoutePoint::Wire { x, y, width, .. } => pts.push((*x, *y, *width)),
             RoutePoint::Via { x, y, .. } => {
-                // A via continues the polyline AND draws a marker.
+                // A via continues the polyline AND draws a marker at its REAL
+                // geometry: an annular copper pad of diameter VIA_PAD_MM with a
+                // drill dot of diameter VIA_DRILL_MM (board units), not an
+                // arbitrary stroke-scaled blob.
                 pts.push((*x, *y, stroke));
                 out.push_str(&format!(
-                    r##"<circle cx="{:.3}" cy="{:.3}" r="{:.3}" fill="#ffd33d" stroke="#000" stroke-width="{:.3}"/>"##,
+                    r##"<circle cx="{:.3}" cy="{:.3}" r="{:.4}" fill="#ffd33d" stroke="#000" stroke-width="{:.4}"/>"##,
                     x,
                     y,
-                    stroke * 2.5,
-                    stroke * 0.5
+                    crate::VIA_PAD_MM / 2.0,
+                    stroke * 0.4
+                ));
+                out.push_str(&format!(
+                    r##"<circle cx="{:.3}" cy="{:.3}" r="{:.4}" fill="#0b1020"/>"##,
+                    x,
+                    y,
+                    crate::VIA_DRILL_MM / 2.0
                 ));
             }
         }
@@ -735,6 +804,40 @@ fn ratsnest_overlay(srj: &SimpleRouteJson, res: &BoardResult, stroke: f64) -> St
                 dash
             ));
         }
+    }
+    out
+}
+
+/// Overlay every geometric DRC violation as a conspicuous red marker at its
+/// reported `location` (board units), drawn ON TOP of all copper. Each is a
+/// hollow red ring with an X through it so a clearance short or via violation is
+/// impossible to miss. Drawn inside the y-flip group, so it shares the copper
+/// coordinate frame.
+fn drc_overlay(violations: &[Violation], stroke: f64) -> String {
+    if violations.is_empty() {
+        return String::new();
+    }
+    let r = stroke * 4.0;
+    let mut out = String::new();
+    for v in violations {
+        let (cx, cy) = v.location;
+        out.push_str(&format!(
+            r##"<circle cx="{cx:.3}" cy="{cy:.3}" r="{r:.3}" fill="none" stroke="#ff2d2d" stroke-width="{:.3}" stroke-opacity="0.95"/>"##,
+            stroke * 1.2
+        ));
+        // An X through the ring.
+        out.push_str(&format!(
+            r##"<path d="M{:.3} {:.3} L{:.3} {:.3} M{:.3} {:.3} L{:.3} {:.3}" stroke="#ff2d2d" stroke-width="{:.3}" stroke-opacity="0.95" stroke-linecap="round"/>"##,
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
+            cx - r,
+            cy + r,
+            cx + r,
+            cy - r,
+            stroke * 1.2
+        ));
     }
     out
 }
@@ -878,8 +981,10 @@ mod tests {
             error: None,
             unrouted: Vec::new(),
             congestion_peak: 0,
+            drc_violations: 0,
+            drc_by_class: BTreeMap::new(),
         };
-        let svg = render_svg(&srj, &traces, &res, &RouteDiagnostics::default());
+        let svg = render_svg(&srj, &traces, &res, &RouteDiagnostics::default(), &[]);
         assert!(svg.starts_with("<svg"));
         assert!(svg.ends_with("</svg>"));
         assert!(svg.contains("<rect")); // obstacle + board bg
@@ -907,6 +1012,8 @@ mod tests {
                 reason: UnroutedReason::Congested,
             }],
             congestion_peak: 2,
+            drc_violations: 0,
+            drc_by_class: BTreeMap::new(),
         };
         // 2x2 grid lines spanning the board; one busy cell to shade.
         let diag = RouteDiagnostics {
@@ -914,7 +1021,7 @@ mod tests {
             y_lines: vec![0.0, 10.0],
             congestion: vec![2, 0, 0, 0],
         };
-        let svg = render_svg(&srj, &traces, &res, &diag);
+        let svg = render_svg(&srj, &traces, &res, &diag, &[]);
         // Ratsnest line for the unrouted net, dashed because it's Congested.
         assert!(svg.contains("<line"), "expected a ratsnest line");
         assert!(svg.contains("stroke-dasharray"), "Congested ratsnest must be dashed");
