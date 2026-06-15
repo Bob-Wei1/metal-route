@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::{default_resolution, parse_srj, route_problem, RouterKind};
+use crate::{default_resolution, parse_srj, route_problem, RouteDiagnostics, RouterKind, UnroutedReason};
 use mr_srj::{Obstacle, PcbTrace, RoutePoint, SimpleRouteJson};
 
 /// Arguments for the `bench-corpus` subcommand.
@@ -52,6 +53,33 @@ pub struct CorpusArgs {
     pub max_cells: u64,
 }
 
+/// One unrouted net and the diagnosed reason it failed.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnroutedNet {
+    pub name: String,
+    pub reason: UnroutedReason,
+}
+
+/// Count of unrouted nets by [`UnroutedReason`] — the headline diagnostic that
+/// says whether failures are resolution-bound (`unroutable_alone`) or the
+/// algorithm leaving routable nets on the table (`congested`).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReasonHistogram {
+    /// Nets with no path even alone on the base grid (a grid/resolution limit).
+    pub unroutable_alone: usize,
+    /// Nets that route fine alone but were lost to congestion (an algorithm limit).
+    pub congested: usize,
+}
+
+impl ReasonHistogram {
+    fn add(&mut self, reason: UnroutedReason) {
+        match reason {
+            UnroutedReason::UnroutableAlone => self.unroutable_alone += 1,
+            UnroutedReason::Congested => self.congested += 1,
+        }
+    }
+}
+
 /// Per-board result.
 #[derive(Debug, Clone, Serialize)]
 pub struct BoardResult {
@@ -66,6 +94,10 @@ pub struct BoardResult {
     pub wall_ms: f64,
     /// `None` on success; a message when the board was skipped or errored.
     pub error: Option<String>,
+    /// Each unrouted net with its diagnosed failure reason (empty on a full board).
+    pub unrouted: Vec<UnroutedNet>,
+    /// Peak per-cell occupancy across routed copper — a congestion proxy.
+    pub congestion_peak: u32,
 }
 
 impl BoardResult {
@@ -88,6 +120,8 @@ pub struct CorpusGroup {
     pub completion_rate: f64,
     pub fully_routed_boards: usize,
     pub total_wall_ms: f64,
+    /// Why this group's unrouted nets failed (congestion vs. resolution).
+    pub unrouted_reasons: ReasonHistogram,
 }
 
 /// The full corpus report — the checked-in real-board baseline.
@@ -101,6 +135,9 @@ pub struct CorpusReport {
     pub fully_routed_boards: usize,
     pub total_wall_ms: f64,
     pub nets_per_sec: f64,
+    /// Corpus-wide split of unrouted nets by failure reason — the headline that
+    /// drives the diagnose-then-fix decision.
+    pub unrouted_reasons: ReasonHistogram,
     pub groups: Vec<CorpusGroup>,
     pub per_board: Vec<BoardResult>,
 }
@@ -167,7 +204,7 @@ fn route_board(
     board: &str,
     srj: &SimpleRouteJson,
     args: &CorpusArgs,
-) -> (BoardResult, Vec<PcbTrace>) {
+) -> (BoardResult, Vec<PcbTrace>, RouteDiagnostics) {
     let nets_total: usize = srj
         .connections
         .iter()
@@ -188,8 +225,11 @@ fn route_board(
                 grid_layers: 0,
                 wall_ms: 0.0,
                 error: Some(format!("skipped: predicted {cells} cells > max-cells")),
+                unrouted: Vec::new(),
+                congestion_peak: 0,
             },
             Vec::new(),
+            RouteDiagnostics::default(),
         );
     }
 
@@ -198,21 +238,32 @@ fn route_board(
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     match routed {
-        Ok((traces, summary)) => (
-            BoardResult {
-                corpus: corpus.to_string(),
-                board: board.to_string(),
-                nets_total: summary.total,
-                nets_routed: summary.routed,
-                total_cost: summary.total_cost,
-                grid_w: summary.grid_w,
-                grid_h: summary.grid_h,
-                grid_layers: summary.grid_layers,
-                wall_ms,
-                error: None,
-            },
-            traces,
-        ),
+        Ok((traces, summary, diag)) => {
+            let unrouted = summary
+                .unrouted
+                .iter()
+                .map(|(name, reason)| UnroutedNet { name: name.clone(), reason: *reason })
+                .collect();
+            let congestion_peak = diag.congestion.iter().copied().max().unwrap_or(0);
+            (
+                BoardResult {
+                    corpus: corpus.to_string(),
+                    board: board.to_string(),
+                    nets_total: summary.total,
+                    nets_routed: summary.routed,
+                    total_cost: summary.total_cost,
+                    grid_w: summary.grid_w,
+                    grid_h: summary.grid_h,
+                    grid_layers: summary.grid_layers,
+                    wall_ms,
+                    error: None,
+                    unrouted,
+                    congestion_peak,
+                },
+                traces,
+                diag,
+            )
+        }
         Err(e) => (
             BoardResult {
                 corpus: corpus.to_string(),
@@ -225,8 +276,11 @@ fn route_board(
                 grid_layers: 0,
                 wall_ms,
                 error: Some(format!("error: {e}")),
+                unrouted: Vec::new(),
+                congestion_peak: 0,
             },
             Vec::new(),
+            RouteDiagnostics::default(),
         ),
     }
 }
@@ -247,57 +301,61 @@ pub fn run_corpus(args: &CorpusArgs) -> Result<CorpusReport> {
             .with_context(|| format!("failed to create svg-out dir {}", svg_dir.display()))?;
     }
 
+    // Route every board IN PARALLEL — boards are fully independent (no shared
+    // state), so this is an embarrassingly parallel fan-out across cores and the
+    // dominant wall-clock win for the eval loop. Side effects (SVG writes, the
+    // per-board log) are hoisted OUT of the parallel section and replayed in file
+    // order afterwards, so the report and the SVG gallery stay deterministic
+    // regardless of completion order. Each board's own router may itself use rayon
+    // internally; nested rayon parallelism composes via work-stealing.
+    let outputs: Vec<(BoardResult, Option<String>)> = files
+        .par_iter()
+        .map(|file| {
+            let corpus = group_of(root, file);
+            let board = file
+                .file_name()
+                .map(|n| n.to_string_lossy().trim_end_matches(".srj.json").to_string())
+                .unwrap_or_default();
+
+            let err_result = |msg: String| BoardResult {
+                corpus: corpus.clone(),
+                board: board.clone(),
+                nets_total: 0,
+                nets_routed: 0,
+                total_cost: 0,
+                grid_w: 0,
+                grid_h: 0,
+                grid_layers: 0,
+                wall_ms: 0.0,
+                error: Some(msg),
+                unrouted: Vec::new(),
+                congestion_peak: 0,
+            };
+
+            let bytes = match std::fs::read(file) {
+                Ok(b) => b,
+                Err(e) => return (err_result(format!("read failed: {e}")), None),
+            };
+            let srj = match parse_srj(&bytes) {
+                Ok(s) => s,
+                Err(e) => return (err_result(format!("parse failed: {e}")), None),
+            };
+
+            let (result, traces, diag) = route_board(&corpus, &board, &srj, args);
+            // Render SVG content here (CPU-bound, parallel-safe); the actual file
+            // write happens sequentially below to keep I/O ordered and fallible.
+            let svg = args
+                .svg_out
+                .as_ref()
+                .map(|_| render_svg(&srj, &traces, &result, &diag));
+            (result, svg)
+        })
+        .collect();
+
     let mut per_board = Vec::with_capacity(files.len());
     let mut gallery: Vec<(BoardResult, String)> = Vec::new();
-
-    for file in &files {
-        let corpus = group_of(root, file);
-        let board = file
-            .file_name()
-            .map(|n| n.to_string_lossy().trim_end_matches(".srj.json").to_string())
-            .unwrap_or_default();
-
-        let bytes = match std::fs::read(file) {
-            Ok(b) => b,
-            Err(e) => {
-                per_board.push(BoardResult {
-                    corpus,
-                    board,
-                    nets_total: 0,
-                    nets_routed: 0,
-                    total_cost: 0,
-                    grid_w: 0,
-                    grid_h: 0,
-                    grid_layers: 0,
-                    wall_ms: 0.0,
-                    error: Some(format!("read failed: {e}")),
-                });
-                continue;
-            }
-        };
-        let srj = match parse_srj(&bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                per_board.push(BoardResult {
-                    corpus,
-                    board,
-                    nets_total: 0,
-                    nets_routed: 0,
-                    total_cost: 0,
-                    grid_w: 0,
-                    grid_h: 0,
-                    grid_layers: 0,
-                    wall_ms: 0.0,
-                    error: Some(format!("parse failed: {e}")),
-                });
-                continue;
-            }
-        };
-
-        let (result, traces) = route_board(&corpus, &board, &srj, args);
-
-        if let Some(svg_dir) = &args.svg_out {
-            let svg = render_svg(&srj, &traces, &result);
+    for (result, svg) in outputs {
+        if let (Some(svg_dir), Some(svg)) = (&args.svg_out, svg) {
             let svg_name = format!("{}__{}.svg", result.corpus, result.board);
             let svg_path = svg_dir.join(svg_name.replace('/', "_"));
             std::fs::write(&svg_path, &svg)
@@ -307,7 +365,6 @@ pub fn run_corpus(args: &CorpusArgs) -> Result<CorpusReport> {
                 svg_path.file_name().unwrap().to_string_lossy().into_owned(),
             ));
         }
-
         eprintln!(
             "  {:<14} {:<44} {:>3}/{:<3} nets  {:>6.0}ms{}",
             result.corpus,
@@ -348,6 +405,7 @@ fn aggregate(router: RouterKind, per_board: Vec<BoardResult>) -> CorpusReport {
     let mut groups: BTreeMap<String, CorpusGroup> = BTreeMap::new();
     let (mut nets_total, mut nets_routed, mut wall, mut fully) = (0usize, 0usize, 0.0f64, 0usize);
 
+    let mut reasons = ReasonHistogram::default();
     for b in &per_board {
         let g = groups.entry(b.corpus.clone()).or_insert_with(|| CorpusGroup {
             name: b.corpus.clone(),
@@ -357,11 +415,16 @@ fn aggregate(router: RouterKind, per_board: Vec<BoardResult>) -> CorpusReport {
             completion_rate: 0.0,
             fully_routed_boards: 0,
             total_wall_ms: 0.0,
+            unrouted_reasons: ReasonHistogram::default(),
         });
         g.boards += 1;
         g.nets_total += b.nets_total;
         g.nets_routed += b.nets_routed;
         g.total_wall_ms += b.wall_ms;
+        for u in &b.unrouted {
+            g.unrouted_reasons.add(u.reason);
+            reasons.add(u.reason);
+        }
         let full = b.error.is_none() && b.nets_total > 0 && b.nets_routed == b.nets_total;
         if full {
             g.fully_routed_boards += 1;
@@ -396,6 +459,7 @@ fn aggregate(router: RouterKind, per_board: Vec<BoardResult>) -> CorpusReport {
         } else {
             0.0
         },
+        unrouted_reasons: reasons,
         groups: groups.into_values().collect(),
         per_board,
     }
@@ -419,7 +483,12 @@ fn esc(s: &str) -> String {
 ///
 /// PCB space is y-up; SVG is y-down, so the drawing is wrapped in a flip
 /// transform. Trace widths and coordinates are therefore in board units.
-fn render_svg(srj: &SimpleRouteJson, traces: &[PcbTrace], res: &BoardResult) -> String {
+fn render_svg(
+    srj: &SimpleRouteJson,
+    traces: &[PcbTrace],
+    res: &BoardResult,
+    diag: &RouteDiagnostics,
+) -> String {
     let b = &srj.bounds;
     let (w, h) = (b.max_x - b.min_x, b.max_y - b.min_y);
     let (w, h) = (if w > 0.0 { w } else { 1.0 }, if h > 0.0 { h } else { 1.0 });
@@ -447,6 +516,11 @@ fn render_svg(srj: &SimpleRouteJson, traces: &[PcbTrace], res: &BoardResult) -> 
         b.min_x, b.min_y, w, h
     ));
 
+    // Congestion / utilisation heatmap (beneath copper) — one blocky Hanan cell
+    // per occupied grid node, warmer where more nets pass through. Shows how full
+    // the board is around a failed net; chokepoints glow.
+    s.push_str(&congestion_overlay(diag, res));
+
     // Obstacles (pads / keepouts) — gray, dimmer on inner layers.
     for o in &srj.obstacles {
         s.push_str(&obstacle_rect(o, stroke));
@@ -456,6 +530,11 @@ fn render_svg(srj: &SimpleRouteJson, traces: &[PcbTrace], res: &BoardResult) -> 
     for (i, t) in traces.iter().enumerate() {
         s.push_str(&trace_path(t, &net_color(i), stroke));
     }
+
+    // Ratsnest of UNROUTED nets — straight red lines between the endpoints the
+    // router failed to connect, so failures are explicit, not just implied by a
+    // missing trace. Dashed = `Congested` (routable alone), solid = impossible.
+    s.push_str(&ratsnest_overlay(srj, res, stroke));
 
     // Connection endpoints — small white dots so unrouted nets are visible.
     for c in &srj.connections {
@@ -561,6 +640,105 @@ fn trace_path(t: &PcbTrace, color: &str, stroke: f64) -> String {
     out
 }
 
+/// Render the per-cell occupancy field as translucent Hanan cells. Each occupied
+/// grid node `(x, y)` — summed across layers — becomes a rect spanning its Voronoi
+/// half-gaps to neighbouring grid lines, coloured warmer (amber → red) with
+/// occupancy. Returns empty if the diagnostics geometry doesn't match the grid.
+fn congestion_overlay(diag: &RouteDiagnostics, res: &BoardResult) -> String {
+    let (xs, ys) = (&diag.x_lines, &diag.y_lines);
+    let (w, h, layers) =
+        (res.grid_w as usize, res.grid_h as usize, res.grid_layers.max(1) as usize);
+    if w == 0 || h == 0 || xs.len() != w || ys.len() != h || diag.congestion.len() != w * h * layers
+    {
+        return String::new();
+    }
+    // Fold occupancy across layers onto the planar (x, y) grid: index `i` lives at
+    // planar node `i % (w*h)` (== y*w + x) regardless of layer.
+    let plane = w * h;
+    let mut planar = vec![0u32; plane];
+    for (i, &c) in diag.congestion.iter().enumerate() {
+        planar[i % plane] += c;
+    }
+    let peak = planar.iter().copied().max().unwrap_or(0).max(1) as f64;
+    // A cell's continuous extent: midpoints to neighbouring lines, clamped to the
+    // first/last line at the board edge.
+    let edge = |lines: &[f64], k: usize| -> (f64, f64) {
+        let lo = if k == 0 { lines[0] } else { 0.5 * (lines[k - 1] + lines[k]) };
+        let hi = if k + 1 == lines.len() { lines[k] } else { 0.5 * (lines[k] + lines[k + 1]) };
+        (lo, hi)
+    };
+    let mut out = String::new();
+    for y in 0..h {
+        let (y0, y1) = edge(ys, y);
+        for x in 0..w {
+            let c = planar[y * w + x];
+            if c == 0 {
+                continue;
+            }
+            let (x0, x1) = edge(xs, x);
+            let t = c as f64 / peak;
+            let op = 0.10 + 0.45 * t;
+            let hue = 40.0 - 40.0 * t; // amber (low) -> red (high)
+            out.push_str(&format!(
+                r##"<rect x="{:.3}" y="{:.3}" width="{:.3}" height="{:.3}" fill="hsl({:.0} 90% 55%)" fill-opacity="{:.3}"/>"##,
+                x0,
+                y0,
+                (x1 - x0).max(0.0),
+                (y1 - y0).max(0.0),
+                hue,
+                op
+            ));
+        }
+    }
+    out
+}
+
+/// Draw straight "ratsnest" lines for every UNROUTED net segment, mapping each
+/// failed sub-net name back to its connection segment (the same `<conn>#<seg>`
+/// decomposition the rasteriser uses). Dashed coral = `Congested` (routable in
+/// isolation, lost to contention); solid bright red = `UnroutableAlone`, so the
+/// two failure classes read apart at a glance.
+fn ratsnest_overlay(srj: &SimpleRouteJson, res: &BoardResult, stroke: f64) -> String {
+    if res.unrouted.is_empty() {
+        return String::new();
+    }
+    let reason: std::collections::HashMap<&str, UnroutedReason> =
+        res.unrouted.iter().map(|u| (u.name.as_str(), u.reason)).collect();
+    let mut out = String::new();
+    for conn in &srj.connections {
+        let pts = &conn.points_to_connect;
+        if pts.len() < 2 {
+            continue;
+        }
+        let segments = pts.len() - 1;
+        for (seg, win) in pts.windows(2).enumerate() {
+            let name =
+                if segments == 1 { conn.name.clone() } else { format!("{}#{}", conn.name, seg) };
+            let Some(r) = reason.get(name.as_str()) else {
+                continue;
+            };
+            let (color, dash) = match r {
+                UnroutedReason::Congested => (
+                    "#ff7b72",
+                    format!(r##" stroke-dasharray="{:.3} {:.3}""##, stroke * 3.0, stroke * 2.0),
+                ),
+                UnroutedReason::UnroutableAlone => ("#ff2d2d", String::new()),
+            };
+            out.push_str(&format!(
+                r##"<line x1="{:.3}" y1="{:.3}" x2="{:.3}" y2="{:.3}" stroke="{}" stroke-width="{:.3}" stroke-opacity="0.95" stroke-linecap="round"{}/>"##,
+                win[0].x,
+                win[0].y,
+                win[1].x,
+                win[1].y,
+                color,
+                stroke * 1.6,
+                dash
+            ));
+        }
+    }
+    out
+}
+
 /// Render the `index.html` gallery: overall + per-corpus stats, then every board
 /// (failures first within each group) as an embedded SVG with a pass/fail badge.
 fn render_gallery(report: &CorpusReport, gallery: &[(BoardResult, String)]) -> String {
@@ -595,6 +773,13 @@ fn render_gallery(report: &CorpusReport, gallery: &[(BoardResult, String)]) -> S
         report.nets_per_sec,
         report.total_wall_ms / 1000.0,
     ));
+    // Headline diagnostic: of all unrouted nets, how many were lost to congestion
+    // (algorithm could fix) vs. impossible at this resolution (grid limit)?
+    h.push_str(&format!(
+        r##"<div style="margin-top:8px"><span class="stat" style="color:#ff7b72"><b>{}</b> congested (routable alone)</span><span class="stat" style="color:#ff2d2d"><b>{}</b> unroutable alone (resolution-bound)</span></div>"##,
+        report.unrouted_reasons.congested,
+        report.unrouted_reasons.unroutable_alone,
+    ));
 
     let by_name: std::collections::HashMap<&str, &(BoardResult, String)> =
         gallery.iter().map(|e| (e.0.board.as_str(), e)).collect();
@@ -602,13 +787,15 @@ fn render_gallery(report: &CorpusReport, gallery: &[(BoardResult, String)]) -> S
 
     for g in &report.groups {
         h.push_str(&format!(
-            r##"<h2>{} — {:.1}% ({}/{} nets, {}/{} boards full)</h2>"##,
+            r##"<h2>{} — {:.1}% ({}/{} nets, {}/{} boards full) · <span style="color:#ff7b72">{} congested</span> / <span style="color:#ff2d2d">{} unroutable-alone</span></h2>"##,
             esc(&g.name),
             g.completion_rate * 100.0,
             g.nets_routed,
             g.nets_total,
             g.fully_routed_boards,
             g.boards,
+            g.unrouted_reasons.congested,
+            g.unrouted_reasons.unroutable_alone,
         ));
         // Failures first, then by board name.
         let mut items: Vec<&(BoardResult, String)> =
@@ -629,14 +816,26 @@ fn render_gallery(report: &CorpusReport, gallery: &[(BoardResult, String)]) -> S
                 .as_deref()
                 .map(esc)
                 .unwrap_or_else(|| format!("{:.0}ms", res.wall_ms));
+            // Per-board failure split, shown only when the board has unrouted nets.
+            let cong =
+                res.unrouted.iter().filter(|u| u.reason == UnroutedReason::Congested).count();
+            let alone = res.unrouted.len() - cong;
+            let reason_line = if res.unrouted.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r##"<div class="badge" style="border-top:1px solid #30363d"><span style="color:#ff7b72">{cong} congested</span><span style="color:#ff2d2d">{alone} unroutable-alone</span></div>"##
+                )
+            };
             h.push_str(&format!(
-                r##"<div class="card {cls}"><img loading="lazy" src="{}"><div class="badge"><span>{}</span><span class="pct {pcls}">{}/{} ({:.0}%)</span><span>{}</span></div></div>"##,
+                r##"<div class="card {cls}"><img loading="lazy" src="{}"><div class="badge"><span>{}</span><span class="pct {pcls}">{}/{} ({:.0}%)</span><span>{}</span></div>{}</div>"##,
                 esc(file),
                 esc(&res.board),
                 res.nets_routed,
                 res.nets_total,
                 res.completion() * 100.0,
                 right,
+                reason_line,
             ));
         }
         h.push_str("</div>");
@@ -677,12 +876,50 @@ mod tests {
             grid_layers: 1,
             wall_ms: 1.0,
             error: None,
+            unrouted: Vec::new(),
+            congestion_peak: 0,
         };
-        let svg = render_svg(&srj, &traces, &res);
+        let svg = render_svg(&srj, &traces, &res, &RouteDiagnostics::default());
         assert!(svg.starts_with("<svg"));
         assert!(svg.ends_with("</svg>"));
         assert!(svg.contains("<rect")); // obstacle + board bg
         assert!(svg.contains("<path")); // the routed trace
+    }
+
+    #[test]
+    fn render_svg_draws_ratsnest_and_heatmap_for_failures() {
+        let srj = tiny_srj(); // single connection "n0" between (1,1) and (9,9)
+        let traces: Vec<PcbTrace> = Vec::new();
+        let res = BoardResult {
+            corpus: "t".into(),
+            board: "tiny".into(),
+            nets_total: 1,
+            nets_routed: 0,
+            total_cost: 0,
+            grid_w: 2,
+            grid_h: 2,
+            grid_layers: 1,
+            wall_ms: 1.0,
+            error: None,
+            // "n0" is a single-segment connection, so its sub-net keeps the bare name.
+            unrouted: vec![UnroutedNet {
+                name: "n0".into(),
+                reason: UnroutedReason::Congested,
+            }],
+            congestion_peak: 2,
+        };
+        // 2x2 grid lines spanning the board; one busy cell to shade.
+        let diag = RouteDiagnostics {
+            x_lines: vec![0.0, 10.0],
+            y_lines: vec![0.0, 10.0],
+            congestion: vec![2, 0, 0, 0],
+        };
+        let svg = render_svg(&srj, &traces, &res, &diag);
+        // Ratsnest line for the unrouted net, dashed because it's Congested.
+        assert!(svg.contains("<line"), "expected a ratsnest line");
+        assert!(svg.contains("stroke-dasharray"), "Congested ratsnest must be dashed");
+        // Heatmap cell for the occupied node (hsl warm fill from congestion_overlay).
+        assert!(svg.contains("hsl("), "expected a congestion heatmap cell");
     }
 
     #[test]

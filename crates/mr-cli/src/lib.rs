@@ -22,7 +22,8 @@ pub mod corpus;
 pub mod drc;
 use std::collections::HashMap;
 
-use mr_core::{BoardRoute, CellIdx, GridCoords, LayerMap, Router, ViaModel};
+use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
+use serde::{Deserialize, Serialize};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
 use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
 use mr_srj::{rasterize_with_layers, to_solution_layered, Mapping, RoutePoint, SimpleRouteJson};
@@ -167,6 +168,24 @@ pub struct ProjectArgs {
     pub nets: u32,
 }
 
+/// Why a net was left unrouted, diagnosed by re-routing it in isolation on the
+/// base grid (all other nets absent).
+///
+/// This is the headline diagnostic: it separates failures the *algorithm* could
+/// in principle fix (contention) from failures rooted in the grid itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnroutedReason {
+    /// The net has no path even on an otherwise-empty board at this resolution —
+    /// a geometry/resolution limit (e.g. a pad walled off by neighbours, or a
+    /// gap too narrow to fit a cell), not contention. Points at resolution levers.
+    UnroutableAlone,
+    /// The net routes fine in isolation; the multi-net router lost it to
+    /// congestion (other nets' committed copper + clearance). Points at the
+    /// routing algorithm (net ordering, rip-up, global planning).
+    Congested,
+}
+
 /// One-line summary of a completed `route` run (also printed to stderr).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -182,6 +201,25 @@ pub struct Summary {
     pub grid_h: u32,
     /// Number of copper layers routed on.
     pub grid_layers: u32,
+    /// Each unrouted net's name paired with its diagnosed [`UnroutedReason`].
+    /// Empty on a fully-routed board.
+    pub unrouted: Vec<(String, UnroutedReason)>,
+}
+
+/// Rendering-side diagnostics for one routed board: the per-cell congestion field
+/// plus the non-uniform grid-line coordinates needed to place each cell back in
+/// continuous board space (so the gallery can draw a faithful heatmap on the
+/// Hanan grid). Kept separate from [`Summary`] because the `f64` line arrays are
+/// not `Eq`, and because only the corpus gallery consumes them.
+#[derive(Debug, Clone, Default)]
+pub struct RouteDiagnostics {
+    /// Per-cell occupancy (length == `grid_w * grid_h * grid_layers`): how many
+    /// routed nets pass through each cell. Summed across layers for the heatmap.
+    pub congestion: Vec<u32>,
+    /// Sorted x grid-line coordinates (continuous board units); `len() == grid_w`.
+    pub x_lines: Vec<f64>,
+    /// Sorted y grid-line coordinates (continuous board units); `len() == grid_h`.
+    pub y_lines: Vec<f64>,
 }
 
 impl std::fmt::Display for Summary {
@@ -247,7 +285,7 @@ pub fn route_problem(
     resolution: Option<f64>,
     router: RouterKind,
     layers: Option<u32>,
-) -> Result<(Vec<mr_srj::PcbTrace>, Summary)> {
+) -> Result<(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics)> {
     let resolution = resolution.unwrap_or_else(|| default_resolution(srj));
     anyhow::ensure!(
         resolution.is_finite() && resolution > 0.0,
@@ -276,8 +314,8 @@ pub fn route_problem(
         RouterKind::Lee => LeeRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Negotiated => NegotiatedRouter::new()
-            .with_via_model(via_model)
-            .with_coords(coords)
+            .with_via_model(via_model.clone())
+            .with_coords(coords.clone())
             .route(&problem.grid, &problem.nets),
     }
     .context("router failed")?;
@@ -294,6 +332,11 @@ pub fn route_problem(
     // changes connectivity or introduces a clearance violation.
     let traces = mr_srj::beautify_traces(traces, &srj.obstacles, srj.min_clearance.unwrap_or(0.0));
 
+    // Diagnose every unrouted net: was it impossible at this resolution, or just
+    // lost to congestion? Cheap — re-routes only the failed nets, one at a time.
+    let unrouted =
+        classify_unrouted(router, &problem.grid, &problem.nets, &board.unrouted, &via_model, &coords);
+
     let summary = Summary {
         routed: board.results.len(),
         total,
@@ -301,9 +344,62 @@ pub fn route_problem(
         grid_w: problem.mapping.dims.w,
         grid_h: problem.mapping.dims.h,
         grid_layers: problem.mapping.dims.layers,
+        unrouted,
     };
 
-    Ok((traces, summary))
+    let diagnostics = RouteDiagnostics {
+        congestion: board.congestion,
+        x_lines: problem.mapping.x_lines.clone(),
+        y_lines: problem.mapping.y_lines.clone(),
+    };
+
+    Ok((traces, summary, diagnostics))
+}
+
+/// Diagnose every unrouted net by re-routing it **alone** on the base grid.
+///
+/// Each name in `unrouted` is submitted as the sole net to the same backend that
+/// routed the board, so its own pads are unmasked and full capability (vias, for
+/// the negotiated backend) is available — exactly the conditions the multi-net
+/// router had, minus every other net's copper. If the net routes in isolation the
+/// original failure was contention ([`UnroutedReason::Congested`]); if it still
+/// can't route, the grid itself blocks it ([`UnroutedReason::UnroutableAlone`]).
+///
+/// Runs sequentially: the corpus harness already fans boards out across cores, so
+/// nesting rayon here would only oversubscribe. The per-net count is small.
+fn classify_unrouted(
+    router: RouterKind,
+    grid: &Grid,
+    nets: &[NetEndpoints],
+    unrouted: &[String],
+    via_model: &ViaModel,
+    coords: &GridCoords,
+) -> Vec<(String, UnroutedReason)> {
+    let by_name: HashMap<&str, &NetEndpoints> = nets.iter().map(|n| (n.net.as_str(), n)).collect();
+
+    unrouted
+        .iter()
+        .map(|name| {
+            let routes_alone = by_name.get(name.as_str()).is_some_and(|net| {
+                let solo = std::slice::from_ref(*net);
+                let res = match router {
+                    RouterKind::Lee => LeeRouter::new().route(grid, solo),
+                    RouterKind::Ripup => RipUpRouter::new().route(grid, solo),
+                    RouterKind::Negotiated => NegotiatedRouter::new()
+                        .with_via_model(via_model.clone())
+                        .with_coords(coords.clone())
+                        .route(grid, solo),
+                };
+                matches!(res, Ok(b) if b.unrouted.is_empty() && !b.results.is_empty())
+            });
+            let reason = if routes_alone {
+                UnroutedReason::Congested
+            } else {
+                UnroutedReason::UnroutableAlone
+            };
+            (name.clone(), reason)
+        })
+        .collect()
 }
 
 /// Execute the `route` subcommand: read the input file, route, write the
@@ -315,7 +411,7 @@ pub fn run_route(args: &RouteArgs) -> Result<Summary> {
         .with_context(|| format!("failed to read input file {}", args.input.display()))?;
     let srj = parse_srj(&bytes)?;
 
-    let (traces, summary) = route_problem(&srj, args.resolution, args.router, args.layers)?;
+    let (traces, summary, _diag) = route_problem(&srj, args.resolution, args.router, args.layers)?;
 
     let json = serde_json::to_string_pretty(&traces).context("failed to serialise solution")?;
 
@@ -906,7 +1002,8 @@ mod tests {
     #[test]
     fn route_problem_routes_two_nets() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
-        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Ripup, None).unwrap();
+        let (traces, summary, _diag) =
+            route_problem(&srj, Some(1.0), RouterKind::Ripup, None).unwrap();
 
         // Two 2-point connections -> two nets, both routable on this open board.
         assert_eq!(summary.total, 2);
@@ -950,14 +1047,15 @@ mod tests {
         let srj = parse_srj(TWO_LAYER_WALL.as_bytes()).unwrap();
 
         // Declared single layer: the top-layer wall is impassable.
-        let (traces1, s1) = route_problem(&srj, Some(1.0), RouterKind::Negotiated, None).unwrap();
+        let (traces1, s1, _d1) =
+            route_problem(&srj, Some(1.0), RouterKind::Negotiated, None).unwrap();
         assert_eq!(s1.grid_layers, 1);
         assert_eq!(s1.routed, 0, "net must be unroutable on one layer");
         assert_eq!(count_vias(&traces1), 0);
 
         // Grant a second layer: the net routes and must change layers (>=2 vias:
         // down before the wall, back up after).
-        let (traces2, s2) =
+        let (traces2, s2, _d2) =
             route_problem(&srj, Some(1.0), RouterKind::Negotiated, Some(2)).unwrap();
         assert_eq!(s2.grid_layers, 2);
         assert_eq!(s2.routed, 1, "net should route once a second layer exists");
@@ -991,7 +1089,8 @@ mod tests {
     #[test]
     fn route_problem_lee_backend_also_routes() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
-        let (traces, summary) = route_problem(&srj, Some(1.0), RouterKind::Lee, None).unwrap();
+        let (traces, summary, _diag) =
+            route_problem(&srj, Some(1.0), RouterKind::Lee, None).unwrap();
         assert_eq!(summary.routed, 2);
         assert!(!traces.is_empty());
     }
@@ -1000,7 +1099,8 @@ mod tests {
     fn default_resolution_targets_reasonable_grid() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
         // span 10 / 64 -> small cells; grid should be well-formed and non-trivial.
-        let (_traces, summary) = route_problem(&srj, None, RouterKind::Ripup, None).unwrap();
+        let (_traces, summary, _diag) =
+            route_problem(&srj, None, RouterKind::Ripup, None).unwrap();
         assert!(summary.grid_w >= 10 && summary.grid_h >= 10);
     }
 
@@ -1051,6 +1151,7 @@ mod tests {
             grid_w: 10,
             grid_h: 8,
             grid_layers: 1,
+            unrouted: Vec::new(),
         };
         let text = s.to_string();
         assert!(!text.contains('\n'));
