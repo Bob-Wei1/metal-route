@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 
-use mr_core::{BoardRoute, CellIdx, Dims, Grid, GridCoords, LayerMap, NetEndpoints};
+use mr_core::{BoardRoute, CellIdx, Dims, Grid, GridCoords, LayerMap, NetEndpoints, RouteResult};
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -1064,15 +1064,28 @@ pub struct PcbTrace {
     #[serde(rename = "type")]
     pub kind: String,
     pub route: Vec<RoutePoint>,
+    /// Base net name of this trace (the connection's net with any `#seg` decomposition
+    /// suffix stripped), for downstream net-aware DRC. In-memory only — `#[serde(skip)]`
+    /// keeps the emitted tscircuit solution byte-identical. `None` when constructed
+    /// without net context (e.g. hand-built test traces).
+    #[serde(skip, default)]
+    pub net: Option<String>,
 }
 
 impl PcbTrace {
-    /// Construct a wire-only `pcb_trace` from the given route points.
+    /// Construct a wire-only `pcb_trace` from the given route points (no net tag).
     pub fn new(route: Vec<RoutePoint>) -> Self {
         Self {
             kind: "pcb_trace".to_string(),
             route,
+            net: None,
         }
+    }
+
+    /// Tag this trace with its base net name (builder style).
+    pub fn with_net(mut self, net: impl Into<String>) -> Self {
+        self.net = Some(net.into());
+        self
     }
 }
 
@@ -1119,12 +1132,86 @@ pub fn to_solution_layered(
     trace_width: f64,
     layers: &LayerMap,
 ) -> Vec<PcbTrace> {
+    // Electrical-net grouping for net-aware DRC, mirroring the router's own grouping
+    // (`NegotiatedRouter::route`): two results are the same net iff they share a
+    // `group_of` name key (`<conn>#<seg>` -> `<conn>`) OR a shared endpoint CELL (a
+    // junction pad where separately-named connections — e.g. `source_net_1` and
+    // `source_trace_5` — meet). Tagging each trace with its group root makes the DRC's
+    // same-net immunity match exactly which copper the router permitted to touch.
+    let net_group = group_results(&board.results);
     board
         .results
         .iter()
-        .map(|result| {
+        .enumerate()
+        .map(|(i, result)| {
             let route = trace_route(result, mapping, pin_points, trace_width, layers);
-            PcbTrace::new(route)
+            PcbTrace::new(route).with_net(net_group[i].clone())
+        })
+        .collect()
+}
+
+/// The base net key of a connection name: the part before any `#<seg>` decomposition
+/// suffix. Mirrors `mr_cpu::negotiated::group_of`.
+fn group_of(name: &str) -> &str {
+    name.split('#').next().unwrap_or(name)
+}
+
+/// Assign each result an electrical-net label by unioning results that (1) share a
+/// `group_of` name key or (2) share an endpoint CELL (`path` first/last == src/dst).
+/// Returns the representative (lowest-index) result's base name per result — the same
+/// grouping the negotiated router uses to decide which nets may share copper.
+fn group_results(results: &[RouteResult]) -> Vec<String> {
+    let n = results.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = x;
+        while parent[c] != r {
+            let next = parent[c];
+            parent[c] = r;
+            c = next;
+        }
+        r
+    }
+    let mut union = |parent: &mut [usize], a: usize, b: usize| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            if ra < rb {
+                parent[rb] = ra;
+            } else {
+                parent[ra] = rb;
+            }
+        }
+    };
+    // (1) name groups.
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for (i, r) in results.iter().enumerate() {
+        match by_name.get(group_of(&r.net)) {
+            Some(&j) => union(&mut parent, i, j),
+            None => {
+                by_name.insert(group_of(&r.net), i);
+            }
+        }
+    }
+    // (2) shared endpoint-cell junctions (a routed path's ends are its src/dst cells).
+    let mut by_cell: HashMap<CellIdx, usize> = HashMap::new();
+    for (i, r) in results.iter().enumerate() {
+        for c in [r.path.first().copied(), r.path.last().copied()].into_iter().flatten() {
+            match by_cell.get(&c) {
+                Some(&j) => union(&mut parent, i, j),
+                None => {
+                    by_cell.insert(c, i);
+                }
+            }
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let root = find(&mut parent, i);
+            group_of(&results[root].net).to_string()
         })
         .collect()
 }

@@ -9,16 +9,22 @@
 //! * Every routed layer is treated as [`LayerKind::Signal`] (we have no plane
 //!   information in the SRJ solution path, so we never *invent* a plane — which
 //!   keeps via-through-plane checks honest rather than fabricating shorts).
-//! * Each [`PcbTrace`] gets a synthetic, stable net name (`trace#<i>`). The SRJ
-//!   solution soup carries no net identity on a [`PcbTrace`], so per-trace names
-//!   preserve same-net immunity *within* a trace (its own corners never trip a
-//!   clearance violation) while keeping every distinct trace mutually foreign.
-//! * Obstacles (pads / keepouts) have unknown net (`None`), so the checker treats
-//!   them as conflicting with every net — conservative, never hides a real short.
+//! * Net identity is RECONSTRUCTED from geometry, since a [`PcbTrace`] in the
+//!   solution soup carries no net field. Traces that share an exact vertex are
+//!   the same electrical net (junction-grouped same-net sub-connections meet at a
+//!   shared point — the geometric twin of the DSN path's `r.net.split('#')` base-net
+//!   collapse). A union-find over shared vertices assigns one synthetic net name
+//!   per connected component, so neither a trace's own corners NOR a sibling
+//!   sub-net trips a false clearance violation, while genuinely distinct nets stay
+//!   mutually foreign.
+//! * Obstacles (pads / keepouts) are tagged with the net of whichever trace
+//!   *terminates inside* them (a routed net ends on its own pad), so own-pad
+//!   contact is immune. An obstacle no trace lands in is foreign copper / a
+//!   keepout and keeps net `None` (conflicts with every net — never hides a short).
 //!
-//! The result is deterministic: layer indices are assigned by first-seen order
-//! over a stable traversal of the traces (then obstacles), and the checker itself
-//! sorts its output.
+//! The result is deterministic: vertex keys are quantised to a fixed grid, union
+//! roots and layer indices are assigned by first-seen order over a stable
+//! traversal, and the checker itself sorts its output.
 
 use std::collections::BTreeMap;
 
@@ -73,10 +79,60 @@ pub fn solution_to_drc_board(
     let mut vias: Vec<Via> = Vec::new();
     let mut pads: Vec<Pad> = Vec::new();
 
-    // Traces first (stable: outer index, then route order) so layer indices are
-    // deterministic and same-net immunity holds within each trace.
+    // --- Reconstruct net membership from geometry ---------------------------
+    // Traces that share an exact vertex are one electrical net (junction-grouped
+    // sub-connections meet at a shared point). Union them so a sibling sub-net is
+    // never treated as foreign. Vertices are quantised so float emission noise at
+    // a shared point still collides.
+    let mut uf = UnionFind::new(traces.len());
+    let mut first_at: BTreeMap<(i64, i64), usize> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
-        let net = format!("trace#{i}");
+        for rp in &t.route {
+            let (x, y) = match rp {
+                RoutePoint::Wire { x, y, .. } => (*x, *y),
+                RoutePoint::Via { x, y, .. } => (*x, *y),
+            };
+            let key = (quantize(x), quantize(y));
+            match first_at.get(&key) {
+                Some(&j) => uf.union(i, j),
+                None => {
+                    first_at.insert(key, i);
+                }
+            }
+        }
+    }
+    // Per-trace net name: prefer the real base-net tag threaded through from the
+    // router (`PcbTrace::net`, the connection's net with `#seg` stripped — so
+    // junction-grouped siblings share one identity). Fall back to the union-find
+    // component label only for untagged (e.g. hand-built test) traces.
+    let mut net_name: Vec<String> = Vec::with_capacity(traces.len());
+    let mut root_name: BTreeMap<usize, String> = BTreeMap::new();
+    for (i, t) in traces.iter().enumerate() {
+        let name = match &t.net {
+            Some(n) => n.clone(),
+            None => {
+                let r = uf.find(i);
+                let n = root_name.len();
+                root_name.entry(r).or_insert_with(|| format!("net#{n}")).clone()
+            }
+        };
+        net_name.push(name);
+    }
+    // Trace vertices tagged with their net, for pad-net resolution below.
+    let mut tagged_vertices: Vec<(f64, f64, String)> = Vec::new();
+
+    // Traces first (stable: outer index, then route order) so layer indices are
+    // deterministic and same-net immunity holds within each net component.
+    for (i, t) in traces.iter().enumerate() {
+        let net = net_name[i].clone();
+        // Record every vertex tagged with this net so an obstacle can be matched
+        // to the net that terminates inside it.
+        for rp in &t.route {
+            let (x, y) = match rp {
+                RoutePoint::Wire { x, y, .. } | RoutePoint::Via { x, y, .. } => (*x, *y),
+            };
+            tagged_vertices.push((x, y, net.clone()));
+        }
         // Walk the route, emitting one Segment per consecutive Wire pair on the
         // same layer, and one Via per Via point.
         let mut prev: Option<(f64, f64, f64, u32)> = None; // x, y, width, layer
@@ -119,13 +175,17 @@ pub fn solution_to_drc_board(
         }
     }
 
-    // Obstacles: one Pad per occupied layer. Net is unknown (None) → conservative.
+    // Obstacles: one Pad per occupied layer. The pad's net is the net of whichever
+    // trace terminates inside it (a routed net ends on its own pad) — so own-pad
+    // contact is immune. An obstacle no trace lands in is foreign copper / a keepout
+    // and keeps net `None` (conflicts with every net — never hides a real short).
     for o in &srj.obstacles {
+        let net = pad_net(o, &tagged_vertices);
         if o.layers.is_empty() {
             // Unlayered obstacle: place it on layer 0 so it is still checked.
             let l = idx.intern("");
             pads.push(Pad {
-                net: None,
+                net: net.clone(),
                 layer: l,
                 center: (o.center.x, o.center.y),
                 width: o.width,
@@ -135,7 +195,7 @@ pub fn solution_to_drc_board(
             for layer in &o.layers {
                 let l = idx.intern(layer);
                 pads.push(Pad {
-                    net: None,
+                    net: net.clone(),
                     layer: l,
                     center: (o.center.x, o.center.y),
                     width: o.width,
@@ -154,6 +214,52 @@ pub fn solution_to_drc_board(
         pads,
         vias,
         rules,
+    }
+}
+
+/// Quantise a coordinate to a fixed sub-micron grid so two vertices the router
+/// emitted at the "same" junction collide despite float round-trip noise.
+fn quantize(v: f64) -> i64 {
+    // 1e4 units per mm → 0.1 µm resolution, far finer than any real pitch.
+    (v * 10_000.0).round() as i64
+}
+
+/// The net of the trace that terminates inside obstacle `o`, if any. Matches when a
+/// tagged trace vertex lies within the obstacle's axis-aligned rect (inclusive).
+fn pad_net(o: &mr_srj::Obstacle, tagged: &[(f64, f64, String)]) -> Option<String> {
+    let (hw, hh) = (o.width / 2.0, o.height / 2.0);
+    let (cx, cy) = (o.center.x, o.center.y);
+    tagged
+        .iter()
+        .find(|(x, y, _)| (*x - cx).abs() <= hw && (*y - cy).abs() <= hh)
+        .map(|(_, _, net)| net.clone())
+}
+
+/// Minimal union-find for grouping traces into electrical nets by shared vertices.
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self { parent: (0..n).collect() }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            // Attach the higher-index root to the lower so naming is first-seen stable.
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            self.parent[hi] = lo;
+        }
     }
 }
 
@@ -219,6 +325,49 @@ mod tests {
         let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         assert!(board.check().is_empty(), "a trace's own corners never conflict");
+    }
+
+    #[test]
+    fn junction_grouped_subnets_are_one_net() {
+        // Two traces meeting at a shared junction vertex (1.0, 0.0) are the same
+        // electrical net, so even though they run within clearance they must NOT
+        // produce a clearance violation (mirrors the DSN path's `#seg` collapse).
+        let srj = srj_no_obstacles();
+        let traces = vec![
+            PcbTrace::new(vec![wire(0.0, 0.0), wire(1.0, 0.0)]),
+            // Shares the (1.0, 0.0) vertex, then runs parallel 0.05 away.
+            PcbTrace::new(vec![wire(1.0, 0.0), wire(1.0, 0.05), wire(0.0, 0.05)]),
+        ];
+        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let board = solution_to_drc_board(&srj, &traces, rules, 1);
+        assert!(
+            board.check().is_empty(),
+            "sub-nets sharing a junction vertex must be treated as one net"
+        );
+    }
+
+    #[test]
+    fn pad_is_immune_to_the_net_that_terminates_in_it() {
+        // A pad obstacle whose net is the trace ending inside it must not conflict
+        // with that trace's copper (own-pad contact is legal).
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.6, "height": 0.6, "layers": ["top"]
+            }],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        // Trace starts inside the pad rect at (0,0) and runs out.
+        let traces = vec![PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)])];
+        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let board = solution_to_drc_board(&srj, &traces, rules, 1);
+        assert!(
+            board.check().is_empty(),
+            "a pad must be immune to the net that terminates inside it"
+        );
     }
 
     #[test]

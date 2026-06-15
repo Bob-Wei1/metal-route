@@ -66,11 +66,11 @@ fn route_to_stdout_emits_pcb_traces_and_summary() {
         stderr.contains("2/2"),
         "summary should report 2/2 nets, got: {stderr}"
     );
-    // Non-uniform / Hanan grid (Phase 3): the sample's bounds + pad endpoints +
-    // obstacle edges + fill channels yield 13 lines per axis. The fill coverage fix
-    // adds a midpoint lane in every gap ≥ channel (e.g. unit gaps gain their midpoint),
-    // so the line union is {0,0.5,1,2,3,4,5,6,7,8,9,9.5,10} = 13 (was 11).
-    assert!(stderr.contains("13x13"), "summary should report grid dims");
+    // Non-uniform / Hanan grid (Phase 3): bounds + pad endpoints + obstacle edges +
+    // fill channels. route_problem now applies the default copper clearance, so a fill
+    // channel must fit `track_w + 2·clearance` rather than a bare track — fewer midpoint
+    // lanes are inserted than the old no-clearance build, yielding 10 lines per axis.
+    assert!(stderr.contains("10x10"), "summary should report grid dims");
 }
 
 #[test]

@@ -35,6 +35,11 @@ pub const GO_NO_GO_THRESHOLD: f32 = 2.0;
 /// Default trace width (continuous units) for emitted `pcb_trace` wires.
 const DEFAULT_TRACE_WIDTH: f64 = 0.15;
 
+/// Default copper-to-copper clearance (mm) applied when a board declares no
+/// `minClearance`. The router and the DRC checker MUST agree on this default, else
+/// the router enforces a different spacing than the checker verifies.
+pub const DEFAULT_CLEARANCE_MM: f64 = 0.15;
+
 /// Signal-via geometry (bon's default): 0.45 mm annular pad over a 0.2 mm drill.
 /// Shared by the SES exporter and the DRC builder so both agree on via copper.
 pub const VIA_PAD_MM: f64 = 0.45;
@@ -297,19 +302,38 @@ pub fn route_problem(
     // Standard tscircuit naming (top/inner_N/bottom) applies for SimpleRouteJson.
     let layer_count = layers.unwrap_or(srj.layer_count).max(1);
     let layer_map = LayerMap::standard(layer_count);
-    // SimpleRouteJson route_problem does not apply pad clearance (that is the DSN
-    // pipeline's concern, which carries a min-clearance rule); pass 0.
-    let problem = rasterize_with_layers(srj, resolution, layer_map, 0);
+    // Clearance enforcement on the SimpleRouteJson path (mirrors the DSN pipeline).
+    // `min_clearance` is the copper-to-copper edge gap; `DEFAULT_TRACE_WIDTH` is the
+    // width every emitted trace carries (see `to_solution_layered` below).
+    //   * PADS are inflated at rasterise time by `clearance + track_w/2` (a foreign
+    //     trace's centreline must clear the pad EDGE by `clearance`) — pass
+    //     `clearance_cells` so `rasterize_with_layers` reserves that halo.
+    //   * TRACE-vs-TRACE spacing is the negotiated router's clearance halo (set below).
+    //     Its radius is a CENTRELINE-to-foreign-centreline distance, so it must be
+    //     `clearance + track_w` (own half-width + clearance + foreign half-width), not
+    //     the bare `clearance` — else two centred tracks `clearance` apart overlap
+    //     copper by `track_w`.
+    let min_clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM).max(0.0);
+    let clearance_cells = if min_clearance > 0.0 && resolution > 0.0 {
+        (min_clearance / resolution).ceil() as u32
+    } else {
+        0
+    };
+    let trace_halo_mm = if min_clearance > 0.0 { min_clearance + DEFAULT_TRACE_WIDTH } else { 0.0 };
+    let problem = rasterize_with_layers(srj, resolution, layer_map, clearance_cells);
     let total = problem.nets.len();
 
     // Only the negotiated backend places vias; give it a through-hole model over
     // the routed stackup. Lee/Ripup route per-layer with no layer changes.
-    // The via's annular ring (pad radius + board clearance, in mm) is reserved as a
-    // keepout so a committed via never sits clearance-illegally close to foreign
-    // copper. SimpleRouteJson route_problem applies no pad clearance, but a via still
-    // needs its own pad-radius ring; use the board min-clearance when declared.
+    // The via's annular-ring keepout (centreline-to-foreign-centreline, in mm) is the
+    // via pad radius + clearance + the foreign trace's half-width, so a committed via's
+    // copper keeps full `clearance` from a foreign track's copper.
     let mut via_model = ViaModel::through_hole(problem.mapping.dims.layers);
-    via_model.keepout_mm = VIA_PAD_MM / 2.0 + srj.min_clearance.unwrap_or(0.0).max(0.0);
+    via_model.keepout_mm = if min_clearance > 0.0 {
+        VIA_PAD_MM / 2.0 + min_clearance + DEFAULT_TRACE_WIDTH / 2.0
+    } else {
+        0.0
+    };
     // The board's continuous grid-line geometry, so the negotiated router prices
     // planar steps by their real length. On a uniform grid this is byte-identical to
     // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
@@ -321,6 +345,7 @@ pub fn route_problem(
         RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
         RouterKind::Negotiated => NegotiatedRouter::new()
             .with_via_model(via_model.clone())
+            .with_clearance_mm(trace_halo_mm)
             .with_coords(coords.clone())
             .route(&problem.grid, &problem.nets),
     }
@@ -336,7 +361,7 @@ pub fn route_problem(
     // Beautify the emitted geometry: pull staircases into diagonals and chamfer
     // square corners. DRC-validated against all other copper/pads, so it never
     // changes connectivity or introduces a clearance violation.
-    let traces = mr_srj::beautify_traces(traces, &srj.obstacles, srj.min_clearance.unwrap_or(0.0));
+    let traces = mr_srj::beautify_traces(traces, &srj.obstacles, min_clearance);
 
     // Diagnose every unrouted net: was it impossible at this resolution, or just
     // lost to congestion? Cheap — re-routes only the failed nets, one at a time.
@@ -1015,12 +1040,12 @@ mod tests {
         assert_eq!(summary.total, 2);
         assert_eq!(summary.routed, 2);
         // Non-uniform / Hanan grid (Phase 3): lines fall on the bounds, every pad
-        // endpoint, every obstacle edge ({4,6}), plus fill channels. `fill_lines` now
-        // adds a midpoint lane in every gap ≥ channel (the coverage fix), so a unit gap
-        // (e.g. 0↔1) gets its midpoint 0.5 and 3-wide gaps (e.g. 1↔4) get 2,3 — the
-        // union is {0,0.5,1,2,3,4,5,6,7,8,9,9.5,10} = 13 lines per axis.
-        assert_eq!(summary.grid_w, 13);
-        assert_eq!(summary.grid_h, 13);
+        // endpoint, every obstacle edge ({4,6}), plus fill channels. route_problem now
+        // applies the default copper clearance (a fill channel must fit `track_w +
+        // 2·clearance`, not just a bare track), so fewer midpoint lanes are inserted
+        // than the old no-clearance build — the grid is 10 lines per axis.
+        assert_eq!(summary.grid_w, 10);
+        assert_eq!(summary.grid_h, 10);
         assert!(summary.total_cost > 0);
 
         assert_eq!(traces.len(), 2);

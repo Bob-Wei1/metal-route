@@ -26,7 +26,7 @@ use mr_srj::{Obstacle, PcbTrace, RoutePoint, SimpleRouteJson};
 
 /// Copper-to-copper clearance (mm) assumed when a board omits `minClearance` —
 /// the same default the DSN ingest uses, so the corpus DRC mirrors `route-dsn`.
-const DEFAULT_CLEARANCE_MM: f64 = 0.15;
+use crate::DEFAULT_CLEARANCE_MM;
 
 /// Arguments for the `bench-corpus` subcommand.
 #[derive(Debug, clap::Parser)]
@@ -282,6 +282,20 @@ fn route_board(
             let rules = default_rules(clearance);
             let layers = args.layers.unwrap_or(srj.layer_count);
             let violations = solution_to_drc_board(srj, &traces, rules, layers).check();
+            if std::env::var("DRC_DEBUG").is_ok() {
+                let same = violations.iter().filter(|v| v.nets.0 == v.nets.1).count();
+                eprintln!(
+                    "DRC_DEBUG {board}: {} violations, {} same-net(self)",
+                    violations.len(),
+                    same
+                );
+                for v in violations.iter().take(12) {
+                    eprintln!(
+                        "  {:?} L{} @({:.3},{:.3}) nets=({},{}) measured={:.4} required={:.4}",
+                        v.class, v.layer, v.location.0, v.location.1, v.nets.0, v.nets.1, v.measured, v.required
+                    );
+                }
+            }
             let drc_by_class = drc_class_breakdown(&violations);
 
             (

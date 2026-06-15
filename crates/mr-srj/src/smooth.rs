@@ -148,7 +148,10 @@ fn beautify_one(
             beautify_run(ti, run, by_layer, clearance);
         }
     }
-    PcbTrace::new(flatten_items(items))
+    let mut out = PcbTrace::new(flatten_items(items));
+    // Beautify only reshapes geometry — carry the trace's net identity through.
+    out.net = trace.net;
+    out
 }
 
 /// Split a trace's route into single-layer wire runs separated by via anchors.
