@@ -434,15 +434,78 @@ impl Router for NegotiatedRouter {
         let mut buf = SearchBuf::new(n_cells);
         let mut pad_set = PadSet::new(n_cells);
 
-        // Connection group id per net (interned, deterministic by first appearance).
+        // Connection group id per net. Cells owned by one group are HARD obstacles
+        // for every OTHER group during legalization, while a group's own sub-nets may
+        // share copper — so nets that must overlap have to live in the SAME group.
+        //
+        // Two effects union nets into one group:
+        //  1. NAME: sub-nets of one multi-point connection share a `group_of` key
+        //     (`<conn>#<seg>` -> `<conn>`), interned by first appearance.
+        //  2. GEOMETRY: nets that share an endpoint CELL (src or dst) are the same
+        //     electrical net meeting at a junction — e.g. the MST edges of a multi-pad
+        //     net, delivered as separately-named 2-point connections that touch at a
+        //     shared branch pad. Without merging them they are forced cell-disjoint and
+        //     the second edge cannot even start from the branch cell the first one
+        //     committed, abandoning a net that routes fine alone. On the non-uniform
+        //     Hanan grid every distinct pad coordinate gets its own grid line, so a
+        //     shared src/dst CELL means the points are identical — this can never fuse
+        //     two genuinely-distinct nets into a short.
         let mut group_ids: Vec<usize> = vec![0; n_nets];
         {
-            let mut seen: HashMap<&str, usize> = HashMap::new();
+            // Start from the name-based interning, then union by shared endpoint cell.
+            let mut parent: Vec<usize> = (0..n_nets).collect();
+            fn find(parent: &mut [usize], x: usize) -> usize {
+                let mut r = x;
+                while parent[r] != r {
+                    r = parent[r];
+                }
+                let mut c = x; // path-halving keeps repeated finds near-flat
+                while parent[c] != r {
+                    let next = parent[c];
+                    parent[c] = r;
+                    c = next;
+                }
+                r
+            }
+            let union = |parent: &mut [usize], a: usize, b: usize| {
+                let (ra, rb) = (find(parent, a), find(parent, b));
+                if ra != rb {
+                    // Union toward the lower index for deterministic roots.
+                    if ra < rb {
+                        parent[rb] = ra;
+                    } else {
+                        parent[ra] = rb;
+                    }
+                }
+            };
+            // (1) name groups.
+            let mut by_name: HashMap<&str, usize> = HashMap::new();
             for (i, net) in nets.iter().enumerate() {
-                let g = group_of(&net.net);
-                let next = seen.len();
-                let id = *seen.entry(g).or_insert(next);
-                group_ids[i] = id;
+                match by_name.get(group_of(&net.net)) {
+                    Some(&j) => union(&mut parent, i, j),
+                    None => {
+                        by_name.insert(group_of(&net.net), i);
+                    }
+                }
+            }
+            // (2) shared-endpoint-cell junctions.
+            let mut by_cell: HashMap<CellIdx, usize> = HashMap::new();
+            for (i, net) in nets.iter().enumerate() {
+                for &c in &[net.src, net.dst] {
+                    match by_cell.get(&c) {
+                        Some(&j) => union(&mut parent, i, j),
+                        None => {
+                            by_cell.insert(c, i);
+                        }
+                    }
+                }
+            }
+            // Dense group ids by first appearance of each union root (deterministic).
+            let mut root_to_g: HashMap<usize, usize> = HashMap::new();
+            for i in 0..n_nets {
+                let r = find(&mut parent, i);
+                let next = root_to_g.len();
+                group_ids[i] = *root_to_g.entry(r).or_insert(next);
             }
         }
 
@@ -2223,9 +2286,13 @@ mod tests {
         b.mark_cell(1, 0);
         b.mark_cell(1, 2);
         let grid = b.build();
+        // DISTINCT endpoints (so they are not junction-merged into one net), but both
+        // can only cross left<->right through the lone corridor cell (1,1): net a runs
+        // the centre row, net b drops in from the bottom corners — both must take
+        // (1,1), so exactly one routes.
         let nets = vec![
             net("a", dims.idx(0, 1), dims.idx(2, 1)),
-            net("b", dims.idx(0, 1), dims.idx(2, 1)),
+            net("b", dims.idx(0, 2), dims.idx(2, 2)),
         ];
         let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(
@@ -2374,10 +2441,10 @@ mod tests {
     }
 
     /// Rip-up must terminate and never panic even when no disjoint solution exists.
-    /// Re-uses the over-constrained single corridor (two same-endpoint nets in
-    /// distinct groups): rip-up may ping-pong the corridor but is bounded by its
-    /// global/per-net budgets, so it stops and returns the best partial (one net),
-    /// never regressing below the multi-order result.
+    /// Re-uses the over-constrained single corridor (two DISTINCT-endpoint nets that
+    /// both must cross through the lone corridor cell): rip-up may ping-pong the
+    /// corridor but is bounded by its global/per-net budgets, so it stops and returns
+    /// the best partial (one net), never regressing below the multi-order result.
     #[test]
     fn ripup_terminates_when_unsolvable() {
         let dims = Dims::new(3, 3);
@@ -2387,7 +2454,7 @@ mod tests {
         let grid = b.build();
         let nets = vec![
             net("a", dims.idx(0, 1), dims.idx(2, 1)),
-            net("b", dims.idx(0, 1), dims.idx(2, 1)),
+            net("b", dims.idx(0, 2), dims.idx(2, 2)),
         ];
         let br = NegotiatedRouter::new().route(&grid, &nets).unwrap();
         assert_eq!(br.results.len() + br.unrouted.len(), 2);
