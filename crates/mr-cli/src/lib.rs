@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub mod bench;
 pub mod corpus;
 pub mod drc;
+mod drc_board;
 use std::collections::HashMap;
 
 use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
