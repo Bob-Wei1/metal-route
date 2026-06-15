@@ -278,6 +278,10 @@ pub fn route_problem(
         DEFAULT_TRACE_WIDTH,
         &problem.layers,
     );
+    // Beautify the emitted geometry: pull staircases into diagonals and chamfer
+    // square corners. DRC-validated against all other copper/pads, so it never
+    // changes connectivity or introduces a clearance violation.
+    let traces = mr_srj::beautify_traces(traces, &srj.obstacles, srj.min_clearance.unwrap_or(0.0));
 
     let summary = Summary {
         routed: board.results.len(),
@@ -766,6 +770,11 @@ pub fn route_dsn_problem(
         trace_width,
         &problem.layers,
     );
+    // Beautify the emitted JSON soup: 45° chamfers + diagonalized staircases,
+    // DRC-validated against all other copper/pads so it never changes connectivity
+    // or introduces a violation. (The .ses below is still built from cell-space
+    // `board`, so KiCad reimport stays on the routed grid.)
+    let traces = mr_srj::beautify_traces(traces, &srj.obstacles, stats.min_clearance_mm);
     let vias = count_vias(&traces);
 
     let ses = board_to_ses(
