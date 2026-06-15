@@ -858,11 +858,15 @@ pub fn route_dsn_problem(
     } else {
         0
     };
+    // The width every emitted trace carries — the router's clearance halo is a
+    // CENTRELINE-to-foreign-centreline distance, so it must budget both half-widths.
+    let trace_w = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
     let mut via_model = ViaModel::through_hole(layer_map.len());
     // Via annular-ring keepout in CONTINUOUS mm (the unit the router's halo code
-    // expects): the via pad radius plus the board min-clearance. No `/resolution`
-    // cell conversion — that was a unit bug on the non-uniform Hanan grid.
-    via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm;
+    // expects): the via pad radius + clearance + the foreign trace's half-width, so a
+    // committed via's copper keeps full `clearance` from a foreign track's copper. No
+    // `/resolution` cell conversion — that was a unit bug on the non-uniform Hanan grid.
+    via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
     let problem = rasterize_with_layers(&srj, resolution, layer_map, clearance_cells);
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
@@ -876,10 +880,11 @@ pub fn route_dsn_problem(
     let start = std::time::Instant::now();
     let board = NegotiatedRouter::new()
         .with_via_model(via_model)
-        // Geometric clearance over the (possibly non-uniform) line arrays — the same
-        // mm budget the rasteriser inflated foreign pads by — so inter-net spacing is
-        // a real distance, not a cell count that varies with local pitch.
-        .with_clearance_mm(stats.min_clearance_mm)
+        // Geometric trace-vs-trace clearance over the (possibly non-uniform) line
+        // arrays. The halo radius is centreline-to-foreign-centreline, so it is
+        // `clearance + track_w` (own half-width + clearance + foreign half-width) — the
+        // bare clearance under-blocks and lets two centred tracks overlap by `track_w`.
+        .with_clearance_mm(stats.min_clearance_mm + trace_w)
         .with_coords(coords)
         .route(&problem.grid, &problem.nets)
         .context("router failed")?;
