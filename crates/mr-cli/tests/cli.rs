@@ -67,10 +67,12 @@ fn route_to_stdout_emits_pcb_traces_and_summary() {
         "summary should report 2/2 nets, got: {stderr}"
     );
     // Non-uniform / Hanan grid (Phase 3): bounds + pad endpoints + obstacle edges +
-    // fill channels. route_problem now applies the default copper clearance, so a fill
-    // channel must fit `track_w + 2·clearance` rather than a bare track — fewer midpoint
-    // lanes are inserted than the old no-clearance build, yielding 10 lines per axis.
-    assert!(stderr.contains("10x10"), "summary should report grid dims");
+    // fill channels. The regular fill needs `track_w + 2·clearance` against the coarse
+    // ceil-rounded clearance (channel 3.0), so the 2.0-wide obstacle gap [4,6] gets no
+    // regular lane; the BGA/LGA escape pass (lever C2) sizes a lane against the TRUE
+    // default clearance 0.15 (escape channel 1.3 ≤ 2.0) and inserts one midpoint escape
+    // lane at 5.0 per axis → 11 lines per axis (was 10 before the escape pass).
+    assert!(stderr.contains("11x11"), "summary should report grid dims");
 }
 
 #[test]

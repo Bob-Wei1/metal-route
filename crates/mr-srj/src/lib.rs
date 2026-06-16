@@ -292,7 +292,15 @@ const CELL_BUDGET: usize = 160_000;
 /// have lanes between them — the classic "track between pins" line. Finally the set
 /// is sorted and deduped (lines within [`LINE_EPSILON`] collapse).
 ///
-/// `track_w` / `clearance` are the design-rule track width and copper clearance;
+/// `track_w` / `clearance` are the design-rule track width and the clearance the
+/// rasteriser actually inflates by (`clearance_cells · resolution`, a `ceil`-rounded
+/// value that can be coarser than the true rule). `escape_clearance` is the TRUE
+/// copper-to-copper rule the DRC checks (`srj.min_clearance`); it is used only to
+/// size **sub-pitch BGA/LGA escape lanes** — narrow inter-pad gaps that the regular
+/// fill (sized against the coarse `clearance`) skips but where a lane sized against
+/// the true clearance still keeps copper legal. Those lanes are reachable only via a
+/// net's own-pad escape halo (the base grid blocks them for foreign nets at the
+/// coarse inflation), giving inner pins of a dense regular pad array an escape path.
 /// `_layers` is accepted for symmetry with the rasteriser (the planar line set is
 /// layer-independent) but unused. The fill spacing and resulting cell count are
 /// capped against [`CELL_BUDGET`]; an over-budget result is logged but still
@@ -302,6 +310,7 @@ fn build_grid_lines(
     _layers: u32,
     track_w: f64,
     clearance: f64,
+    escape_clearance: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let mut xs: Vec<f64> = Vec::new();
     let mut ys: Vec<f64> = Vec::new();
@@ -350,12 +359,124 @@ fn build_grid_lines(
     // amount of fill thinning can help and we must not silently proceed as if fine.
     enforce_budget(&xs, &ys, &mut x_fill, &mut y_fill);
 
+    // BGA/LGA escape lanes (lever C2). Dense regular pad arrays leave inter-pad gaps
+    // that are too tight for a regular fill lane sized against the (coarse, ceil-
+    // rounded) `clearance`, so inner pins have no node to route into and become
+    // unroutable-alone. When the TRUE rule (`escape_clearance`) is finer than that
+    // coarse `clearance`, a centred lane sized against the true rule still fits and
+    // keeps copper legal; it is reachable only through a net's own-pad escape halo
+    // (the base grid blocks it for foreign nets at the coarse inflation), which is
+    // exactly the per-pin escape path we want. Only meaningful when the true rule is
+    // strictly finer than the coarse one — otherwise `fill_lines` already covers the
+    // gap. Gated behind clearance-active so the clearance-off byte-identical fast path
+    // (and the rounding that produces it) is untouched.
+    if escape_clearance.is_finite()
+        && escape_clearance > 0.0
+        && escape_clearance + LINE_EPSILON < clearance
+    {
+        let x_escape = escape_lines(&xs, track_w, clearance, escape_clearance);
+        let y_escape = escape_lines(&ys, track_w, clearance, escape_clearance);
+        // Add the escape lanes only insofar as they fit the remaining budget headroom
+        // (feature + retained fill already honour it). Escape lanes are local and few
+        // relative to the array, so on the target boards all fit; on a pathologically
+        // dense array we add as many as the headroom allows (deterministic order),
+        // never blowing the ceiling the budget enforcer just established.
+        add_escape_within_budget(&xs, &ys, &mut x_fill, &mut y_fill, x_escape, y_escape);
+    }
+
     xs.append(&mut x_fill);
     ys.append(&mut y_fill);
     sort_dedup(&mut xs);
     sort_dedup(&mut ys);
 
     (xs, ys)
+}
+
+/// Sub-pitch escape lanes for dense pad arrays (lever C2). For each adjacent feature
+/// pair whose gap is too tight for a regular fill lane (`gap < track_w + 2·clearance`,
+/// the coarse rasteriser inflation) but wide enough for a lane sized against the TRUE
+/// clearance rule (`gap >= track_w + 2·escape_clearance`), emit the single midpoint
+/// lane — the maximal-clearance position. This is the escape node an inner pin of a
+/// regular grid array needs; it is reachable only through the net's own-pad escape
+/// halo (foreign nets see the coarse inflation block it), so it cannot host a foreign
+/// short. Returns the sorted, deduped lane positions (not merged into `features`).
+fn escape_lines(features: &[f64], track_w: f64, clearance: f64, escape_clearance: f64) -> Vec<f64> {
+    if features.len() < 2 || !(track_w.is_finite() && track_w > 0.0) {
+        return Vec::new();
+    }
+    let coarse_channel = track_w + 2.0 * clearance; // regular fill already covers >= this
+    let escape_channel = track_w + 2.0 * escape_clearance; // true-clearance lane fits
+    if !(escape_channel < coarse_channel) {
+        return Vec::new();
+    }
+    let mut out: Vec<f64> = Vec::new();
+    for win in features.windows(2) {
+        let (lo, hi) = (win[0], win[1]);
+        let gap = hi - lo;
+        // Skip gaps the regular fill already lanes (>= coarse_channel) and gaps too
+        // tight even for a true-clearance lane (< escape_channel). The remaining band
+        // is the sub-pitch escape window — exactly the inter-pad gaps of a dense array.
+        if gap + LINE_EPSILON >= coarse_channel || gap + LINE_EPSILON < escape_channel {
+            continue;
+        }
+        out.push(lo + gap * 0.5); // exact midpoint = maximal clearance to both edges
+    }
+    sort_dedup(&mut out);
+    out
+}
+
+/// Append escape lanes to the per-axis fill sets, but only as many as fit under
+/// [`CELL_BUDGET`] given the already-budgeted feature+fill grid. Lanes are added in
+/// sorted order, alternating axes for balance, so the result is deterministic and the
+/// ceiling the budget enforcer established is never exceeded. On the target small
+/// arrays every escape lane fits; the cap only bites on pathologically dense fields.
+fn add_escape_within_budget(
+    x_features: &[f64],
+    y_features: &[f64],
+    x_fill: &mut Vec<f64>,
+    y_fill: &mut Vec<f64>,
+    mut x_escape: Vec<f64>,
+    mut y_escape: Vec<f64>,
+) {
+    // Drop escape lanes coincident with an existing feature/fill line (they add no
+    // distinct node) so they neither double-count nor waste headroom.
+    coalesce_fill(x_features, &mut x_escape);
+    coalesce_fill(y_features, &mut y_escape);
+    coalesce_fill(x_fill, &mut x_escape);
+    coalesce_fill(y_fill, &mut y_escape);
+
+    let cells = |xf: usize, yf: usize| -> usize {
+        (x_features.len() + xf).saturating_mul(y_features.len() + yf)
+    };
+    let (mut xi, mut yi) = (0usize, 0usize);
+    // Greedily add the next lane from whichever axis still has lanes, preferring the
+    // axis with fewer already-added escape lanes (balance), as long as it keeps us at
+    // or under budget.
+    loop {
+        let try_x = xi < x_escape.len();
+        let try_y = yi < y_escape.len();
+        if !try_x && !try_y {
+            break;
+        }
+        // Pick axis: the one with more remaining lanes, tie → x. This keeps both axes
+        // growing together on a square array.
+        let take_x = if try_x && try_y {
+            (x_escape.len() - xi) >= (y_escape.len() - yi)
+        } else {
+            try_x
+        };
+        if take_x {
+            if cells(x_fill.len() + 1, y_fill.len()) <= CELL_BUDGET {
+                x_fill.push(x_escape[xi]);
+            }
+            xi += 1;
+        } else {
+            if cells(x_fill.len(), y_fill.len() + 1) <= CELL_BUDGET {
+                y_fill.push(y_escape[yi]);
+            }
+            yi += 1;
+        }
+    }
 }
 
 /// Thin the per-axis fill-line sets in place so the final grid honours
@@ -741,7 +862,17 @@ pub fn rasterize_with_layers(
     } else {
         0.0
     };
-    let (x_lines, y_lines) = build_grid_lines(srj, layer_count, track_w, clearance);
+    // The TRUE copper-to-copper rule the DRC enforces (the caller's `min_clearance_mm`,
+    // else the problem's declaration). Used to size sub-pitch BGA/LGA escape lanes in
+    // gaps the coarse `clearance` (a ceil-rounded inflation) would skip — see
+    // `build_grid_lines`. Zero (clearance-off) leaves the escape pass inert.
+    let escape_clearance = if min_clearance_mm > 0.0 {
+        min_clearance_mm
+    } else {
+        srj.min_clearance.filter(|c| *c > 0.0).unwrap_or(0.0)
+    };
+    let (x_lines, y_lines) =
+        build_grid_lines(srj, layer_count, track_w, clearance, escape_clearance);
     let mapping = Mapping::from_lines(x_lines, y_lines, layer_count);
     let mut builder = GridBuilder::new(mapping.dims, 1);
 
@@ -2583,7 +2714,7 @@ mod tests {
             connections: vec![],
             bounds: Bounds { min_x: -1.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
         };
-        let (xs, _ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        let (xs, _ys) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         // At least one fill line falls strictly inside the free corridor [0.3, 0.7]
         // (≥ clearance from both pad edges), so a track of another net can run there.
         let lane = xs.iter().find(|&&x| x > 0.3 + LINE_EPSILON && x < 0.7 - LINE_EPSILON);
@@ -2617,7 +2748,7 @@ mod tests {
             ],
             ..srj.clone()
         };
-        let (xs2, _) = build_grid_lines(&srj2, 1, track_w, clearance);
+        let (xs2, _) = build_grid_lines(&srj2, 1, track_w, clearance, clearance);
         // Inner edges at -0.16 and 0.16 (gap 0.32 > channel) → a lane in the free
         // corridor [-0.06, 0.06] (≥ clearance from both edges).
         assert!(
@@ -2627,6 +2758,100 @@ mod tests {
         assert!(
             channel > 0.0,
             "sanity: channel is the gap that just admits a clearance-legal lane"
+        );
+    }
+
+    /// LEVER C2 (BGA/LGA escape fanout): when the rasteriser's `clearance` is the
+    /// coarse ceil-rounded inflation (coarser than the TRUE `escape_clearance` rule),
+    /// inter-pad gaps too tight for a regular fill lane but wide enough for a true-
+    /// clearance lane get one midpoint ESCAPE lane — the node an inner array pin needs.
+    #[test]
+    fn escape_lanes_added_for_sub_pitch_pad_gaps() {
+        // 2.54mm-pitch, 1.6mm pads (the bugreport23-LGA15x4 geometry). track 0.15,
+        // coarse clearance 0.618 (clearance_cells·resolution), true clearance 0.15.
+        let track_w = 0.15;
+        let coarse = 0.618; // coarse_channel = 0.15 + 2·0.618 = 1.386 (> 0.94 gap)
+        let escape = 0.15; // escape_channel = 0.15 + 2·0.15 = 0.45 (≤ 0.94 gap)
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(escape),
+            obstacles: vec![
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    width: 1.6,
+                    height: 1.6,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 2.54, y: 0.0, layer: None },
+                    width: 1.6,
+                    height: 1.6,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+            ],
+            connections: vec![],
+            bounds: Bounds { min_x: -2.0, max_x: 4.54, min_y: -2.0, max_y: 2.0 },
+        };
+        // Coarse build (escape == coarse): no lane in the 0.94-wide inter-pad gap
+        // [0.8, 1.74] — the regular fill skips it (gap 0.94 < coarse_channel 1.386).
+        let (xs_coarse, _) = build_grid_lines(&srj, 1, track_w, coarse, coarse);
+        assert!(
+            !xs_coarse.iter().any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
+            "coarse build must leave the sub-pitch gap empty, got {xs_coarse:?}"
+        );
+        // Escape build (true escape 0.15 < coarse 0.618): one midpoint escape lane at
+        // the gap centre 1.27 (maximal clearance to both pad edges).
+        let (xs, _) = build_grid_lines(&srj, 1, track_w, coarse, escape);
+        assert!(
+            xs.iter().any(|&x| (x - 1.27).abs() <= LINE_EPSILON),
+            "escape pass must insert a midpoint lane at 1.27 in the sub-pitch gap, got {xs:?}"
+        );
+    }
+
+    /// The escape pass is inert when the true rule is NOT finer than the coarse
+    /// inflation (so it never duplicates the regular fill or perturbs clearance-off /
+    /// already-fine-grained boards). Same geometry, escape == coarse → no extra lane.
+    #[test]
+    fn escape_lanes_inert_when_true_clearance_not_finer() {
+        let track_w = 0.15;
+        let cl = 0.618;
+        let srj = SimpleRouteJson {
+            layer_count: 1,
+            min_trace_width: Some(track_w),
+            min_clearance: Some(cl),
+            obstacles: vec![
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    width: 1.6,
+                    height: 1.6,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+                Obstacle {
+                    kind: "rect".into(),
+                    center: Point { x: 2.54, y: 0.0, layer: None },
+                    width: 1.6,
+                    height: 1.6,
+                    layers: vec![],
+                    connected_to: vec![],
+                },
+            ],
+            connections: vec![],
+            bounds: Bounds { min_x: -2.0, max_x: 4.54, min_y: -2.0, max_y: 2.0 },
+        };
+        // escape == clearance: escape_channel == coarse_channel, so `escape_lines`
+        // bails (the gate `escape_clearance + eps < clearance` is false) — no lane in
+        // the tight gap.
+        let (xs, _) = build_grid_lines(&srj, 1, track_w, cl, cl);
+        assert!(
+            !xs.iter().any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
+            "no escape lane when the true rule is not finer than the coarse one, got {xs:?}"
         );
     }
 
@@ -2664,7 +2889,7 @@ mod tests {
             connections: vec![],
             bounds: Bounds { min_x: -2.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
         };
-        let (xs, _) = build_grid_lines(&srj, 1, track_w, clearance);
+        let (xs, _) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         // No fill line inside the unroutable 0.02-wide gap [0.2, 0.22].
         assert!(
             !xs.iter().any(|&x| x > 0.2 + LINE_EPSILON && x < 0.22 - LINE_EPSILON),
@@ -2737,7 +2962,7 @@ mod tests {
             xf.len()
         );
 
-        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         let cells = xs.len().saturating_mul(ys.len());
         assert!(
             cells <= CELL_BUDGET,
@@ -2794,7 +3019,7 @@ mod tests {
                 max_y: n as f64,
             },
         };
-        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance);
+        let (xs, ys) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         // Feature lines alone exceed the budget; we still get them all (every pad edge
         // present so pads stay on-node), and fill is fully dropped.
         assert!(xs.len().saturating_mul(ys.len()) > CELL_BUDGET);
