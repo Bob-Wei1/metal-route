@@ -320,7 +320,16 @@ pub fn route_problem(
         0
     };
     let trace_halo_mm = if min_clearance > 0.0 { min_clearance + DEFAULT_TRACE_WIDTH } else { 0.0 };
-    let problem = rasterize_with_layers(srj, resolution, layer_map, clearance_cells, min_clearance);
+    // D2: thread the real signal-via pad diameter so the rasteriser can reserve a
+    // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
+    let problem = rasterize_with_layers(
+        srj,
+        resolution,
+        layer_map,
+        clearance_cells,
+        min_clearance,
+        VIA_PAD_MM,
+    );
     let total = problem.nets.len();
 
     // Only the negotiated backend places vias; give it a through-hole model over
@@ -916,7 +925,15 @@ pub fn route_dsn_problem(
     // committed via's copper keeps full `clearance` from a foreign track's copper. No
     // `/resolution` cell conversion — that was a unit bug on the non-uniform Hanan grid.
     via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
-    let problem = rasterize_with_layers(&srj, resolution, layer_map, clearance_cells, stats.min_clearance_mm);
+    // D2: thread the real signal-via pad diameter for the via-class foreign-pad halo.
+    let problem = rasterize_with_layers(
+        &srj,
+        resolution,
+        layer_map,
+        clearance_cells,
+        stats.min_clearance_mm,
+        VIA_PAD_MM,
+    );
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
     let grid_h = problem.mapping.dims.h;
@@ -1098,13 +1115,18 @@ mod tests {
         // Two 2-point connections -> two nets, both routable on this open board.
         assert_eq!(summary.total, 2);
         assert_eq!(summary.routed, 2);
-        // Non-uniform / Hanan grid (Phase 3): lines fall on the bounds, every pad
-        // endpoint, every obstacle edge ({4,6}), plus fill channels. route_problem now
-        // applies the default copper clearance (a fill channel must fit `track_w +
-        // 2·clearance`, not just a bare track), so fewer midpoint lanes are inserted
-        // than the old no-clearance build — the grid is 10 lines per axis.
-        assert_eq!(summary.grid_w, 10);
-        assert_eq!(summary.grid_h, 10);
+        // Non-uniform / Hanan grid (Phase 3): lines fall on the bounds {0,10}, every
+        // pad endpoint {1,9}, every obstacle edge {4,6}, plus fill channels. The
+        // regular fill needs `track_w + 2·clearance`; here `clearance` is the coarse
+        // ceil-rounded inflation (clearance_cells·resolution = 1·1.0 = 1.0 with
+        // track_w = 1.0 → coarse channel 3.0), so the 2.0-wide obstacle gap [4,6] gets
+        // NO regular lane. The BGA/LGA escape pass (lever C2) sizes a lane against the
+        // TRUE rule (default clearance 0.15 → escape channel 1.3 ≤ 2.0), so it inserts
+        // one midpoint escape lane at 5.0 on each axis: 10 → 11 lines per axis. (Before
+        // the escape pass this was 10.) The escape lane is reachable only via a net's
+        // own-pad escape halo, so it adds routing room without admitting foreign shorts.
+        assert_eq!(summary.grid_w, 11);
+        assert_eq!(summary.grid_h, 11);
         assert!(summary.total_cost > 0);
 
         assert_eq!(traces.len(), 2);

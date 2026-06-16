@@ -226,6 +226,13 @@ pub fn legalize_clearance(
                     }
                 }
             }
+            // After interior-vertex relaxation, try nudging each VIA landing (and its
+            // two coincident run anchors) as a rigid unit. This is the only place a
+            // run's first/last anchor is allowed to move, and ONLY when that anchor is
+            // a via landing (never a real endpoint), so connectivity is preserved.
+            if legalize_vias(ti, items, &by_layer, clearance) {
+                moved = true;
+            }
         }
         if !moved {
             break; // quiescent: no vertex could improve, further sweeps are futile
@@ -269,21 +276,50 @@ fn count_foreign_violations(
     let mut n = 0usize;
     for (ti, items) in items_per_trace.iter().enumerate() {
         for item in items {
-            if let Item::Run(run) = item {
-                let req = clearance + run.width / 2.0;
-                let feats = context.foreign_for_layer(ti, &run.layer);
-                for w in run.pts.windows(2) {
-                    let (s0, s1) = (w[0], w[1]);
-                    let cb = seg_bbox(s0, s1, req);
+            match item {
+                Item::Run(run) => {
+                    let req = clearance + run.width / 2.0;
+                    let feats = context.foreign_for_layer(ti, &run.layer);
+                    for w in run.pts.windows(2) {
+                        let (s0, s1) = (w[0], w[1]);
+                        let cb = seg_bbox(s0, s1, req);
+                        for f in &feats {
+                            if !bbox_overlap(cb, f.bbox()) {
+                                continue;
+                            }
+                            if f.gap(s0, s1) + GAP_EPS < req {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                Item::Via(RoutePoint::Via { x, y, from_layer, to_layer }) => {
+                    // Count the barrel against foreign features on BOTH the layers it
+                    // spans. The legaliser may move a via, so this term must be in the
+                    // gate or a barrel could be pushed into a foreign feature unseen.
+                    // Tally each unique foreign feature once (a feature reachable from
+                    // both layers — e.g. an all-layer pad — is deduplicated by pointer).
+                    let v = (*x, *y);
+                    let cb = seg_bbox(v, v, VIA_RADIUS + clearance);
+                    let mut feats = context.foreign_for_layer(ti, from_layer);
+                    if to_layer != from_layer {
+                        feats.extend(context.foreign_for_layer(ti, to_layer));
+                    }
+                    feats.sort_by_key(|f| *f as *const Feature as usize);
+                    feats.dedup_by_key(|f| *f as *const Feature as usize);
                     for f in &feats {
                         if !bbox_overlap(cb, f.bbox()) {
                             continue;
                         }
-                        if f.gap(s0, s1) + GAP_EPS < req {
+                        // Barrel surface gap vs the via clearance (clearance only — the
+                        // barrel radius is the via's own copper, mirrored on the feature
+                        // side by the feature's own half-width already folded into gap()).
+                        if f.gap(v, v) - VIA_RADIUS + GAP_EPS < clearance {
                             n += 1;
                         }
                     }
                 }
+                Item::Via(_) => {}
             }
         }
     }
@@ -422,6 +458,245 @@ fn legalize_run(ti: usize, run: &mut Run, by_layer: &LayerFeatures, clearance: f
         }
     }
     moved
+}
+
+/// Nudge VIA landings to recover foreign clearance on the via-adjacent copper.
+///
+/// A via in the parsed item stream is an `Item::Via` flanked by the run that lands on
+/// it (its LAST point coincides with the via barrel) and the run that departs from it
+/// (its FIRST point coincides). The legaliser otherwise treats those flanking anchors
+/// as immovable, so a graze on the very first/last segment of a via-adjacent run — or
+/// against the via barrel itself — is structurally unreachable.
+///
+/// Here we move the via barrel and BOTH coincident run anchors TOGETHER (a rigid
+/// translation of one planar point shared by three geometry items), so the via and the
+/// two runs stay connected exactly as before — the move is connectivity-preserving by
+/// construction (the three coincident coordinates remain coincident). We try the same
+/// small candidate offsets and commit a move only when it *strictly increases* the
+/// worst foreign-clearance gap over EVERY segment/feature the move touches (the two
+/// incident segments on their own layers, plus the via barrel) without pushing any of
+/// them below where it started — the identical monotone, exact-oracle acceptance rule
+/// the interior-vertex relaxation uses. Endpoints (runs not flanking a via) are never
+/// touched, and no via is added or removed; only existing barrels are repositioned.
+///
+/// Returns true iff any via moved.
+fn legalize_vias(ti: usize, items: &mut [Item], by_layer: &LayerFeatures, clearance: f64) -> bool {
+    let mut moved = false;
+    // Indices of `Item::Via` that have a Run immediately before AND after them; only
+    // such vias have two incident wire segments whose landing we can co-move safely.
+    let via_idxs: Vec<usize> = (1..items.len().saturating_sub(1))
+        .filter(|&k| {
+            matches!(items[k], Item::Via(_))
+                && matches!(items[k - 1], Item::Run(_))
+                && matches!(items[k + 1], Item::Run(_))
+        })
+        .collect();
+
+    for k in via_idxs {
+        // The via barrel position and the two coincident anchor points.
+        let v = match &items[k] {
+            Item::Via(RoutePoint::Via { x, y, .. }) => (*x, *y),
+            _ => continue,
+        };
+        // Penultimate point of the landing run (the neighbour of the via anchor on the
+        // incoming side) and second point of the departing run (neighbour on the
+        // outgoing side), plus each run's layer/req. A run with a single point has no
+        // incident segment on that side, so skip such degenerate vias entirely.
+        let (in_neighbor, in_layer, in_req) = match &items[k - 1] {
+            Item::Run(r) if r.pts.len() >= 2 => {
+                (r.pts[r.pts.len() - 2], r.layer.clone(), clearance + r.width / 2.0)
+            }
+            _ => continue,
+        };
+        let (out_neighbor, out_layer, out_req) = match &items[k + 1] {
+            Item::Run(r) if r.pts.len() >= 2 => {
+                (r.pts[1], r.layer.clone(), clearance + r.width / 2.0)
+            }
+            _ => continue,
+        };
+        let in_feats = by_layer.foreign_for_layer(ti, &in_layer);
+        let out_feats = by_layer.foreign_for_layer(ti, &out_layer);
+
+        // Worst foreign gap over everything the move touches, as it stands. We measure
+        // each incident segment against its own layer's foreign features and the via
+        // barrel (radius VIA_RADIUS) against the union — exactly the geometry that moves.
+        let cur = via_min_gap(
+            v, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+        );
+        if cur >= in_req.min(out_req) {
+            continue; // already clear on both incident segments and the barrel — leave it
+        }
+
+        // The geometry the move changes, with the original (pre-move) shape so the
+        // per-feature non-worsening gate can compare against where each element started.
+        // `via_accepted` requires that EVERY affected element stays at/above its required
+        // clearance OR no closer than it originally was (against every foreign feature) —
+        // the same exact-oracle, per-feature rule `accepted()` enforces for chamfers.
+        // This is strictly stronger than "the worst gap improved": a candidate that lifts
+        // the minimum while pushing some OTHER feature below `min(req, original)` is
+        // rejected, which is exactly the case the looser min-only rule let slip through.
+        let mut best: Option<(f64, P)> = None;
+        for &step in &NUDGE_STEPS {
+            for (dx, dy) in DIRS {
+                let cand = (v.0 + dx * step, v.1 + dy * step);
+                if !via_accepted(
+                    v, cand, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+                ) {
+                    continue; // would worsen some feature below min(req, original) — unsafe
+                }
+                let g = via_min_gap(
+                    cand, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+                );
+                if g > cur + GAP_EPS {
+                    match best {
+                        Some((bg, _)) if g <= bg => {}
+                        _ => best = Some((g, cand)),
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        if let Some((_, cand)) = best {
+            // Co-move the three coincident coordinates so connectivity is preserved.
+            if let Item::Via(RoutePoint::Via { x, y, .. }) = &mut items[k] {
+                *x = cand.0;
+                *y = cand.1;
+            }
+            if let Item::Run(r) = &mut items[k - 1] {
+                let last = r.pts.len() - 1;
+                r.pts[last] = cand;
+            }
+            if let Item::Run(r) = &mut items[k + 1] {
+                r.pts[0] = cand;
+            }
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Worst foreign-clearance gap over the geometry a via move at `v` touches: the
+/// incoming incident segment `[in_neighbor, v]` on its layer, the outgoing incident
+/// segment `[v, out_neighbor]` on its layer, and the via barrel (a circle of radius
+/// [`VIA_RADIUS`] at `v`) against every foreign feature on either layer. The returned
+/// value is the raw centre-line/surface gap; the caller compares improvements
+/// monotonically (no absolute threshold beyond the strict-increase rule), so this is a
+/// sound non-worsening guard over exactly the moved geometry.
+#[allow(clippy::too_many_arguments)]
+fn via_min_gap(
+    v: P,
+    in_neighbor: P,
+    in_feats: &[&Feature],
+    in_req: f64,
+    out_neighbor: P,
+    out_feats: &[&Feature],
+    out_req: f64,
+) -> f64 {
+    let mut worst = f64::INFINITY;
+    // Incoming incident segment, measured against the incoming layer's foreign features.
+    {
+        let (s0, s1) = (in_neighbor, v);
+        let cb = seg_bbox(s0, s1, in_req);
+        for f in in_feats {
+            if bbox_overlap(cb, f.bbox()) {
+                worst = worst.min(f.gap(s0, s1));
+            }
+        }
+    }
+    // Outgoing incident segment, measured against the outgoing layer's foreign features.
+    {
+        let (s0, s1) = (v, out_neighbor);
+        let cb = seg_bbox(s0, s1, out_req);
+        for f in out_feats {
+            if bbox_overlap(cb, f.bbox()) {
+                worst = worst.min(f.gap(s0, s1));
+            }
+        }
+    }
+    // Via barrel: a degenerate segment at `v` (a point) padded by the barrel radius.
+    // The barrel spans the stackup, so test it against foreign features on BOTH layers.
+    let barrel_pad = VIA_RADIUS + in_req.max(out_req);
+    let cb = seg_bbox(v, v, barrel_pad);
+    for f in in_feats.iter().chain(out_feats.iter()) {
+        if bbox_overlap(cb, f.bbox()) {
+            // Gap from the barrel SURFACE: centre-line/point gap minus the via radius.
+            worst = worst.min(f.gap(v, v) - VIA_RADIUS);
+        }
+    }
+    worst
+}
+
+/// Per-feature non-worsening acceptance for a via move from `from` to `to`. Returns
+/// true iff EVERY element the move changes — the incoming incident segment, the
+/// outgoing incident segment, and the via barrel — is, against every foreign feature,
+/// at/above its required clearance OR no closer than the SAME element was at the
+/// via's original position. This is the via analogue of [`accepted`] (which guards the
+/// chamfer/interior-vertex moves): it can never push any foreign gap below
+/// `min(required, original)`, so it cannot introduce or worsen a clearance short on the
+/// moved geometry, regardless of which feature happened to be the global minimum.
+#[allow(clippy::too_many_arguments)]
+fn via_accepted(
+    from: P,
+    to: P,
+    in_neighbor: P,
+    in_feats: &[&Feature],
+    in_req: f64,
+    out_neighbor: P,
+    out_feats: &[&Feature],
+    out_req: f64,
+) -> bool {
+    // The incoming incident segment, before and after the via endpoint moved.
+    if !accepted((in_neighbor, to), &[(in_neighbor, from)], in_feats, in_req) {
+        return false;
+    }
+    // The outgoing incident segment, before and after.
+    if !accepted((to, out_neighbor), &[(from, out_neighbor)], out_feats, out_req) {
+        return false;
+    }
+    // The via barrel (a degenerate point inflated by VIA_RADIUS). Reuse the same
+    // monotone rule on the surface gap: a candidate barrel position is legal vs a
+    // foreign feature when it is no closer than `clearance` OR no closer than the
+    // barrel originally was. `clearance == req - half_w`; the half_w belongs to the
+    // *wire*, not the barrel, so the barrel's own threshold is `req - VIA_RADIUS`'s
+    // wire half-width removed — but we conservatively reuse `accepted` over the barrel
+    // SURFACE by representing the barrel as the point `to` with the feature gap reduced
+    // by VIA_RADIUS, comparing against the larger incident `req` (a safe over-estimate
+    // of the spacing the barrel must keep). Over-requiring can only REJECT moves, never
+    // wrongly accept one, so it cannot compromise safety.
+    let barrel_req = in_req.max(out_req);
+    barrel_accepted(from, to, in_feats, out_feats, barrel_req)
+}
+
+/// Non-worsening acceptance for the via BARREL alone (a circle of radius [`VIA_RADIUS`]
+/// translating from `from` to `to`), tested against every foreign feature on either
+/// incident layer. A move is legal vs a feature when the barrel-surface gap at `to` is
+/// at/above `req` OR no closer than it was at `from`. Mirrors [`accepted`]'s rule on the
+/// barrel surface so the barrel can never be pushed into a foreign feature.
+fn barrel_accepted(
+    from: P,
+    to: P,
+    in_feats: &[&Feature],
+    out_feats: &[&Feature],
+    req: f64,
+) -> bool {
+    let cb = seg_bbox(to, to, VIA_RADIUS + req);
+    for f in in_feats.iter().chain(out_feats.iter()) {
+        if !bbox_overlap(cb, f.bbox()) {
+            continue;
+        }
+        let g_new = f.gap(to, to) - VIA_RADIUS;
+        if g_new >= req {
+            continue;
+        }
+        let g_orig = f.gap(from, from) - VIA_RADIUS;
+        if g_new + GAP_EPS >= g_orig {
+            continue; // not closer than the barrel already was
+        }
+        return false;
+    }
+    true
 }
 
 /// Worst foreign-clearance gap over every segment AFFECTED by offsetting run vertices
@@ -1027,5 +1302,89 @@ mod tests {
         let b = PcbTrace::new(vec![wire(0.0, 0.1), wire(1.0, 0.1), wire(2.0, 0.1)]).with_net("A");
         let out = legalize_clearance(vec![a.clone(), b.clone()], &[], clearance);
         assert_eq!(pts_of(&out[1]), pts_of(&b), "same-net copper must not be nudged");
+    }
+
+    /// (D3) A via landing that grazes a foreign track is nudged — together with its two
+    /// coincident wire anchors — to recover clearance, WITHOUT changing the via count or
+    /// breaking the via↔run coincidence (connectivity). The two real trace endpoints
+    /// (the far ends of each run) stay fixed.
+    fn via_at(x: f64, y: f64) -> RoutePoint {
+        RoutePoint::Via {
+            x,
+            y,
+            from_layer: "top".to_string(),
+            to_layer: "bottom".to_string(),
+        }
+    }
+    fn wire_on(x: f64, y: f64, layer: &str) -> RoutePoint {
+        RoutePoint::Wire { x, y, width: 0.1, layer: layer.to_string() }
+    }
+
+    #[test]
+    fn legalize_nudges_via_landing() {
+        let clearance = 0.2;
+        // Trace B (the obstacle): a straight horizontal foreign track on `top` at y = 0.
+        let b = PcbTrace::new(vec![
+            wire_on(0.0, 0.0, "top"),
+            wire_on(4.0, 0.0, "top"),
+        ])
+        .with_net("B");
+        // Trace A: arrives on `top` from far above, drops a via at (2, 0.12) — only
+        // 0.12 from B (copper gap 0.12 - 0.10 = 0.02 << clearance 0.2) — then departs on
+        // `bottom`. The via landing on `top` is the LAST point of the first run; the
+        // approach segment from (2,2) grazes B. The far ends (2,2) and (2,-2) are the
+        // real endpoints and must stay put; only the via (and its two anchors) may move.
+        let a = PcbTrace::new(vec![
+            wire_on(2.0, 2.0, "top"),
+            wire_on(2.0, 0.12, "top"),
+            via_at(2.0, 0.12),
+            wire_on(2.0, 0.12, "bottom"),
+            wire_on(2.0, -2.0, "bottom"),
+        ])
+        .with_net("A");
+
+        let via_xy = |t: &PcbTrace| -> P {
+            t.route.iter().find_map(|rp| match rp {
+                RoutePoint::Via { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            }).unwrap()
+        };
+        let via_count = |t: &PcbTrace| -> usize {
+            t.route.iter().filter(|rp| matches!(rp, RoutePoint::Via { .. })).count()
+        };
+
+        let out = legalize_clearance(vec![a.clone(), b.clone()], &[], clearance);
+        let (oa, ob) = (&out[0], &out[1]);
+
+        // Via count unchanged.
+        assert_eq!(via_count(oa), 1, "via count must be unchanged");
+        // The via moved away from B (its y grew past the original 0.12).
+        let (vx, vy) = via_xy(oa);
+        let (bx, by) = via_xy(&a);
+        assert!(
+            (vy - by).abs() > 1e-6 || (vx - bx).abs() > 1e-6,
+            "via should have been nudged: {:?} -> {:?}",
+            (bx, by),
+            (vx, vy)
+        );
+        // Connectivity preserved: via barrel still coincides with both incident anchors.
+        let pa = pts_of(oa);
+        assert!(approx(pa[1], (vx, vy)), "landing anchor must track the via: {pa:?}");
+        assert!(approx(pa[2], (vx, vy)), "departing anchor must track the via: {pa:?}");
+        // Real endpoints (far run ends) are immovable.
+        assert!(approx(pa[0], (2.0, 2.0)), "start endpoint moved: {pa:?}");
+        assert!(approx(*pa.last().unwrap(), (2.0, -2.0)), "end endpoint moved: {pa:?}");
+        // The obstacle trace B is left alone (it was already clear of itself).
+        assert_eq!(pts_of(ob), pts_of(&b), "obstacle track must not move");
+
+        // Clearance against B's `top` segment strictly improved (was 0.02 copper gap).
+        let gap_to_b = |t: &PcbTrace| -> f64 {
+            // Only the `top` approach segment of A faces B; measure it directly.
+            let p = pts_of(t);
+            seg_seg_dist(p[0], p[1], (0.0, 0.0), (4.0, 0.0)) - 2.0 * 0.05
+        };
+        let before = 0.12 - 0.10;
+        let after = gap_to_b(oa);
+        assert!(after > before + 1e-6, "via nudge must increase the foreign gap: {before} -> {after}");
     }
 }
