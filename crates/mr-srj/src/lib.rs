@@ -325,6 +325,33 @@ fn cell_budget(x_features: usize, y_features: usize) -> usize {
     }
 }
 
+/// D1 foreign-pad clearance safety-band factor. The base grid reserves a foreign pad's
+/// halo as `clearance + PAD_BAND_K · track_w` (instead of the bare `track_w/2`, i.e.
+/// k = 0.5). The grid only reserves NODE centres, but emitted copper is the segment
+/// BETWEEN nodes plus the endpoint snap-back to the exact pad and 45° chamfers — none of
+/// which sit on the reserved node. With k = 0.5 ~40% of residual inter-net DRC
+/// violations land in the near-miss band [0.10,0.145) mm hugging a foreign pad; widening
+/// to k ∈ [0.5, 1] pushes routable nodes far enough out that the snapped/chamfered
+/// segment between them still clears the pad. On the A1 subset (D2 off): k = 0.5 = the
+/// historical baseline (DRC 189, 150/155 routed); k = 1.0 cuts DRC to 164 (−25, −13%)
+/// for −2 routed (sample43 55→53) — broad per-board DRC drops (sample11 79→64, bugreport48
+/// 8→2, sample55 6→1). Per the project's strictly-DRC-clean-over-completion preference,
+/// k = 1.0 is chosen; the integrator may joint-tune it with the other clearance levers.
+/// Applied ONLY when clearance is active — the clearance-off fast path keeps the historical
+/// k = 0.5 base grid.
+const PAD_BAND_K: f64 = 1.0;
+
+/// D2 via-class foreign-pad reservation fraction. On via-allowed (multi-layer) stackups
+/// a foreign pad's reserved half-width is widened to `max(pad_band, VIA_RESERVE_FRAC ·
+/// VIA_PAD_MM/2)` so the grid never offers a via NODE whose annular pad (radius 0.225)
+/// would bite a foreign pad's clearance band. `0.0` disables the reservation; `1.0`
+/// reserves the full via-pad radius. The full radius (and any positive fraction tested)
+/// over-blocks the Hanan grid — it deletes whole routing lanes between dense pads and
+/// drops completion sharply (subset: −14 nets, DRC up) — so it ships OFF. Kept as a
+/// named constant (grid RESERVATION only, never a placement-time veto, which was tried
+/// in `ring_conflict` and reverted as net-negative) so the integrator can re-tune it.
+const VIA_RESERVE_FRAC: f64 = 0.0;
+
 /// Build the non-uniform (Hanan-style) grid-line arrays for `srj` — the per-axis
 /// sorted, deduped continuous positions every grid node sits on (plan section 2).
 ///
@@ -825,7 +852,7 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     // The board's layer axis. `layer_count == 1` yields `["top"]`, so every
     // single-layer construction below collapses onto layer 0 and is byte-identical
     // to the pre-layers path.
-    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0, 0.0)
+    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0, 0.0, 0.0)
 }
 
 /// (B3) Rasterise with an explicit [`LayerMap`] — use this when the layer *names*
@@ -864,6 +891,7 @@ pub fn rasterize_with_layers(
     layers: LayerMap,
     clearance_cells: u32,
     min_clearance_mm: f64,
+    via_pad_mm: f64,
 ) -> RasterizedProblem {
     let layer_count = layers.len();
     // Non-uniform / Hanan grid: build per-axis lines through every pad endpoint and
@@ -894,21 +922,70 @@ pub fn rasterize_with_layers(
     // defined trace to reserve against, and forcing the `resolution`-based fallback here
     // would (a) break the byte-identical contract of `rasterize()`/`clearance_cells == 0`
     // fixtures that omit `minTraceWidth`, and (b) over-block on coarse-resolution boards.
+    //
+    // Baseline reserves `track_w/2` (the centred-track half-width). The D1/D2 widenings
+    // below are NEW logic that fires ONLY when clearance is active (`clearance > 0`); in
+    // the clearance-off DEFAULT regime (`clearance == 0` with a declared trace width)
+    // this stays exactly `track_w/2`, preserving the historical base grid and the
+    // byte-identical `clearance_cells == 0` contract.
     let track_block_mm = srj
         .min_trace_width
         .filter(|w| *w > 0.0)
         .map_or(0.0, |w| w / 2.0);
-    // Total distance every FOREIGN pad/obstacle reserves around itself.
-    let block_margin_mm = clearance + track_block_mm;
+    // D1 (foreign-pad clearance safety band): the bare `track_w/2` reserves only the
+    // grid NODE centre, but emitted copper is the segment BETWEEN nodes plus the
+    // endpoint snap-back to the exact pad and the 45° chamfers — geometry that does NOT
+    // sit on the reserved node. ~40% of residual inter-net DRC violations land in the
+    // near-miss band [0.10,0.145) mm hugging a foreign pad. Widening the reserved
+    // half-width from `track_w/2` to `PAD_BAND_K·track_w` (k ≥ 0.5) pushes those routable
+    // nodes far enough out that a snapped/chamfered segment between them still clears the
+    // pad. Only applied when clearance is active. `PAD_BAND_K` is a named constant the
+    // integrator can joint-tune.
+    let pad_band_mm = if clearance > 0.0 {
+        srj.min_trace_width
+            .filter(|w| *w > 0.0)
+            .map_or(track_block_mm, |w| PAD_BAND_K * w)
+    } else {
+        track_block_mm
+    };
+    // D2 (via-class pad reservation): a via's annular pad (radius `VIA_PAD_MM/2 = 0.225`)
+    // is far larger than a track's half-width (0.075), but the pad halo above only
+    // reserves the track-sized margin — so the grid can offer a via NODE close enough to
+    // a foreign pad that the via's copper bites the pad's clearance band (a hard
+    // overlap). On via-allowed layers (any multi-layer routed stackup uses through-vias)
+    // reserve `max(pad_band_mm, VIA_RESERVE_FRAC · VIA_PAD_MM/2)` so the grid never offers
+    // a via node too close to a foreign pad. This is a grid RESERVATION only — NOT a
+    // placement-time veto (that was tried in `ring_conflict` and reverted as net-negative).
+    // Single-layer boards place no vias, so the via term is suppressed there; the value is
+    // threaded from `via_pad_mm` (never a hardcoded duplicate). Gated on `clearance > 0` so
+    // the clearance-off fast path is untouched. NOTE: every positive `VIA_RESERVE_FRAC`
+    // tested regressed the subset (it over-blocks dense lanes), so it ships at 0.0 (off);
+    // see the constant's doc for the sweep finding.
+    let via_reserve_mm = VIA_RESERVE_FRAC * via_pad_mm / 2.0;
+    let pad_band_mm = if clearance > 0.0 && layer_count > 1 && via_reserve_mm > 0.0 {
+        pad_band_mm.max(via_reserve_mm)
+    } else {
+        pad_band_mm
+    };
+    // Total distance every FOREIGN pad/obstacle reserves around itself. In the
+    // clearance-off regime this is just the historical `track_w/2` (or 0 with no
+    // declared width), preserving the byte-identical base grid.
+    let block_margin_mm = clearance + pad_band_mm;
     // Foreign-pad clip margin for the own-pad ESCAPE halo (see `pad_cells_for_point`).
     // The base grid is inflated by `block_margin_mm`, but `clearance_cells` is a
     // `ceil`-rounded count so on coarse grids `clearance` (and hence `block_margin_mm`)
     // can exceed the rule the DRC actually enforces — clipping the escape corridor by
     // that inflated value needlessly strands nets. The corridor only has to keep a
     // centred track's copper `min_clearance` from a foreign pad edge, i.e. the TRUE
-    // geometric `min_clearance + track_w/2`. Prefer the declared `min_clearance`
+    // geometric `min_clearance + pad_band`. Prefer the declared `min_clearance`
     // (what the DRC checks); fall back to the rounded `clearance` when the problem
     // states none, and never exceed `block_margin_mm`. Zero when nothing is reserved.
+    //
+    // D1 CONSISTENCY: the half-width term here is the SAME widened `pad_band_mm` the
+    // foreign-pad halo above grew by — not the bare `track_w/2`. The base grid now
+    // reserves `clearance + pad_band` around every foreign pad, so the own-pad escape
+    // corridor must be clipped by that same band; using a narrower clip would re-open
+    // exactly the near-miss cells D1 set out to reserve.
     let foreign_margin_mm = if block_margin_mm > 0.0 {
         // The DRC enforces the caller's true `min_clearance_mm` (e.g. a default when the
         // problem omits one — which `clearance_cells` already `ceil`-rounded away). Fall
@@ -919,7 +996,7 @@ pub fn rasterize_with_layers(
         } else {
             srj.min_clearance.filter(|c| *c > 0.0).unwrap_or(clearance)
         };
-        true_clearance.min(clearance) + track_block_mm
+        true_clearance.min(clearance) + pad_band_mm
     } else {
         0.0
     };
@@ -2352,7 +2429,7 @@ mod tests {
     #[test]
     fn rasterize_pad_clearance_reserves_halo_and_unmasks_own() {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
-        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1, 0.0);
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1, 0.0, 0.0);
         let d = prob.mapping.dims;
         let clearance = 1.0_f64; // clearance_cells (1) · resolution (1.0)
 
@@ -2415,7 +2492,7 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
         // `rasterize` (no clearance) and `rasterize_with_layers(.., 0)` must agree.
         let baseline = rasterize(&srj, 1.0);
-        let zero = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 0, 0.0);
+        let zero = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 0, 0.0, 0.0);
 
         assert_eq!(
             baseline.grid.cost, zero.grid.cost,
@@ -2500,7 +2577,7 @@ mod tests {
         let track_w = 0.3_f64;
         let margin = clearance + track_w / 2.0; // 0.25 — the track-centreline rule
         let clearance_cells = (clearance / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0);
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0, 0.0);
         let d = prob.mapping.dims;
 
         // Each pad's copper rect (continuous).
@@ -2576,7 +2653,7 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(TRACK_GT_CLEARANCE_SRJ).unwrap();
         let resolution = 0.05;
         let clearance_cells = (0.1_f64 / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0);
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0, 0.0);
         let d = prob.mapping.dims;
         let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
         let (ax, ay) = prob.mapping.point_to_xy((2.0, 2.0));
