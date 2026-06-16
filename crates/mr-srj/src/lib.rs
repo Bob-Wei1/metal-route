@@ -332,14 +332,23 @@ fn cell_budget(x_features: usize, y_features: usize) -> usize {
 /// which sit on the reserved node. With k = 0.5 ~40% of residual inter-net DRC
 /// violations land in the near-miss band [0.10,0.145) mm hugging a foreign pad; widening
 /// to k ∈ [0.5, 1] pushes routable nodes far enough out that the snapped/chamfered
-/// segment between them still clears the pad. On the A1 subset (D2 off): k = 0.5 = the
-/// historical baseline (DRC 189, 150/155 routed); k = 1.0 cuts DRC to 164 (−25, −13%)
-/// for −2 routed (sample43 55→53) — broad per-board DRC drops (sample11 79→64, bugreport48
-/// 8→2, sample55 6→1). Per the project's strictly-DRC-clean-over-completion preference,
-/// k = 1.0 is chosen; the integrator may joint-tune it with the other clearance levers.
-/// Applied ONLY when clearance is active — the clearance-off fast path keeps the historical
-/// k = 0.5 base grid.
-const PAD_BAND_K: f64 = 1.0;
+/// segment between them still clears the pad.
+///
+/// INTEGRATION JOINT-TUNE (full 112-board corpus, all four levers, default budget):
+/// | k    | corpus DRC | routed     | full   | clean | DSN fixture |
+/// |------|-----------:|-----------:|-------:|------:|------------:|
+/// | 0.5  | 1900 (base)| 2708/3167  | 76/112 | 39    | 126         |
+/// | 0.75 | 1493 (−21%)| 2701/3167  | 78/112 | 40    | 110 (−16)   |
+/// | 1.0  | 1275 (−33%)| 2677/3167  | 77/112 | 43    | 154 (+28)   |
+///
+/// **k = 0.75 is the shipped default**: it maximises DRC reduction subject to completion
+/// staying at/above the project's ~2700/3167 tolerance (k = 1.0 drops to 2677, below it),
+/// posts the best full-board count (+2), and *improves* the dense 8-layer DSN fixture
+/// (126→110) where the wider k = 1.0 band over-blocks and regresses it (+28). k = 1.0 is
+/// the max-DRC alternative (−33%, +4 clean boards) at a real completion/DSN cost — flip
+/// this constant to select it. Applied ONLY when clearance is active — the clearance-off
+/// fast path keeps the historical k = 0.5 base grid.
+const PAD_BAND_K: f64 = 0.75;
 
 /// D2 via-class foreign-pad reservation fraction. On via-allowed (multi-layer) stackups
 /// a foreign pad's reserved half-width is widened to `max(pad_band, VIA_RESERVE_FRAC ·
