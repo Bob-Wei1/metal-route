@@ -362,6 +362,55 @@ pub fn route_problem(
     // square corners. DRC-validated against all other copper/pads, so it never
     // changes connectivity or introduces a clearance violation.
     let traces = mr_srj::beautify_traces(traces, &srj.obstacles, min_clearance);
+    // Exact-geometry clearance legalisation: the grid halo guards NODE positions, but
+    // copper is the segments between nodes (plus endpoint snapping and 45° chamfers),
+    // so the emitted geometry can still hold genuine different-net clearance shorts the
+    // exact DRC reports. This pass nudges interior wire vertices to recover spacing,
+    // validated against the same exact distance engine — monotone (never worsens a
+    // gap) so it only removes violations and never breaks connectivity. No-op when
+    // `min_clearance <= 0` (clearance-off fast path stays byte-identical).
+    //
+    // AUTHORITATIVE GATE: the legaliser lives in `mr-srj` and reconstructs net identity
+    // from `PcbTrace::net` (the router's `g<group>` labels), which can differ from the
+    // DRC's `c<connectivity_net>` relabelling at shared junction pads. So we gate the
+    // pass against the REAL DRC here: keep the legalised geometry only if it does not
+    // increase the authoritative different-net violation count. This guarantees the pass
+    // can never regress a board, regardless of any net-view mismatch.
+    let traces = if min_clearance > 0.0 {
+        let layers = layers.unwrap_or(srj.layer_count).max(1);
+        let rules = drc::default_rules(min_clearance);
+        // Tag each trace with the DRC's own electrical-net identity (`c<net>` at shared
+        // connectivity pads, else the router group) so the legaliser's same-net immunity
+        // and its internal gate agree with the authoritative checker — otherwise it would
+        // try to push apart copper the DRC considers one net, or miss real foreign pairs.
+        let labels = drc_board::reconstruct_net_labels(srj, &traces);
+        let traces: Vec<_> = traces
+            .into_iter()
+            .zip(labels)
+            .map(|(mut t, n)| {
+                t.net = Some(n);
+                t
+            })
+            .collect();
+        let before = drc_board::solution_to_drc_board(srj, &traces, rules, layers)
+            .check()
+            .iter()
+            .filter(|v| v.nets.0 != v.nets.1)
+            .count();
+        let legalised = mr_srj::legalize_clearance(traces.clone(), &srj.obstacles, min_clearance);
+        let after = drc_board::solution_to_drc_board(srj, &legalised, rules, layers)
+            .check()
+            .iter()
+            .filter(|v| v.nets.0 != v.nets.1)
+            .count();
+        if after <= before {
+            legalised
+        } else {
+            traces
+        }
+    } else {
+        traces
+    };
 
     // Diagnose every unrouted net: was it impossible at this resolution, or just
     // lost to congestion? Cheap — re-routes only the failed nets, one at a time.
@@ -926,6 +975,11 @@ pub fn route_dsn_problem(
     // or introduces a violation. (The .ses below is still built from cell-space
     // `board`, so KiCad reimport stays on the routed grid.)
     let traces = mr_srj::beautify_traces(traces, &srj.obstacles, stats.min_clearance_mm);
+    // Exact-geometry clearance legalisation (see the SRJ path): nudge interior wire
+    // vertices to recover any different-net spacing the node-based grid halo could not
+    // guarantee on the emitted segments. Monotone and connectivity-preserving; a no-op
+    // when clearance is off.
+    let traces = mr_srj::legalize_clearance(traces, &srj.obstacles, stats.min_clearance_mm);
     let vias = count_vias(&traces);
 
     let ses = board_to_ses(

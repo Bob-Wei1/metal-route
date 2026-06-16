@@ -68,22 +68,19 @@ impl LayerIndex {
 ///   board with vias spanning unseen layers still reports a sensible stack.
 ///
 /// Pure and deterministic.
-pub fn solution_to_drc_board(
-    srj: &SimpleRouteJson,
-    traces: &[PcbTrace],
-    rules: DrcRules,
-    layers: u32,
-) -> DrcBoard {
-    let mut idx = LayerIndex::default();
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut vias: Vec<Via> = Vec::new();
-    let mut pads: Vec<Pad> = Vec::new();
-
-    // --- Reconstruct net membership from geometry ---------------------------
-    // Traces that share an exact vertex are one electrical net (junction-grouped
-    // sub-connections meet at a shared point). Union them so a sibling sub-net is
-    // never treated as foreign. Vertices are quantised so float emission noise at
-    // a shared point still collides.
+/// Reconstruct the per-trace electrical-net label exactly as [`solution_to_drc_board`]
+/// (and hence the DRC) sees it, in trace order:
+///
+/// 1. Start from the router's tag (`PcbTrace::net`, a `g<groupid>`), or a union-find
+///    component label over shared vertices for untagged (hand-built) traces.
+/// 2. Relabel any trace whose endpoint lands on an SRJ `connectivity_netNNNN` pad to
+///    `c<net>`, collapsing the many router sub-groups that solder to one shared junction
+///    pad into a single electrical net — the same immunity the DRC grants.
+///
+/// Exposed so the clearance legaliser can tag traces with the DRC's own net identity
+/// before it runs, making its same-net immunity (and its internal violation gate) agree
+/// with the authoritative checker rather than the bare router groups.
+pub fn reconstruct_net_labels(srj: &SimpleRouteJson, traces: &[PcbTrace]) -> Vec<String> {
     let mut uf = UnionFind::new(traces.len());
     let mut first_at: BTreeMap<(i64, i64), usize> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
@@ -101,10 +98,6 @@ pub fn solution_to_drc_board(
             }
         }
     }
-    // Per-trace net name: prefer the real base-net tag threaded through from the
-    // router (`PcbTrace::net`, the router's `g<groupid>` — so junction-grouped
-    // siblings share one identity). Fall back to the union-find component label only
-    // for untagged (e.g. hand-built test) traces.
     let mut net_name: Vec<String> = Vec::with_capacity(traces.len());
     let mut root_name: BTreeMap<usize, String> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
@@ -118,27 +111,12 @@ pub fn solution_to_drc_board(
         };
         net_name.push(name);
     }
-
-    // Ground-truth electrical-net relabel via the SRJ obstacles' `connectedTo`
-    // connectivity nets. A pad declares the single `connectivity_netNNNN` it belongs
-    // to; every trace that TERMINATES on such a pad is, by construction, that net.
-    // Many separately-grouped router nets legitimately solder to one shared junction
-    // pad (a GND/power pad lists dozens of `source_trace`s under ONE connectivity
-    // net): the router keeps them in distinct groups, so the bare `g<id>` labels make
-    // them mutually foreign and their copper meeting AT the shared pad trips a false
-    // clearance hit. Relabelling every trace whose endpoint lands on a connectivity
-    // pad — and the pad itself — to `c<net>` collapses that physical net to ONE
-    // identity, so own-pad and sibling-at-pad contact is immune while genuinely
-    // foreign copper stays foreign. Traces that touch no connectivity pad keep their
-    // router group label.
     let conn_pads: Vec<(&mr_srj::Obstacle, &str)> = srj
         .obstacles
         .iter()
         .filter_map(|o| mr_srj::obstacle_connectivity_net(o).map(|n| (o, n)))
         .collect();
     let connectivity_at = |x: f64, y: f64| -> Option<String> {
-        // Prefer the smallest containing connectivity pad: a terminal landing pad
-        // nested in a larger pour is the point's true net, not the pour it overlaps.
         conn_pads
             .iter()
             .filter(|(o, _)| {
@@ -153,8 +131,6 @@ pub fn solution_to_drc_board(
             .map(|(_, n)| format!("c{n}"))
     };
     for (i, t) in traces.iter().enumerate() {
-        // Endpoints first, then any vertex: a trace's terminals carry its net; only
-        // if neither endpoint lands on a connectivity pad do we leave the group label.
         let ends = [t.route.first(), t.route.last()];
         let endpoint_net = ends.into_iter().flatten().find_map(|rp| {
             let (x, y) = match rp {
@@ -166,6 +142,22 @@ pub fn solution_to_drc_board(
             net_name[i] = c;
         }
     }
+    net_name
+}
+
+pub fn solution_to_drc_board(
+    srj: &SimpleRouteJson,
+    traces: &[PcbTrace],
+    rules: DrcRules,
+    layers: u32,
+) -> DrcBoard {
+    let mut idx = LayerIndex::default();
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut vias: Vec<Via> = Vec::new();
+    let mut pads: Vec<Pad> = Vec::new();
+
+    // Reconstruct the per-trace electrical-net identity exactly as the DRC sees it.
+    let net_name = reconstruct_net_labels(srj, traces);
     // Trace vertices tagged with their net, for pad-net resolution below.
     let mut tagged_vertices: Vec<(f64, f64, String)> = Vec::new();
 
