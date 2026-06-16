@@ -189,6 +189,11 @@ async fn solve(
         LayerMap::standard(effective_layers),
         clearance_cells,
         clearance_mm,
+        // D2 (via-class foreign-pad reservation) is threaded from the CLI/corpus path
+        // where `VIA_PAD_MM` lives; this server crate carries no via-pad constant and
+        // its generic `make_router` may use a different via geometry, so we pass 0.0
+        // (reservation off) rather than hardcode a duplicate diameter here.
+        0.0,
     );
 
     // The rasteriser built a non-uniform (Hanan) grid; hand the router the same

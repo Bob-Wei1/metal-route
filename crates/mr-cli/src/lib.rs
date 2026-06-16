@@ -320,7 +320,16 @@ pub fn route_problem(
         0
     };
     let trace_halo_mm = if min_clearance > 0.0 { min_clearance + DEFAULT_TRACE_WIDTH } else { 0.0 };
-    let problem = rasterize_with_layers(srj, resolution, layer_map, clearance_cells, min_clearance);
+    // D2: thread the real signal-via pad diameter so the rasteriser can reserve a
+    // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
+    let problem = rasterize_with_layers(
+        srj,
+        resolution,
+        layer_map,
+        clearance_cells,
+        min_clearance,
+        VIA_PAD_MM,
+    );
     let total = problem.nets.len();
 
     // Only the negotiated backend places vias; give it a through-hole model over
@@ -916,7 +925,15 @@ pub fn route_dsn_problem(
     // committed via's copper keeps full `clearance` from a foreign track's copper. No
     // `/resolution` cell conversion — that was a unit bug on the non-uniform Hanan grid.
     via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
-    let problem = rasterize_with_layers(&srj, resolution, layer_map, clearance_cells, stats.min_clearance_mm);
+    // D2: thread the real signal-via pad diameter for the via-class foreign-pad halo.
+    let problem = rasterize_with_layers(
+        &srj,
+        resolution,
+        layer_map,
+        clearance_cells,
+        stats.min_clearance_mm,
+        VIA_PAD_MM,
+    );
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
     let grid_h = problem.mapping.dims.h;

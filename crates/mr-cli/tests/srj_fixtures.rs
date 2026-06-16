@@ -60,6 +60,7 @@ fn route_fixture_layers(name: &str, layers: u32) -> (usize, usize) {
         LayerMap::standard(effective),
         0,
         0.0,
+        0.0,
     );
     let board = NegotiatedRouter::new()
         .route(&problem.grid, &problem.nets)
@@ -168,7 +169,7 @@ fn track_gt_clearance_routes_drc_clean_native_checker() {
     // Same clearance_cells the CLI/server derive for the routing pipeline.
     let clearance_cells = (clearance / resolution).ceil() as u32;
     let layers = LayerMap::standard(1);
-    let problem = rasterize_with_layers(&srj, resolution, layers.clone(), clearance_cells, 0.0);
+    let problem = rasterize_with_layers(&srj, resolution, layers.clone(), clearance_cells, 0.0, 0.0);
     // Route with the router's OWN negotiation clearance DISABLED (clearance_cells = 0),
     // so DRC-cleanliness rests on the rasteriser's `clearance + track_w/2` grid blocking
     // alone (not the router's separate clearance). The tight geometric guard that the
