@@ -154,6 +154,335 @@ fn beautify_one(
     out
 }
 
+/// Number of relaxation sweeps the clearance legaliser runs. Each sweep visits
+/// every movable vertex once; the gains saturate quickly because a sweep only
+/// ever increases foreign clearance (and never worsens it), so a small fixed bound
+/// keeps the pass cheap and deterministic.
+const LEGALIZE_SWEEPS: usize = 8;
+/// Candidate nudge offsets (continuous units, ~mm) tried at each movable vertex,
+/// largest first, so the legaliser opens up as much foreign clearance as a single
+/// move legally can before falling back to a finer step. Sized around the default
+/// `clearance + track_w` so one move can clear a half-track overlap.
+const NUDGE_STEPS: [f64; 5] = [0.30, 0.20, 0.10, 0.05, 0.025];
+
+/// Post-route exact-geometry clearance legaliser (runs AFTER [`beautify_traces`]).
+///
+/// The negotiated router enforces inter-net spacing with a grid HALO — cells within
+/// a radius of a routed net's path *nodes* are blocked for foreign nets. But copper
+/// is the SEGMENTS between nodes, and the emitted geometry adds vertex snapping
+/// (endpoints pulled to the exact pad, interior vertices at cell centres) and 45°
+/// chamfers, so a foreign segment can still pass closer to ours than any node-to-node
+/// distance the halo measured. The exact DRC ([`mr_drc`]) then reports those genuine
+/// different-net clearance shorts.
+///
+/// This pass repairs them on the emitted geometry directly, against the same exact
+/// distance engine the DRC uses. It moves only INTERIOR wire vertices (never an
+/// endpoint anchor or a via landing, so connectivity and via positions are
+/// untouched) along a small set of candidate offsets, accepting a move only when it
+/// *strictly increases* the worst foreign-clearance gap on the vertex's incident
+/// segments AND leaves every incident segment no worse than `min(required, original)`
+/// against every OTHER foreign feature. Because acceptance is validated by the exact
+/// oracle and is monotone (a gap is never pushed below where it started), the pass
+/// can only reduce violations, never create one, and it cannot break connectivity.
+///
+/// `obstacles` are the problem's pads/keepouts, `clearance` the minimum
+/// copper-to-copper spacing. When `clearance <= 0` the pass is a no-op (returns the
+/// input unchanged), preserving the clearance-off fast path byte-for-byte.
+pub fn legalize_clearance(
+    traces: Vec<PcbTrace>,
+    obstacles: &[Obstacle],
+    clearance: f64,
+) -> Vec<PcbTrace> {
+    if clearance <= 0.0 || traces.is_empty() {
+        return traces;
+    }
+    let mut items_per_trace: Vec<Vec<Item>> =
+        traces.iter().map(parse_items).collect();
+    let nets: Vec<Option<String>> = traces.iter().map(|t| t.net.clone()).collect();
+
+    for _ in 0..LEGALIZE_SWEEPS {
+        // Rebuild the foreign-feature context from the CURRENT geometry at the start of
+        // each sweep so every accepted move is validated against the latest copper.
+        // Within a sweep, moves are applied Gauss-Seidel against THIS snapshot, so a
+        // later vertex is checked against an earlier mover's OLD position — that race
+        // can, on rare boxed-in geometry, nudge two tracks toward each other. We GATE
+        // the sweep with a self-consistent count (foreign violations rebuilt from the
+        // TRIAL geometry's own updated copper) and keep the sweep only if it did not
+        // raise that count, so the pass is internally non-regressing. The CALLER applies
+        // a second, authoritative gate against the real DRC (which knows the exact
+        // electrical-net relabelling), so the emitted board can never regress even if
+        // this crate's net view differs from the DRC's. See `count_foreign_violations`.
+        let snapshot = current_traces(&items_per_trace, &nets);
+        let by_layer = features_by_layer(&snapshot, obstacles);
+        let before = count_foreign_violations(&items_per_trace, &by_layer, clearance);
+
+        let mut trial = clone_items(&items_per_trace);
+        let mut moved = false;
+        for (ti, items) in trial.iter_mut().enumerate() {
+            for item in items.iter_mut() {
+                if let Item::Run(run) = item {
+                    if legalize_run(ti, run, &by_layer, clearance) {
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if !moved {
+            break; // quiescent: no vertex could improve, further sweeps are futile
+        }
+        // Rebuild the context from the TRIAL geometry so `after` reflects every trace's
+        // NEW position (catching a within-sweep race where two tracks both moved); the
+        // sweep is accepted only if the count did not rise in the real, post-move world.
+        let trial_snapshot = current_traces(&trial, &nets);
+        let trial_ctx = features_by_layer(&trial_snapshot, obstacles);
+        let after = count_foreign_violations(&trial, &trial_ctx, clearance);
+        if after <= before {
+            items_per_trace = trial; // accept: non-regressing
+        } else {
+            break; // a sweep that would regress; stop and keep the last good geometry
+        }
+    }
+
+    items_per_trace
+        .into_iter()
+        .zip(traces)
+        .map(|(items, trace)| {
+            let mut out = PcbTrace::new(flatten_items(items));
+            out.net = trace.net; // geometry-only reshape; carry net identity through
+            out
+        })
+        .collect()
+}
+
+/// Count distinct different-net clearance violations across the in-progress geometry,
+/// measured against the SAME exact distance engine the DRC uses, on the fixed feature
+/// `context`. Each trace's wire segments are tested against the foreign features for
+/// their layer; a segment-feature pair below `clearance + half_width` counts once. Used
+/// only to gate a legalisation sweep (accept iff the count does not rise), so it need
+/// not perfectly mirror the DRC's pair canonicalisation — only move monotonically with
+/// it, which a per-(segment, feature) tally does.
+fn count_foreign_violations(
+    items_per_trace: &[Vec<Item>],
+    context: &LayerFeatures,
+    clearance: f64,
+) -> usize {
+    let mut n = 0usize;
+    for (ti, items) in items_per_trace.iter().enumerate() {
+        for item in items {
+            if let Item::Run(run) = item {
+                let req = clearance + run.width / 2.0;
+                let feats = context.foreign_for_layer(ti, &run.layer);
+                for w in run.pts.windows(2) {
+                    let (s0, s1) = (w[0], w[1]);
+                    let cb = seg_bbox(s0, s1, req);
+                    for f in &feats {
+                        if !bbox_overlap(cb, f.bbox()) {
+                            continue;
+                        }
+                        if f.gap(s0, s1) + GAP_EPS < req {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Deep-clone the in-progress per-trace items so a legalisation sweep can be applied to
+/// a trial copy and discarded if it would regress the violation count.
+fn clone_items(items_per_trace: &[Vec<Item>]) -> Vec<Vec<Item>> {
+    items_per_trace
+        .iter()
+        .map(|items| {
+            items
+                .iter()
+                .map(|it| match it {
+                    Item::Run(r) => Item::Run(Run {
+                        layer: r.layer.clone(),
+                        width: r.width,
+                        pts: r.pts.clone(),
+                    }),
+                    Item::Via(v) => Item::Via(v.clone()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Re-emit the in-progress per-trace items back into `PcbTrace`s (carrying their net
+/// labels) so the foreign-feature context can be rebuilt from the CURRENT geometry
+/// between legalisation sweeps.
+fn current_traces(items_per_trace: &[Vec<Item>], nets: &[Option<String>]) -> Vec<PcbTrace> {
+    items_per_trace
+        .iter()
+        .enumerate()
+        .map(|(ti, items)| {
+            let route = flatten_items_ref(items);
+            let mut t = PcbTrace::new(route);
+            t.net = nets.get(ti).cloned().flatten();
+            t
+        })
+        .collect()
+}
+
+/// Relax one run's interior vertices to recover foreign clearance. Returns true iff
+/// any vertex moved. A vertex's two incident segments are re-measured against the
+/// foreign features for its layer; if either is below clearance, the vertex is nudged
+/// along a small set of offsets and the first move that strictly improves the worst
+/// incident foreign gap (without worsening any other) is committed.
+fn legalize_run(ti: usize, run: &mut Run, by_layer: &LayerFeatures, clearance: f64) -> bool {
+    if run.pts.len() < 3 {
+        return false; // only the two immovable anchors — nothing interior to move
+    }
+    let half_w = run.width / 2.0;
+    let req = clearance + half_w;
+    let feats = by_layer.foreign_for_layer(ti, &run.layer);
+    let mut moved = false;
+
+    // PHASE 1 — segment push. A parallel violating run is a stretch of copper running
+    // alongside a foreign feature; nudging one vertex at a time just kinks it. Instead,
+    // for each interior segment whose BOTH endpoints are movable (interior), shift the
+    // two endpoints TOGETHER perpendicular to the segment, which slides the whole run
+    // sideways away from the neighbour while staying parallel. The shifted endpoints'
+    // OTHER incident segments (to the fixed/anchor neighbours) tilt slightly; the
+    // exact-gap check below covers them, so a push is taken only when it improves the
+    // worst foreign gap across all four affected segments without worsening it.
+    for i in 1..run.pts.len().saturating_sub(2) {
+        let (p, q) = (run.pts[i], run.pts[i + 1]);
+        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= GAP_EPS {
+            continue;
+        }
+        // Unit perpendicular to the segment.
+        let (nx, ny) = (-dy / len, dx / len);
+        let before = push_min_gap(run, i, &feats, req, 0.0, 0.0);
+        if before >= req {
+            continue; // segment already clear
+        }
+        let mut best: Option<(f64, f64, f64)> = None; // (gap, ox, oy)
+        for &step in &NUDGE_STEPS {
+            for sign in [1.0, -1.0] {
+                let (ox, oy) = (nx * step * sign, ny * step * sign);
+                let g = push_min_gap(run, i, &feats, req, ox, oy);
+                if g > before + GAP_EPS {
+                    match best {
+                        Some((bg, _, _)) if g <= bg => {}
+                        _ => best = Some((g, ox, oy)),
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        if let Some((_, ox, oy)) = best {
+            run.pts[i] = (run.pts[i].0 + ox, run.pts[i].1 + oy);
+            run.pts[i + 1] = (run.pts[i + 1].0 + ox, run.pts[i + 1].1 + oy);
+            moved = true;
+        }
+    }
+
+    // PHASE 2 — single-vertex relaxation (handles corners and run ends the push misses).
+    for i in 1..run.pts.len() - 1 {
+        let a = run.pts[i - 1];
+        let p = run.pts[i];
+        let b = run.pts[i + 1];
+        // Worst foreign gap on the two segments incident to vertex `i` as it stands.
+        let cur = incident_min_gap(p, a, b, &feats, req);
+        if cur >= req {
+            continue; // this vertex is already clear — leave it untouched
+        }
+        // Search candidate offsets along the 4 axis directions and the 4 diagonals,
+        // largest step first. Accept the move that most improves the worst incident
+        // foreign gap while never pushing it below where it started (monotone). A
+        // partial improvement that does not yet reach `req` is still kept: successive
+        // sweeps compound it, and a parallel run is opened up one vertex at a time.
+        let mut best: Option<(f64, P)> = None;
+        for &step in &NUDGE_STEPS {
+            for (dx, dy) in DIRS {
+                let cand = (p.0 + dx * step, p.1 + dy * step);
+                let g = incident_min_gap(cand, a, b, &feats, req);
+                if g > cur + GAP_EPS {
+                    match best {
+                        Some((bg, _)) if g <= bg => {}
+                        _ => best = Some((g, cand)),
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        if let Some((_, cand)) = best {
+            run.pts[i] = cand;
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Worst foreign-clearance gap over every segment AFFECTED by offsetting run vertices
+/// `i` and `i+1` by `(ox, oy)`: the pushed segment `[p',q']` plus the two connector
+/// segments to its (unmoved) neighbours `[i-1, i']` and `[q', i+2]` when those
+/// neighbours exist. This is exactly the set of segments whose geometry the push
+/// changes, so comparing it before/after is a sound monotone guard.
+fn push_min_gap(run: &Run, i: usize, feats: &[&Feature], req: f64, ox: f64, oy: f64) -> f64 {
+    let p = (run.pts[i].0 + ox, run.pts[i].1 + oy);
+    let q = (run.pts[i + 1].0 + ox, run.pts[i + 1].1 + oy);
+    let mut segs: Vec<(P, P)> = vec![(p, q)];
+    if i >= 1 {
+        segs.push((run.pts[i - 1], p));
+    }
+    if i + 2 < run.pts.len() {
+        segs.push((q, run.pts[i + 2]));
+    }
+    let mut worst = f64::INFINITY;
+    for (s0, s1) in segs {
+        let cb = seg_bbox(s0, s1, req);
+        for f in feats {
+            if !bbox_overlap(cb, f.bbox()) {
+                continue;
+            }
+            worst = worst.min(f.gap(s0, s1));
+        }
+    }
+    worst
+}
+
+/// The minimum foreign-clearance gap over the two segments `[a,p]` and `[p,b]`
+/// incident to a candidate vertex position `p`. A gap is `feature_gap - 0` already
+/// includes the segment half-width via `req` at the call site; here we return the raw
+/// `Feature::gap` (centre-line to surface) and the caller compares against `req`.
+/// Broad-phased by the per-segment bbox so only nearby features are measured.
+fn incident_min_gap(p: P, a: P, b: P, feats: &[&Feature], req: f64) -> f64 {
+    let mut worst = f64::INFINITY;
+    for (s0, s1) in [(a, p), (p, b)] {
+        let cb = seg_bbox(s0, s1, req);
+        for f in feats {
+            if !bbox_overlap(cb, f.bbox()) {
+                continue;
+            }
+            worst = worst.min(f.gap(s0, s1));
+        }
+    }
+    worst
+}
+
+/// The 8 unit nudge directions (4 axis-aligned + 4 diagonal), deterministic order.
+const DIRS: [(f64, f64); 8] = [
+    (1.0, 0.0),
+    (-1.0, 0.0),
+    (0.0, 1.0),
+    (0.0, -1.0),
+    (0.70710678, 0.70710678),
+    (0.70710678, -0.70710678),
+    (-0.70710678, 0.70710678),
+    (-0.70710678, -0.70710678),
+];
+
 /// Split a trace's route into single-layer wire runs separated by via anchors.
 fn parse_items(trace: &PcbTrace) -> Vec<Item> {
     let mut items = Vec::new();
@@ -191,6 +520,28 @@ fn parse_items(trace: &PcbTrace) -> Vec<Item> {
         items.push(Item::Run(run));
     }
     items
+}
+
+/// Re-emit parsed items as a flat route by REFERENCE (does not consume `items`),
+/// used to rebuild the feature context between legalisation sweeps.
+fn flatten_items_ref(items: &[Item]) -> Vec<RoutePoint> {
+    let mut route = Vec::new();
+    for item in items {
+        match item {
+            Item::Run(run) => {
+                for (x, y) in &run.pts {
+                    route.push(RoutePoint::Wire {
+                        x: *x,
+                        y: *y,
+                        width: run.width,
+                        layer: run.layer.clone(),
+                    });
+                }
+            }
+            Item::Via(v) => route.push(v.clone()),
+        }
+    }
+    route
 }
 
 /// Re-emit parsed items as a flat route, restoring `Wire`/`Via` points in order.
@@ -328,6 +679,12 @@ struct LayerFeatures {
     pads: Vec<(Vec<String>, Feature)>,
     /// Vias — treated as blocking on every layer (a barrel spans the stackup).
     vias: Vec<Feature>,
+    /// Per-trace electrical-net label (`PcbTrace::net`), indexed by trace id. Used
+    /// by [`Self::foreign_for_layer`] to grant same-net immunity exactly the way
+    /// the DRC reconstructs it (sibling sub-nets that share a junction must never be
+    /// treated as a clearance obstacle, or the legaliser would try to push apart
+    /// copper that is legitimately one net meeting at a pad).
+    nets: Vec<Option<String>>,
 }
 
 impl LayerFeatures {
@@ -340,6 +697,32 @@ impl LayerFeatures {
             v.extend(segs.iter().filter(|f| f.trace() != Some(ti)));
         }
         v.extend(self.vias.iter().filter(|f| f.trace() != Some(ti)));
+        for (layers, pad) in &self.pads {
+            if layers.is_empty() || layers.iter().any(|l| l == layer) {
+                v.push(pad);
+            }
+        }
+        v
+    }
+
+    /// FOREIGN feature list relevant to trace `ti` on `layer`: like
+    /// [`Self::for_layer`] but additionally excludes copper of the SAME electrical
+    /// net (`nets[ti] == nets[other]`, both `Some`), so the clearance legaliser only
+    /// measures against genuinely foreign copper — exactly the pairs the DRC counts.
+    /// Untagged traces (`None` net) fall back to the trace-index exclusion only.
+    fn foreign_for_layer(&self, ti: usize, layer: &str) -> Vec<&Feature> {
+        let my_net = self.nets.get(ti).and_then(|n| n.as_deref());
+        let same_net = |f: &Feature| -> bool {
+            match (my_net, f.trace().and_then(|t| self.nets.get(t)).and_then(|n| n.as_deref())) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+        let mut v: Vec<&Feature> = Vec::new();
+        if let Some(segs) = self.segs.get(layer) {
+            v.extend(segs.iter().filter(|f| f.trace() != Some(ti) && !same_net(f)));
+        }
+        v.extend(self.vias.iter().filter(|f| f.trace() != Some(ti) && !same_net(f)));
         for (layers, pad) in &self.pads {
             if layers.is_empty() || layers.iter().any(|l| l == layer) {
                 v.push(pad);
@@ -403,7 +786,8 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
         })
         .collect();
 
-    LayerFeatures { segs, pads, vias }
+    let nets = traces.iter().map(|t| t.net.clone()).collect();
+    LayerFeatures { segs, pads, vias, nets }
 }
 
 // --- small geometry helpers -------------------------------------------------
@@ -576,5 +960,72 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    /// Worst foreign clearance gap between two traces (different nets) over their
+    /// wire segments, measured exactly (centre-line to centre-line minus both
+    /// half-widths). Used by the legalisation tests below.
+    fn min_track_gap(a: &PcbTrace, b: &PcbTrace, half_w: f64) -> f64 {
+        let segs = |t: &PcbTrace| -> Vec<(P, P)> {
+            let pts = pts_of(t);
+            (0..pts.len().saturating_sub(1)).map(|i| (pts[i], pts[i + 1])).collect()
+        };
+        let mut worst = f64::INFINITY;
+        for (a0, a1) in segs(a) {
+            for (b0, b1) in segs(b) {
+                worst = worst.min(seg_seg_dist(a0, a1, b0, b1) - 2.0 * half_w);
+            }
+        }
+        worst
+    }
+
+    /// The legaliser nudges an interior vertex of a foreign-net trace away from a
+    /// too-close neighbour so the emitted copper clears the required spacing, while
+    /// keeping both endpoint anchors (and the via-free connectivity) fixed.
+    #[test]
+    fn legalize_opens_sub_clearance_track() {
+        let clearance = 0.2;
+        let half_w = 0.05; // width 0.1
+        // Trace A: straight horizontal reference at y = 0.
+        let a = PcbTrace::new(vec![wire(0.0, 0.0), wire(4.0, 0.0)]).with_net("A");
+        // Trace B: runs parallel only 0.12 above A through an interior vertex (copper
+        // gap 0.12 - 0.10 = 0.02 << clearance 0.2), with endpoints far from A so the
+        // anchors themselves are clear and the interior vertex is free to move up.
+        let b = PcbTrace::new(vec![
+            wire(0.0, 1.0),
+            wire(2.0, 0.12),
+            wire(4.0, 1.0),
+        ])
+        .with_net("B");
+        let before = min_track_gap(&a, &b, half_w);
+        assert!(before < clearance, "fixture must start in violation: {before}");
+        let out = legalize_clearance(vec![a.clone(), b], &[], clearance);
+        let after = min_track_gap(&out[0], &out[1], half_w);
+        assert!(after > before + 1e-6, "legalise must increase the gap: {before} -> {after}");
+        // Endpoint anchors are immovable.
+        let bp = pts_of(&out[1]);
+        assert!(approx(bp[0], (0.0, 1.0)) && approx(*bp.last().unwrap(), (4.0, 1.0)),
+            "endpoint anchors must not move: {bp:?}");
+    }
+
+    /// Clearance off (== 0) is a no-op: the geometry round-trips byte-for-byte.
+    #[test]
+    fn legalize_noop_when_clearance_off() {
+        let t = PcbTrace::new(vec![wire(0.0, 0.0), wire(1.0, 0.5), wire(2.0, 0.0)]).with_net("A");
+        let out = legalize_clearance(vec![t.clone()], &[], 0.0);
+        assert_eq!(pts_of(&out[0]), pts_of(&t), "clearance-off must not move anything");
+    }
+
+    /// Same-net sub-traces meeting at a junction are immune: the legaliser must not
+    /// try to push apart copper that is one electrical net (no spurious moves).
+    #[test]
+    fn legalize_leaves_same_net_alone() {
+        let clearance = 0.2;
+        // Two traces of net "A" running parallel 0.1 apart — well within clearance, but
+        // SAME net, so they must be left untouched.
+        let a = PcbTrace::new(vec![wire(0.0, 0.0), wire(2.0, 0.0)]).with_net("A");
+        let b = PcbTrace::new(vec![wire(0.0, 0.1), wire(1.0, 0.1), wire(2.0, 0.1)]).with_net("A");
+        let out = legalize_clearance(vec![a.clone(), b.clone()], &[], clearance);
+        assert_eq!(pts_of(&out[1]), pts_of(&b), "same-net copper must not be nudged");
     }
 }

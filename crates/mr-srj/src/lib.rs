@@ -52,7 +52,7 @@ use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
 mod smooth;
-pub use smooth::beautify_traces;
+pub use smooth::{beautify_traces, legalize_clearance};
 
 /// A 2-D point in continuous tscircuit coordinates.
 ///
