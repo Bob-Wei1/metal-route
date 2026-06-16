@@ -643,7 +643,7 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     // The board's layer axis. `layer_count == 1` yields `["top"]`, so every
     // single-layer construction below collapses onto layer 0 and is byte-identical
     // to the pre-layers path.
-    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0)
+    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0, 0.0)
 }
 
 /// (B3) Rasterise with an explicit [`LayerMap`] — use this when the layer *names*
@@ -670,11 +670,18 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// (line-distance ≤ `clearance_mm` on both axes, on the endpoint's layer) of its own
 /// pad cells, so the net can still escape its own pads. `clearance_cells == 0` is a
 /// no-op: no inflation, no halo expansion.
+///
+/// `min_clearance_mm` is the caller's TRUE copper-to-copper clearance rule (the same
+/// value the DRC checks), used only to size the own-pad escape corridor's foreign-pad
+/// clip. It is passed separately from `clearance_cells` because the latter is
+/// `ceil`-rounded to the grid and can overstate the rule on coarse boards; `0.0` means
+/// "use the rounded grid clearance" (the historical behaviour).
 pub fn rasterize_with_layers(
     srj: &SimpleRouteJson,
     resolution: f64,
     layers: LayerMap,
     clearance_cells: u32,
+    min_clearance_mm: f64,
 ) -> RasterizedProblem {
     let layer_count = layers.len();
     // Non-uniform / Hanan grid: build per-axis lines through every pad endpoint and
@@ -711,6 +718,29 @@ pub fn rasterize_with_layers(
         .map_or(0.0, |w| w / 2.0);
     // Total distance every FOREIGN pad/obstacle reserves around itself.
     let block_margin_mm = clearance + track_block_mm;
+    // Foreign-pad clip margin for the own-pad ESCAPE halo (see `pad_cells_for_point`).
+    // The base grid is inflated by `block_margin_mm`, but `clearance_cells` is a
+    // `ceil`-rounded count so on coarse grids `clearance` (and hence `block_margin_mm`)
+    // can exceed the rule the DRC actually enforces — clipping the escape corridor by
+    // that inflated value needlessly strands nets. The corridor only has to keep a
+    // centred track's copper `min_clearance` from a foreign pad edge, i.e. the TRUE
+    // geometric `min_clearance + track_w/2`. Prefer the declared `min_clearance`
+    // (what the DRC checks); fall back to the rounded `clearance` when the problem
+    // states none, and never exceed `block_margin_mm`. Zero when nothing is reserved.
+    let foreign_margin_mm = if block_margin_mm > 0.0 {
+        // The DRC enforces the caller's true `min_clearance_mm` (e.g. a default when the
+        // problem omits one — which `clearance_cells` already `ceil`-rounded away). Fall
+        // back to `srj.min_clearance` then the rounded `clearance`, and never exceed
+        // `block_margin_mm` (the base-grid inflation the corridor lives in).
+        let true_clearance = if min_clearance_mm > 0.0 {
+            min_clearance_mm
+        } else {
+            srj.min_clearance.filter(|c| *c > 0.0).unwrap_or(clearance)
+        };
+        true_clearance.min(clearance) + track_block_mm
+    } else {
+        0.0
+    };
     let (x_lines, y_lines) = build_grid_lines(srj, layer_count, track_w, clearance);
     let mapping = Mapping::from_lines(x_lines, y_lines, layer_count);
     let mut builder = GridBuilder::new(mapping.dims, 1);
@@ -799,6 +829,7 @@ pub fn rasterize_with_layers(
         &srj.obstacles,
         &layers,
         block_margin_mm,
+        foreign_margin_mm,
     );
 
     RasterizedProblem {
@@ -848,12 +879,21 @@ fn obstacle_layers(obs: &Obstacle, layers: &LayerMap) -> Vec<u32> {
 /// [`mr_grid::GridBuilder::inflate_clearance`]'s mm-based halo — so the net can still
 /// reach and escape its own pad through the inflated clearance halo that now
 /// surrounds it. `clearance_mm <= 0` leaves the set unchanged.
+///
+/// `foreign_margin_mm` is the band by which a FOREIGN pad reserves the escape
+/// corridor: an expanded-halo cell within `foreign_margin_mm` of a foreign pad rect
+/// (but outside the net's OWN pad) is clipped, since a centred track there would
+/// drive copper within clearance of that pad. It is the true geometric rule
+/// (`min_clearance + track_w/2`), which can be smaller than `clearance_mm` (the
+/// `ceil`-rounded base-grid inflation) on coarse grids — clipping by the smaller,
+/// exact value reclaims escape room without admitting a real short.
 fn pad_cells_for_point(
     point: (f64, f64),
     layer: u32,
     mapping: &Mapping,
     obstacles: &[Obstacle],
     clearance_mm: f64,
+    foreign_margin_mm: f64,
 ) -> Vec<CellIdx> {
     let (px, py) = point;
     // Pad cells as (x, y) on this endpoint's layer; we inflate these planar coords
@@ -898,15 +938,29 @@ fn pad_cells_for_point(
     // above into `planar`) are always kept; only the *expanded* halo ring is clipped.
     // A cell at line position `(lx, ly)` is foreign-blocked iff it lies inside some
     // obstacle rect that does not also contain `(px, py)`.
+    // Foreign-pad reservation margin: a routable node may host the centre of a
+    // `track_w`-wide trace, so to keep that trace's copper `clearance` from a foreign
+    // pad EDGE the node must sit `clearance + track_w/2` (== `clearance_mm`, the same
+    // value `inflate_clearance` grows obstacles by) outside the foreign rect. The
+    // original clip rejected only the bare rect, so the own-pad escape halo could
+    // still unmask a cell sitting inside a NEIGHBOURING pad's clearance band — the
+    // dominant source of routed-segment-vs-foreign-pad shorts on tight-pitch boards.
+    // Inflating the foreign test by the margin closes that leak at the source.
+    let margin = foreign_margin_mm.max(0.0);
     let foreign_blocks = |lx: f64, ly: f64| -> bool {
         obstacles.iter().any(|obs| {
-            let min_x = obs.center.x - obs.width / 2.0;
-            let max_x = obs.center.x + obs.width / 2.0;
-            let min_y = obs.center.y - obs.height / 2.0;
-            let max_y = obs.center.y + obs.height / 2.0;
+            let min_x = obs.center.x - obs.width / 2.0 - margin;
+            let max_x = obs.center.x + obs.width / 2.0 + margin;
+            let min_y = obs.center.y - obs.height / 2.0 - margin;
+            let max_y = obs.center.y + obs.height / 2.0 + margin;
             let in_this = lx >= min_x && lx <= max_x && ly >= min_y && ly <= max_y;
-            // Foreign iff this cell is inside the rect but the endpoint is not.
-            let owns = px >= min_x && px <= max_x && py >= min_y && py <= max_y;
+            // Foreign iff this (inflated) band contains the cell but not the endpoint's
+            // OWN pad — measured against the bare rect so a net is never deemed to own a
+            // foreign pad merely because it sits within that pad's clearance band.
+            let owns = px >= obs.center.x - obs.width / 2.0
+                && px <= obs.center.x + obs.width / 2.0
+                && py >= obs.center.y - obs.height / 2.0
+                && py <= obs.center.y + obs.height / 2.0;
             in_this && !owns
         })
     };
@@ -997,6 +1051,7 @@ fn decompose_connections(
     obstacles: &[Obstacle],
     layers: &LayerMap,
     clearance_mm: f64,
+    foreign_margin_mm: f64,
 ) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
@@ -1035,6 +1090,7 @@ fn decompose_connections(
                 mapping,
                 obstacles,
                 clearance_mm,
+                foreign_margin_mm,
             );
             passable_pads.extend(pad_cells_for_point(
                 (win[1].x, win[1].y),
@@ -1042,6 +1098,7 @@ fn decompose_connections(
                 mapping,
                 obstacles,
                 clearance_mm,
+                foreign_margin_mm,
             ));
             passable_pads.sort_unstable();
             passable_pads.dedup();
@@ -2103,7 +2160,7 @@ mod tests {
     #[test]
     fn rasterize_pad_clearance_reserves_halo_and_unmasks_own() {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
-        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1);
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 1, 0.0);
         let d = prob.mapping.dims;
         let clearance = 1.0_f64; // clearance_cells (1) · resolution (1.0)
 
@@ -2166,7 +2223,7 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(CLEARANCE_SRJ).unwrap();
         // `rasterize` (no clearance) and `rasterize_with_layers(.., 0)` must agree.
         let baseline = rasterize(&srj, 1.0);
-        let zero = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 0);
+        let zero = rasterize_with_layers(&srj, 1.0, LayerMap::standard(1), 0, 0.0);
 
         assert_eq!(
             baseline.grid.cost, zero.grid.cost,
@@ -2251,7 +2308,7 @@ mod tests {
         let track_w = 0.3_f64;
         let margin = clearance + track_w / 2.0; // 0.25 — the track-centreline rule
         let clearance_cells = (clearance / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells);
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0);
         let d = prob.mapping.dims;
 
         // Each pad's copper rect (continuous).
@@ -2327,7 +2384,7 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(TRACK_GT_CLEARANCE_SRJ).unwrap();
         let resolution = 0.05;
         let clearance_cells = (0.1_f64 / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells);
+        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0);
         let d = prob.mapping.dims;
         let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
         let (ax, ay) = prob.mapping.point_to_xy((2.0, 2.0));

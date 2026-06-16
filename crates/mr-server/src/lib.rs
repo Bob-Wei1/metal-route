@@ -188,6 +188,7 @@ async fn solve(
         resolution,
         LayerMap::standard(effective_layers),
         clearance_cells,
+        clearance_mm,
     );
 
     // The rasteriser built a non-uniform (Hanan) grid; hand the router the same
