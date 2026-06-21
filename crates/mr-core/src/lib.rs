@@ -492,6 +492,94 @@ impl BoardRoute {
     }
 }
 
+/// A replayable trace of what the negotiated router did while routing a board,
+/// for step-by-step animation in the visualiser webapp.
+///
+/// It is produced ONLY by `mr_cpu::NegotiatedRouter::route_traced`; the normal
+/// `Router::route` path builds nothing and stays byte-identical. Every cell is a
+/// [`CellIdx`] into [`RouteTrace::dims`] — the client maps cells to continuous
+/// coordinates itself using the board's Hanan line arrays (which the server ships
+/// alongside this trace), so the router never has to serialise geometry.
+///
+/// This type lives in `mr-core` (not `mr-cpu`) deliberately: it crosses the
+/// router→server boundary like [`BoardRoute`], references the same [`CellIdx`] /
+/// [`Dims`] contract types, and keeps `mr-cpu` free of a serde dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTrace {
+    /// The grid the trace is addressed against (same `dims` as the routed grid).
+    pub dims: Dims,
+    /// Per-net static metadata, indexed by net index (aligned with the input
+    /// `nets` slice). `len() == number of nets`.
+    pub nets: Vec<TracedNet>,
+    /// Number of distinct connection groups the router formed.
+    pub n_groups: usize,
+    /// One entry per negotiation iteration that was recorded (`<= MAX_ITERS`;
+    /// unchanged iterations may be pruned). Each is a frame the client renders.
+    pub iterations: Vec<IterSnapshot>,
+    /// The legalization phase result. `None` only if the router errored before
+    /// reaching it (which surfaces as `Err` from `route_traced`, so in practice
+    /// this is always `Some` on success).
+    pub legalization: Option<LegalizationTrace>,
+}
+
+/// Static per-net information for the trace: identity, endpoints, group, and the
+/// net's "alone path" (routed by itself on the empty grid) for an ideal-route /
+/// ratsnest overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracedNet {
+    pub net: String,
+    pub src: CellIdx,
+    pub dst: CellIdx,
+    /// Connection-group id (nets sharing a group may legally share copper).
+    pub group: u32,
+    /// The path this net takes alone on the base grid (no other nets present);
+    /// empty when the net is individually unroutable. Computed once during
+    /// legalization.
+    pub alone_path: Vec<CellIdx>,
+}
+
+/// One negotiation-iteration boundary: the routed state at the end of an iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IterSnapshot {
+    /// Zero-based iteration index.
+    pub iter: u32,
+    /// The present-penalty factor for this iteration (`== 1 + iter`): congestion
+    /// sharing gets steadily more expensive as this grows.
+    pub pfac: u32,
+    /// Current routed path per net (empty == unrouted this iteration), indexed by
+    /// net index. This is the frame's geometry.
+    pub paths: Vec<Vec<CellIdx>>,
+    /// Cells over-used (occupied by >=2 distinct groups) at the end of this
+    /// iteration — the cells whose history was just bumped, i.e. the hot spots the
+    /// negotiation is trying to relieve.
+    pub overused_cells: Vec<CellIdx>,
+    /// `false` on the final iteration (converged: cell-disjoint across groups).
+    pub any_overuse: bool,
+}
+
+/// The legalization phase: the group order chosen, what each candidate order
+/// achieved, and the final committed per-net result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegalizationTrace {
+    /// The group order (a permutation of `0..n_groups`) the multi-order pass
+    /// selected as best.
+    pub chosen_order: Vec<usize>,
+    /// Per-candidate-order evaluation, in candidate order: how many nets each
+    /// order routed and its total unit cost. Lets the client show "the router
+    /// tried these orders and kept this one".
+    pub candidates: Vec<CandidateEval>,
+    /// Final committed path per net (`None` == dropped/unrouted), indexed by net.
+    pub committed: Vec<Option<Vec<CellIdx>>>,
+}
+
+/// One candidate group-order's legalization outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateEval {
+    pub order: Vec<usize>,
+    pub routed: usize,
+    pub total_cost: Cost,
+}
+
 /// The deterministic tie-break shared by every router so CPU and GPU agree.
 ///
 /// A parallel prefix-min does NOT preserve a sequential tie-break for free

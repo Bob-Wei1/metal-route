@@ -33,5 +33,8 @@ pub mod sweep;
 pub use astar::AStarRouter;
 pub use lee::LeeRouter;
 pub use negotiated::{NegotiatedRouter, MAX_ITERS, SCALE};
+// Re-export the trace contract types (defined in `mr-core`) so callers of
+// `NegotiatedRouter::route_traced` get them from one place.
+pub use mr_core::{CandidateEval, IterSnapshot, LegalizationTrace, RouteTrace, TracedNet};
 pub use ripup::{RipUpRouter, MAX_PASSES};
 pub use sweep::{bfs_distance_field, sweep_distance_field};
