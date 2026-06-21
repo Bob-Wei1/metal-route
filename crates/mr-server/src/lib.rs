@@ -33,18 +33,23 @@
 //! which Lee/rip-up handle comfortably while still resolving fixture-scale pad
 //! pitches.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Path as AxumPath, State},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router as AxumRouter,
 };
-use mr_core::{GridCoords, LayerMap, Router, RouterError};
-use mr_srj::{rasterize_with_layers, to_solution_layered, PcbTrace, SimpleRouteJson};
+use mr_core::{GridCoords, LayerMap, RouteTrace, Router, RouterError};
+use mr_cpu::NegotiatedRouter;
+use mr_srj::{
+    rasterize_with_layers, to_solution_layered, Bounds, PcbTrace, RasterizedProblem, SimpleRouteJson,
+};
 use serde::{Deserialize, Serialize};
+use tower_http::{cors::CorsLayer, services::ServeDir};
 
 /// Target number of grid cells along the longer bounds span when deriving a
 /// default resolution. See the module-level "Resolution policy" docs.
@@ -92,6 +97,9 @@ struct AppState {
     /// traces keep a real gap rather than merely not overlapping); `Some(mm)` =
     /// a fixed budget, with `Some(0.0)` disabling clearance entirely.
     clearance_mm: Option<f64>,
+    /// Root directory of the board corpus, scanned by the `/api/boards*` routes.
+    /// Boards live at `<corpus_dir>/<corpus>/<name>.srj.json`.
+    corpus_dir: PathBuf,
 }
 
 /// Request body for `POST /solve`.
@@ -151,33 +159,40 @@ pub fn choose_resolution(srj: &SimpleRouteJson, override_res: Option<f64>) -> f6
     res
 }
 
-/// `POST /solve` handler.
-async fn solve(
-    State(state): State<AppState>,
-    body: Result<Json<SolveRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Json(req) = match body {
-        Ok(j) => j,
-        Err(rej) => return bad_request(format!("invalid request body: {rej}")),
-    };
+/// The rasterised problem plus the derived geometry/policy values both the `/solve`
+/// and `/api/trace` handlers need. Produced by [`prepare`] so the two routes share
+/// one identical rasterisation + clearance pipeline.
+struct Prepared {
+    problem: RasterizedProblem,
+    /// The non-uniform (Hanan) grid line arrays, handed to the router so its
+    /// geometric cost + heuristic match the actual cell spacing.
+    coords: GridCoords,
+    /// Effective clearance budget in continuous units (after policy + override).
+    clearance_mm: f64,
+    /// Emitted wire width in continuous units.
+    trace_width: f64,
+}
 
-    let srj = &req.simple_route_json;
-    let resolution = choose_resolution(srj, req.resolution);
-    // Route on at least `solve_layers` layers, never fewer than the declared
-    // stackup. The extra layers give the negotiated router somewhere to send a
-    // crossing via a through-via; single-net problems never take a via and stay
-    // byte-identical to the single-layer path.
-    let effective_layers = srj.layer_count.max(state.solve_layers);
-    // Clearance budget (continuous units): explicit override, else auto = the larger
-    // of the problem's declared min-clearance and one trace width. Converted to a cell
-    // halo radius `ceil(mm / resolution)`, fed to BOTH the rasteriser (inflates foreign
-    // pads + their halo) AND the router (prices a clearance halo around every net), so
-    // traces keep a real gap from each other and from foreign pads. `0` => off (the
-    // harness only checks overlap, so off maximises the benchmark score).
-    let trace_w = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
-    let clearance_mm = state
-        .clearance_mm
-        .unwrap_or_else(|| srj.min_clearance.unwrap_or(0.0).max(trace_w));
+/// Shared rasterise-and-policy step for `/solve` and `/api/trace`.
+///
+/// Chooses the resolution, layer budget (`max(layerCount, solve_layers)`), and
+/// clearance budget (explicit `clearance_policy` override, else auto = the larger of
+/// the problem's declared min-clearance and one trace width), then rasterises into a
+/// non-uniform Hanan grid and builds the matching [`GridCoords`].
+fn prepare(
+    srj: &SimpleRouteJson,
+    override_res: Option<f64>,
+    solve_layers: u32,
+    clearance_policy: Option<f64>,
+) -> Prepared {
+    let resolution = choose_resolution(srj, override_res);
+    let effective_layers = srj.layer_count.max(solve_layers);
+    let trace_width = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
+    let clearance_mm =
+        clearance_policy.unwrap_or_else(|| srj.min_clearance.unwrap_or(0.0).max(trace_width));
+    // Convert the clearance to a cell halo radius `ceil(mm / resolution)`, fed to BOTH
+    // the rasteriser (inflates foreign pads + their halo) AND the router (prices a
+    // clearance halo around every net). `0` => off.
     let clearance_cells = if clearance_mm > 0.0 && resolution > 0.0 {
         (clearance_mm / resolution).ceil() as u32
     } else {
@@ -189,35 +204,55 @@ async fn solve(
         LayerMap::standard(effective_layers),
         clearance_cells,
         clearance_mm,
-        // D2 (via-class foreign-pad reservation) is threaded from the CLI/corpus path
-        // where `VIA_PAD_MM` lives; this server crate carries no via-pad constant and
-        // its generic `make_router` may use a different via geometry, so we pass 0.0
-        // (reservation off) rather than hardcode a duplicate diameter here.
+        // D2 (via-class foreign-pad reservation) is off here (no via-pad constant in
+        // this crate); matches the historical `/solve` behaviour.
         0.0,
     );
-
-    // The rasteriser built a non-uniform (Hanan) grid; hand the router the same
-    // line arrays so its geometric cost + heuristic match the actual cell spacing.
     let coords = GridCoords::from_lines(
         problem.mapping.x_lines.clone(),
         problem.mapping.y_lines.clone(),
     );
-    let router = (state.make_router)(clearance_mm, coords);
-    let board = match router.route(&problem.grid, &problem.nets) {
+    Prepared {
+        problem,
+        coords,
+        clearance_mm,
+        trace_width,
+    }
+}
+
+/// The ordered layer names of an effective stackup (`["top", "bottom", ...]`).
+fn layer_names(layers: &LayerMap) -> Vec<String> {
+    (0..layers.len()).map(|i| layers.name(i).to_string()).collect()
+}
+
+/// `POST /solve` handler.
+async fn solve(
+    State(state): State<AppState>,
+    body: Result<Json<SolveRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return bad_request(format!("invalid request body: {rej}")),
+    };
+
+    let prep = prepare(
+        &req.simple_route_json,
+        req.resolution,
+        state.solve_layers,
+        state.clearance_mm,
+    );
+    let router = (state.make_router)(prep.clearance_mm, prep.coords.clone());
+    let board = match router.route(&prep.problem.grid, &prep.problem.nets) {
         Ok(b) => b,
         Err(e) => return router_error_response(e),
     };
 
-    let trace_width = req
-        .simple_route_json
-        .min_trace_width
-        .unwrap_or(DEFAULT_TRACE_WIDTH);
     let solution_soup = to_solution_layered(
         &board,
-        &problem.mapping,
-        &problem.pin_points,
-        trace_width,
-        &problem.layers,
+        &prep.problem.mapping,
+        &prep.problem.pin_points,
+        prep.trace_width,
+        &prep.problem.layers,
     );
     (StatusCode::OK, Json(SolveResponse { solution_soup })).into_response()
 }
@@ -253,40 +288,277 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Build the axum application wired to `/solve` and `/health`, backed by
-/// `make_router`, routing on `solve_layers` layers (never fewer than a problem's
-/// declared `layerCount`), and applying the `clearance_mm` budget (`None` = auto:
-/// one trace width; `Some(0.0)` = clearance off).
-pub fn app(make_router: RouterFactory, solve_layers: u32, clearance_mm: Option<f64>) -> AxumRouter {
+// ---------------------------------------------------------------------------
+// Visualiser API: list corpus boards, fetch a board, and produce a route trace.
+// ---------------------------------------------------------------------------
+
+/// One corpus board in the `/api/boards` listing.
+#[derive(Debug, Serialize)]
+struct BoardInfo {
+    /// Stable id `"<corpus>/<name>"`, e.g. `"bug-reports/bugreport01-be84eb"`.
+    id: String,
+    /// Sub-corpus directory name, e.g. `"bug-reports"` or `"srj15"`.
+    corpus: String,
+    /// Board file stem (without the `.srj.json` suffix).
+    name: String,
+    /// Number of connections (nets) declared in the board.
+    net_count: usize,
+}
+
+/// `GET /api/boards` — scan the corpus directory for `*.srj.json` boards.
+async fn list_boards(State(state): State<AppState>) -> Response {
+    match scan_boards(&state.corpus_dir) {
+        Ok(mut boards) => {
+            boards.sort_by(|a, b| a.id.cmp(&b.id));
+            (StatusCode::OK, Json(boards)).into_response()
+        }
+        Err(e) => internal_error(format!("cannot scan corpus: {e}")),
+    }
+}
+
+/// Walk `<corpus_dir>/<sub>/*.srj.json` one level deep and summarise each board.
+fn scan_boards(corpus_dir: &Path) -> std::io::Result<Vec<BoardInfo>> {
+    let mut out = Vec::new();
+    for sub in std::fs::read_dir(corpus_dir)? {
+        let sub = sub?;
+        if !sub.file_type()?.is_dir() {
+            continue;
+        }
+        let corpus = sub.file_name().to_string_lossy().into_owned();
+        for entry in std::fs::read_dir(sub.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = fname.strip_suffix(".srj.json") else {
+                continue;
+            };
+            // Parse to count nets; skip files that don't parse as a board.
+            let net_count = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<SimpleRouteJson>(&s).ok())
+                .map(|srj| srj.connections.len())
+                .unwrap_or(0);
+            out.push(BoardInfo {
+                id: format!("{corpus}/{name}"),
+                corpus: corpus.clone(),
+                name: name.to_string(),
+                net_count,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a board id (`"<corpus>/<name>"`) to its file and read it verbatim.
+/// Rejects ids containing `..` or absolute components to prevent path traversal.
+fn board_path(corpus_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    if id.is_empty() || id.contains("..") || id.starts_with('/') {
+        return Err(format!("invalid board id: {id:?}"));
+    }
+    Ok(corpus_dir.join(format!("{id}.srj.json")))
+}
+
+/// `GET /api/boards/*id` — return a board's raw SimpleRouteJson (so the client
+/// renders obstacles/pads/bounds from the original tscircuit fields verbatim).
+async fn get_board(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    let path = match board_path(&state.corpus_dir, &id) {
+        Ok(p) => p,
+        Err(e) => return bad_request(e),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => not_found(format!("board not found: {id}")),
+    }
+}
+
+/// Request body for `POST /api/trace`. Supply either a `board_id` (loaded from the
+/// corpus) or an inline `simple_route_json`. Optional `resolution`, `layers`, and
+/// `clearance` override the server defaults for this one request.
+#[derive(Debug, Deserialize)]
+struct TraceRequest {
+    #[serde(default)]
+    board_id: Option<String>,
+    #[serde(default)]
+    simple_route_json: Option<SimpleRouteJson>,
+    #[serde(default)]
+    resolution: Option<f64>,
+    #[serde(default)]
+    layers: Option<u32>,
+    #[serde(default)]
+    clearance: Option<f64>,
+}
+
+/// Continuous (mm) positions of the grid lines — the client maps `CellIdx` → (x, y)
+/// with these plus `trace.dims`.
+#[derive(Debug, Serialize)]
+struct CoordsDto {
+    x_lines: Vec<f64>,
+    y_lines: Vec<f64>,
+}
+
+/// Successful `POST /api/trace` response: the replayable trace plus everything the
+/// client needs to render it in continuous coordinates.
+#[derive(Debug, Serialize)]
+struct TraceResponse {
+    trace: RouteTrace,
+    coords: CoordsDto,
+    /// Ordered copper layer names the trace's cells are addressed against.
+    layers: Vec<String>,
+    /// The board's continuous bounds (for the initial viewport).
+    bounds: Bounds,
+    /// The final routed result in tscircuit solution-soup form.
+    solution: Vec<PcbTrace>,
+}
+
+/// `POST /api/trace` — route a board and return a step-by-step [`RouteTrace`].
+async fn trace(
+    State(state): State<AppState>,
+    body: Result<Json<TraceRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => return bad_request(format!("invalid request body: {rej}")),
+    };
+
+    // Resolve the problem: inline json wins, else load by board id.
+    let srj = match (req.simple_route_json, req.board_id.as_deref()) {
+        (Some(s), _) => s,
+        (None, Some(id)) => {
+            let path = match board_path(&state.corpus_dir, id) {
+                Ok(p) => p,
+                Err(e) => return bad_request(e),
+            };
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<SimpleRouteJson>(&s).ok())
+            {
+                Some(s) => s,
+                None => return not_found(format!("board not found or invalid: {id}")),
+            }
+        }
+        (None, None) => {
+            return bad_request("trace requires `board_id` or `simple_route_json`".to_string())
+        }
+    };
+
+    let solve_layers = req.layers.map(|l| l.max(1)).unwrap_or(state.solve_layers);
+    // Per-request clearance override, else the server policy.
+    let clearance_policy = match req.clearance {
+        Some(c) => Some(c),
+        None => state.clearance_mm,
+    };
+    let prep = prepare(&srj, req.resolution, solve_layers, clearance_policy);
+
+    // The trace requires the concrete `NegotiatedRouter` (the generic `make_router`
+    // factory only yields the `Router` trait, which has no `route_traced`). Build one
+    // mirroring `main.rs`'s factory: clearance budget + the problem's Hanan coords.
+    let router = NegotiatedRouter::new()
+        .with_clearance_mm(prep.clearance_mm)
+        .with_coords(prep.coords.clone());
+    let (board, trace) = match router.route_traced(&prep.problem.grid, &prep.problem.nets) {
+        Ok(bt) => bt,
+        Err(e) => return router_error_response(e),
+    };
+
+    let solution = to_solution_layered(
+        &board,
+        &prep.problem.mapping,
+        &prep.problem.pin_points,
+        prep.trace_width,
+        &prep.problem.layers,
+    );
+    let resp = TraceResponse {
+        trace,
+        coords: CoordsDto {
+            x_lines: prep.problem.mapping.x_lines.clone(),
+            y_lines: prep.problem.mapping.y_lines.clone(),
+        },
+        layers: layer_names(&prep.problem.layers),
+        bounds: srj.bounds,
+        solution,
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Build a `404 Not Found` JSON response.
+fn not_found(msg: String) -> Response {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse { error: msg })).into_response()
+}
+
+/// Build a `500 Internal Server Error` JSON response.
+fn internal_error(msg: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: msg }),
+    )
+        .into_response()
+}
+
+/// Build the axum application.
+///
+/// Wires the tscircuit solver (`/solve`, `/health`), the visualiser API
+/// (`/api/boards`, `/api/boards/*id`, `/api/trace`) backed by `corpus_dir`, and a
+/// static-file fallback serving the built SPA from `web_dir` (any non-API path).
+/// `make_router` backs `/solve`; the trace route builds its own `NegotiatedRouter`.
+/// Routes on `solve_layers` layers (never fewer than a problem's declared
+/// `layerCount`) and applies the `clearance_mm` budget (`None` = auto: one trace
+/// width; `Some(0.0)` = clearance off). CORS is permissive so a separate Vite dev
+/// server can call the API.
+pub fn app(
+    make_router: RouterFactory,
+    solve_layers: u32,
+    clearance_mm: Option<f64>,
+    corpus_dir: PathBuf,
+    web_dir: PathBuf,
+) -> AxumRouter {
     let state = AppState {
         make_router,
         solve_layers: solve_layers.max(1),
         clearance_mm,
+        corpus_dir,
     };
     AxumRouter::new()
         .route("/health", get(health))
         .route("/solve", post(solve))
+        .route("/api/boards", get(list_boards))
+        .route("/api/boards/*id", get(get_board))
+        .route("/api/trace", post(trace))
         .with_state(state)
+        .layer(CorsLayer::permissive())
+        // Serve the built SPA for any unmatched (non-API) path. A missing `web_dir`
+        // simply 404s, so the API still works before the frontend is built.
+        .fallback_service(ServeDir::new(web_dir))
 }
 
-/// Bind `addr` and serve the solver until shutdown, building backends via
-/// `make_router` and applying the `solve_layers` + `clearance_mm` policy.
+/// Bind `addr` and serve until shutdown, building backends via `make_router` and
+/// applying the `solve_layers` + `clearance_mm` policy, scanning `corpus_dir` for
+/// boards and serving the SPA from `web_dir`.
 pub async fn serve(
     addr: std::net::SocketAddr,
     make_router: RouterFactory,
     solve_layers: u32,
     clearance_mm: Option<f64>,
+    corpus_dir: PathBuf,
+    web_dir: PathBuf,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(make_router, solve_layers, clearance_mm)).await
+    axum::serve(
+        listener,
+        app(make_router, solve_layers, clearance_mm, corpus_dir, web_dir),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
-    use mr_cpu::NegotiatedRouter;
-    use tower::ServiceExt; // for `oneshot`
+    use tower::ServiceExt; // for `oneshot` (NegotiatedRouter comes from `super::*`)
 
     const SAMPLE: &str = r#"{
         "simple_route_json": {
@@ -315,9 +587,16 @@ mod tests {
     }
 
     /// App wired to the test router at the default solve-layer budget, clearance
-    /// off (fast + deterministic for the shape assertions below).
+    /// off (fast + deterministic for the shape assertions below). The corpus / web
+    /// dirs are placeholders the `/solve` + `/health` tests never touch.
     fn test_app() -> AxumRouter {
-        app(test_factory(), DEFAULT_SOLVE_LAYERS, Some(0.0))
+        app(
+            test_factory(),
+            DEFAULT_SOLVE_LAYERS,
+            Some(0.0),
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        )
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {

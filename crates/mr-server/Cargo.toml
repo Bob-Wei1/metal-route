@@ -15,6 +15,7 @@ mr-srj = { workspace = true }
 mr-cpu = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -45,8 +45,8 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use mr_core::{
-    BoardRoute, CellIdx, Cost, Grid, GridCoords, NetEndpoints, RouteResult, Router, RouterError,
-    ViaModel, OBSTACLE,
+    BoardRoute, CandidateEval, CellIdx, Cost, Grid, GridCoords, IterSnapshot, LegalizationTrace,
+    NetEndpoints, RouteResult, RouteTrace, Router, RouterError, TracedNet, ViaModel, OBSTACLE,
 };
 
 use crate::dijkstra::{astar_buf, edge_cost, SearchBuf, COST_SCALE};
@@ -386,8 +386,21 @@ fn axis_leg_cost(lines: &[f64], i: u32, j: u32) -> Cost {
     total
 }
 
-impl Router for NegotiatedRouter {
-    fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
+impl NegotiatedRouter {
+    /// Route a board, optionally recording a [`RouteTrace`] for the visualiser.
+    ///
+    /// When `recorder` is `None` this is the production route and is BYTE-IDENTICAL
+    /// to the historical behaviour: every capture point below only *reads* loop
+    /// state (it never feeds a value back into the search), and all captures run on
+    /// the main thread between the rayon parallel sections, so the hot A* search is
+    /// never touched. The trait [`Router::route`] calls this with `None`;
+    /// [`NegotiatedRouter::route_traced`] calls it with `Some`.
+    fn route_impl(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        mut recorder: Option<&mut RouteTrace>,
+    ) -> Result<BoardRoute, RouterError> {
         if !grid.is_well_formed() {
             return Err(RouterError::MalformedGrid);
         }
@@ -503,6 +516,25 @@ impl Router for NegotiatedRouter {
                 let next = root_to_g.len();
                 group_ids[i] = *root_to_g.entry(r).or_insert(next);
             }
+        }
+
+        // TRACE: static board + per-net metadata, now that grouping is known. The
+        // per-net `alone_path` is filled later (during legalization). No-op for the
+        // production route (`recorder` is `None`).
+        if let Some(rec) = &mut recorder {
+            rec.dims = dims;
+            rec.n_groups = group_ids.iter().map(|&g| g + 1).max().unwrap_or(0);
+            rec.nets = nets
+                .iter()
+                .zip(group_ids.iter())
+                .map(|(net, &group)| TracedNet {
+                    net: net.net.clone(),
+                    src: net.src,
+                    dst: net.dst,
+                    group: group as u32,
+                    alone_path: Vec::new(),
+                })
+                .collect();
         }
 
         // Persistent congestion state.
@@ -869,6 +901,20 @@ impl Router for NegotiatedRouter {
                 history[c as usize] = history[c as usize].saturating_add(SCALE);
             }
 
+            // TRACE: snapshot this iteration's settled state. Taken HERE — after the
+            // overuse scan + history bump, but BEFORE the `incremental` block below
+            // `mem::swap`s `overused_cells` out — so `overused_cells` still holds this
+            // iteration's set. A read-only clone; it does not touch any loop state.
+            if let Some(rec) = &mut recorder {
+                rec.iterations.push(IterSnapshot {
+                    iter,
+                    pfac,
+                    paths: paths.clone(),
+                    overused_cells: overused_cells.clone(),
+                    any_overuse,
+                });
+            }
+
             // Clear the per-iteration scratch for the cells we touched (O(touched),
             // not O(all cells)): `first_group` via the path cells, `overused` via
             // the over-used list.
@@ -1072,6 +1118,20 @@ impl Router for NegotiatedRouter {
                 best_idx = Some(*idx);
             }
         }
+        // TRACE: capture every candidate order's (routed, cost) BEFORE `evaluated` is
+        // consumed by the `best_idx` match below. Sorted by candidate index so the
+        // list is deterministic and aligns with `candidates`. Read-only.
+        let traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
+            let mut idxs: Vec<&(usize, usize, Cost, Committed)> = evaluated.iter().collect();
+            idxs.sort_unstable_by_key(|(idx, _, _, _)| *idx);
+            idxs.into_iter()
+                .map(|(idx, routed, total_cost, _)| CandidateEval {
+                    order: candidates[*idx].clone(),
+                    routed: *routed,
+                    total_cost: *total_cost,
+                })
+                .collect()
+        });
         let (best_routed, best_order, multi_committed) = match best_idx {
             Some(idx) => {
                 let routed = best.as_ref().map(|b| b.0).unwrap_or(0);
@@ -1122,6 +1182,21 @@ impl Router for NegotiatedRouter {
         } else {
             multi_committed
         };
+        // TRACE: legalization result — the per-net alone paths (ratsnest / ideal
+        // overlay), the chosen group order, every candidate order's score, and the
+        // final committed routes. No-op for the production route.
+        if let Some(rec) = &mut recorder {
+            for (i, ap) in alone_path.iter().enumerate() {
+                if let Some(tn) = rec.nets.get_mut(i) {
+                    tn.alone_path = ap.clone();
+                }
+            }
+            rec.legalization = Some(LegalizationTrace {
+                chosen_order: best_order.clone(),
+                candidates: traced_candidates.unwrap_or_default(),
+                committed: committed.clone(),
+            });
+        }
         // Assemble in input net order for determinism. Carry the router's actual
         // electrical-net group id alongside each routed net (aligned 1:1 with
         // `results`) so downstream DRC can grant same-net copper the exact same
@@ -1150,6 +1225,37 @@ impl Router for NegotiatedRouter {
             congestion,
             groups,
         })
+    }
+
+    /// Route a board and additionally return a [`RouteTrace`] recording each
+    /// negotiation iteration and the legalization phase, for step-by-step animation
+    /// in the visualiser. The returned [`BoardRoute`] is identical to what
+    /// [`Router::route`] would produce for the same inputs (the recorder only reads
+    /// loop state); only the extra trace is the difference.
+    pub fn route_traced(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+    ) -> Result<(BoardRoute, RouteTrace), RouterError> {
+        // Construct the trace explicitly with the real `dims` (it has no meaningful
+        // `Default`); the capture points fill the rest.
+        let mut trace = RouteTrace {
+            dims: grid.dims,
+            nets: Vec::new(),
+            n_groups: 0,
+            iterations: Vec::new(),
+            legalization: None,
+        };
+        let board = self.route_impl(grid, nets, Some(&mut trace))?;
+        Ok((board, trace))
+    }
+}
+
+impl Router for NegotiatedRouter {
+    /// The production route: delegates to [`NegotiatedRouter::route_impl`] with no
+    /// recorder, so it is byte-identical to the historical behaviour.
+    fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
+        self.route_impl(grid, nets, None)
     }
 }
 
@@ -3305,5 +3411,102 @@ mod tests {
             lines.push(acc);
         }
         lines
+    }
+
+    /// The load-bearing instrumentation invariant: enabling the trace recorder must
+    /// NOT change routing. `route` and `route_traced().0` must produce an IDENTICAL
+    /// `BoardRoute` on every fixture (single-net battery + multi-net contention
+    /// cases), and the trace must be internally consistent with that result.
+    #[test]
+    fn route_traced_matches_route_byte_for_byte() {
+        // Build a battery: the shared single-net fixtures plus multi-net cases that
+        // actually exercise the negotiation loop AND legalization.
+        let mut cases: Vec<(String, Grid, Vec<NetEndpoints>)> = Vec::new();
+        for f in mr_fixtures::obstacle_battery() {
+            cases.push((f.name.to_string(), f.grid, f.nets));
+        }
+        {
+            // Crossing nets (negotiation must separate them).
+            let dims = Dims::new(5, 5);
+            let grid = GridBuilder::new(dims, 1).build();
+            cases.push((
+                "crossing".into(),
+                grid,
+                vec![
+                    net("a", dims.idx(2, 1), dims.idx(2, 3)),
+                    net("b", dims.idx(1, 2), dims.idx(3, 2)),
+                ],
+            ));
+        }
+        {
+            // Three nets, one foreign — exercises grouping + multi-order legalization.
+            let dims = Dims::new(8, 8);
+            let grid = GridBuilder::new(dims, 1).build();
+            cases.push((
+                "grouped".into(),
+                grid,
+                vec![
+                    net("g#0", dims.idx(0, 0), dims.idx(7, 0)),
+                    net("g#1", dims.idx(0, 2), dims.idx(7, 2)),
+                    net("foreign", dims.idx(0, 5), dims.idx(7, 5)),
+                ],
+            ));
+        }
+
+        for (name, grid, nets) in &cases {
+            let router = NegotiatedRouter::new();
+            let plain = router.route(grid, nets).unwrap();
+            let (traced_board, trace) = router.route_traced(grid, nets).unwrap();
+            assert_eq!(
+                plain, traced_board,
+                "fixture `{name}`: route_traced must yield an identical BoardRoute"
+            );
+
+            // Trace self-consistency.
+            assert_eq!(trace.dims, grid.dims, "fixture `{name}`: trace dims");
+            assert_eq!(
+                trace.nets.len(),
+                nets.len(),
+                "fixture `{name}`: one TracedNet per input net"
+            );
+            let leg = trace
+                .legalization
+                .as_ref()
+                .unwrap_or_else(|| panic!("fixture `{name}`: legalization recorded"));
+            assert_eq!(
+                leg.committed.len(),
+                nets.len(),
+                "fixture `{name}`: committed has one slot per net"
+            );
+            // The final committed routes in the trace must match the BoardRoute: each
+            // routed net's committed path equals its RouteResult path.
+            for (i, ep) in nets.iter().enumerate() {
+                let in_board = traced_board.results.iter().find(|r| r.net == ep.net);
+                match (&leg.committed[i], in_board) {
+                    (Some(path), Some(r)) => assert_eq!(
+                        path, &r.path,
+                        "fixture `{name}`: committed path matches result for `{}`",
+                        ep.net
+                    ),
+                    (None, None) => {}
+                    other => panic!(
+                        "fixture `{name}`: committed/result disagree for `{}`: {other:?}",
+                        ep.net
+                    ),
+                }
+            }
+            // If the loop ran at all, the last recorded iteration is the converged
+            // one (no overuse) OR the loop hit MAX_ITERS.
+            if let Some(last) = trace.iterations.last() {
+                assert!(
+                    !last.any_overuse || last.iter == MAX_ITERS - 1,
+                    "fixture `{name}`: trace should end converged or at MAX_ITERS"
+                );
+                // Every snapshot has one path slot per net.
+                for snap in &trace.iterations {
+                    assert_eq!(snap.paths.len(), nets.len());
+                }
+            }
+        }
     }
 }
