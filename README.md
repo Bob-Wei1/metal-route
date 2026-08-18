@@ -292,14 +292,16 @@ callers rerun the whole batch on CPU instead of accepting an unsafe GPU path.
 The product selector is legacy-first. It recreates the exact pre-outline route,
 including beautification/legalization/via repair, then checks the final emitted
 soup against the active polygon. Edge-clean legacy bytes return unchanged; only
-an unsafe result pays for a constrained rerun. The constrained soup must be
-edge-safe and non-worse under the complete authoritative DRC profile. CLI
-`route`, server `/solve`, and `/api/trace` share that policy. Mask construction
-uses the width actually emitted by partial/legacy inputs, and the continuous
-checker uses each emitted segment width and via-pad diameter. Zero-length and
-singleton wire geometry is treated as copper disks, and zero/sub-epsilon polygon
-crossings use the same tolerance in routing and DRC. Board-edge findings use the
-reserved `__board_edge__` identity.
+an unsafe result pays for a constrained rerun. CLI `route`, server `/solve`, and
+`/api/trace` all require the selected soup to be edge-safe. The CLI additionally
+requires the constrained candidate to be non-worse under the complete
+authoritative DRC profile; the server endpoints retain their historical lack of
+an ordinary-DRC acceptance gate. Mask construction uses the width actually
+emitted by partial/legacy inputs, and the continuous checker uses each emitted
+segment width and via-pad diameter. Zero-length and singleton wire geometry is
+treated as copper disks, and zero/sub-epsilon polygon crossings use the same
+tolerance in routing and DRC. Board-edge findings use the reserved
+`__board_edge__` identity.
 
 The only changed cohort is the nine active-outline boards below. “Invalid” means
 a pre-outline routed identity that the independent continuous audit rejects;

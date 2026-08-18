@@ -176,9 +176,11 @@ Important new families:
 - The product selector first runs the exact historical route with only the
   board-edge contract removed, including every postprocessor, then validates the
   final soup. Edge-clean bytes return unchanged. An unsafe route is ineligible and
-  triggers one constrained rerun, which must be edge-safe and non-worse under the
-  complete authoritative DRC profile. CLI `route`, server `/solve`, and
-  `/api/trace` use the same selection contract.
+  triggers one constrained rerun. CLI `route`, server `/solve`, and `/api/trace`
+  all require the selected soup to be edge-safe. The CLI additionally requires
+  the constrained candidate to be non-worse under the complete authoritative DRC
+  profile; the server endpoints retain their historical lack of an ordinary-DRC
+  acceptance gate.
 - Legalization pre-stamps committed trace cells and via landings into a dense,
   group-aware via-landing guard. Each cell is free, owned by one connection group,
   or mixed, so a candidate via needs two O(1) tag reads while same-group sharing
