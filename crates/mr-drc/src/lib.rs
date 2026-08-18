@@ -24,11 +24,19 @@
 //! ## Performance
 //!
 //! Clearance checking must be near-linear: bin every feature into a uniform grid of
-//! cell size `clearance + max_feature_extent` and only test feature pairs that share
-//! or neighbour a bin. A naïve O(n²) sweep is acceptable only for the tiny golden
-//! unit tests, never for the full-board path.
+//! cell size `clearance + 2 * max_feature_extent` and only test feature pairs that
+//! share or neighbour a bin. The typed physical-via stream first collapses exact
+//! duplicate producer records and retains this bound for the producer's bounded
+//! sibling-representation multiplicity; adversarially many distinct records at one
+//! site are outside that input contract. A naïve O(n²) full-board sweep is never
+//! used.
 
 use serde::{Deserialize, Serialize};
+
+/// Producer-compatible tolerance for recognizing sibling same-net via records as
+/// one physical drill location. This is deliberately much wider than the generic
+/// floating-point clearance comparison epsilon.
+const SAME_VIA_LOCATION_EPS: f64 = 5e-3;
 
 /// The physical role of a copper layer in the stackup, indexed top (0) → bottom.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,8 +196,59 @@ impl DrcBoard {
     /// Stream A implements: clearance (uniform-grid spatial index, per layer,
     /// different-net pairs only), via-through-plane (antipad-aware), annular ring.
     pub fn check(&self) -> Vec<Violation> {
+        self.check_with_optional_pad_clearances(None)
+    }
+
+    /// Run every check while applying feature-pair-specific edge clearances for
+    /// trace↔pad, via-annulus↔trace, via-annulus↔pad, and (when supplied)
+    /// pad↔pad pairs. The SRJ trace-to-pad rule also governs via↔trace, matching
+    /// the producer checker. An
+    /// optional via-hole↔via-hole fabrication rule is net-independent and is
+    /// enforced once per physical via pair alongside the generic annular-pad rule.
+    /// The stricter rule owns the finding, with drill-rule findings reported in
+    /// actual drill-edge units. All other copper pairings continue to use
+    /// [`DrcRules::clearance`].
+    ///
+    /// Invalid pair values fall back to the generic rule. This lets typed board
+    /// formats project their pad rules without globally over-reporting legal
+    /// trace↔trace or via↔trace spacing.
+    pub fn check_with_pad_clearances(
+        &self,
+        trace_to_pad_clearance: f64,
+        via_to_pad_clearance: f64,
+        pad_to_pad_clearance: Option<f64>,
+        via_hole_to_hole_clearance: Option<f64>,
+    ) -> Vec<Violation> {
+        let valid_or_generic = |value: f64| {
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                self.rules.clearance
+            }
+        };
+        self.check_with_optional_pad_clearances(Some(PadClearances {
+            trace_to_pad: valid_or_generic(trace_to_pad_clearance),
+            via_to_pad: valid_or_generic(via_to_pad_clearance),
+            pad_to_pad: pad_to_pad_clearance
+                .map(valid_or_generic)
+                .unwrap_or(self.rules.clearance),
+            via_hole_to_hole: via_hole_to_hole_clearance.map(valid_or_generic),
+        }))
+    }
+
+    fn check_with_optional_pad_clearances(
+        &self,
+        pad_clearances: Option<PadClearances>,
+    ) -> Vec<Violation> {
         let mut out = Vec::new();
-        self.check_clearance(&mut out);
+        let hole_clearance = pad_clearances.and_then(|rules| rules.via_hole_to_hole);
+        let via_sites = hole_clearance
+            .map(|_| physical_via_sites(&self.vias))
+            .unwrap_or_default();
+        self.check_clearance(&mut out, pad_clearances, &via_sites);
+        if let Some(clearance) = hole_clearance {
+            self.check_canonical_via_pair_rules(&mut out, clearance, &via_sites);
+        }
         self.check_via_through_plane(&mut out);
         self.check_annular_ring(&mut out);
         out.sort_by(violation_cmp);
@@ -198,26 +257,75 @@ impl DrcBoard {
 
     /// Clearance: bin every copper feature into a per-layer uniform grid and test
     /// only different-net pairs that share or neighbour a bin (near-linear).
-    fn check_clearance(&self, out: &mut Vec<Violation>) {
+    fn check_clearance(
+        &self,
+        out: &mut Vec<Violation>,
+        pad_clearances: Option<PadClearances>,
+        via_sites: &[PhysicalViaSite],
+    ) {
+        #[derive(Clone, Debug)]
+        struct IndexedFeature {
+            feature: Feature,
+            logical_id: usize,
+            via_site: Option<usize>,
+        }
+
         // Collect the copper features present on each physical layer. A via pad is
         // present (as a circle) on every layer in its inclusive span.
-        let mut by_layer: std::collections::HashMap<u32, Vec<Feature>> =
+        let mut by_layer: std::collections::HashMap<u32, Vec<IndexedFeature>> =
             std::collections::HashMap::new();
         let layer_count = self.layers.len() as u32;
+        let hole_rule_active = pad_clearances
+            .and_then(|rules| rules.via_hole_to_hole)
+            .is_some();
+        let mut next_logical_id = 0usize;
 
         for s in &self.segments {
-            by_layer
-                .entry(s.layer)
-                .or_default()
-                .push(Feature::segment(s));
+            by_layer.entry(s.layer).or_default().push(IndexedFeature {
+                feature: Feature::segment(s),
+                logical_id: next_logical_id,
+                via_site: None,
+            });
+            next_logical_id += 1;
         }
         for p in &self.pads {
-            by_layer.entry(p.layer).or_default().push(Feature::pad(p));
+            by_layer.entry(p.layer).or_default().push(IndexedFeature {
+                feature: Feature::pad(p),
+                logical_id: next_logical_id,
+                via_site: None,
+            });
+            next_logical_id += 1;
         }
-        for v in &self.vias {
-            if let Some((lo, hi)) = in_stack_via_span(v, layer_count) {
-                for layer in lo..=hi {
-                    by_layer.entry(layer).or_default().push(Feature::via(v));
+        if hole_rule_active {
+            for (site_id, site) in via_sites.iter().enumerate() {
+                let logical_id = next_logical_id + site_id;
+                for v in &site.representations {
+                    if let Some((lo, hi)) = in_stack_via_span(v, layer_count) {
+                        for layer in lo..=hi {
+                            by_layer.entry(layer).or_default().push(IndexedFeature {
+                                feature: Feature::via(v),
+                                logical_id,
+                                via_site: Some(site_id),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Preserve the historical no-hole checker byte/count semantics: each
+            // raw via record remains an independent copper feature. Physical-site
+            // identity activates only with an explicit fabrication-hole rule.
+            for v in &self.vias {
+                let logical_id = next_logical_id;
+                next_logical_id += 1;
+                if let Some((lo, hi)) = in_stack_via_span(v, layer_count) {
+                    for layer in lo..=hi {
+                        by_layer.entry(layer).or_default().push(IndexedFeature {
+                            feature: Feature::via(v),
+                            logical_id,
+                            via_site: None,
+                        });
+                    }
                 }
             }
         }
@@ -231,10 +339,18 @@ impl DrcBoard {
         let max_extent = by_layer
             .values()
             .flat_map(|fs| fs.iter())
-            .map(Feature::extent)
+            .map(|indexed| indexed.feature.extent())
             .fold(0.0_f64, f64::max);
-        let cell = (self.rules.clearance + 2.0 * max_extent).max(f64::MIN_POSITIVE);
-
+        let largest_clearance = pad_clearances.map_or(self.rules.clearance, |rules| {
+            self.rules
+                .clearance
+                .max(rules.trace_to_pad)
+                .max(rules.via_to_pad)
+                .max(rules.pad_to_pad)
+        });
+        let cell = (largest_clearance + 2.0 * max_extent).max(f64::MIN_POSITIVE);
+        let mut aggregated: std::collections::BTreeMap<(u32, usize, usize), Violation> =
+            std::collections::BTreeMap::new();
         // Stable iteration order over layers for determinism of `out` before sort.
         let mut layers: Vec<u32> = by_layer.keys().copied().collect();
         layers.sort_unstable();
@@ -245,7 +361,7 @@ impl DrcBoard {
             let mut bins: std::collections::HashMap<(i64, i64), Vec<usize>> =
                 std::collections::HashMap::new();
             for (i, f) in feats.iter().enumerate() {
-                let (cx, cy) = f.centroid();
+                let (cx, cy) = f.feature.centroid();
                 let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
                 bins.entry(key).or_default().push(i);
             }
@@ -261,7 +377,55 @@ impl DrcBoard {
                                     if i >= j {
                                         continue;
                                     }
-                                    self.test_clearance_pair(layer, &feats[i], &feats[j], out);
+                                    let a = &feats[i];
+                                    let b = &feats[j];
+                                    if a.logical_id == b.logical_id {
+                                        continue;
+                                    }
+                                    // With a declared hole rule, all via-site pairs
+                                    // are owned by the centralized physical-site
+                                    // arbitration below. Raw representation pairs
+                                    // must not emit duplicate or contradictory rows.
+                                    if hole_rule_active
+                                        && a.via_site.is_some()
+                                        && b.via_site.is_some()
+                                    {
+                                        continue;
+                                    }
+                                    let mut candidate = Vec::with_capacity(1);
+                                    self.test_clearance_pair_with_pad_rules(
+                                        layer,
+                                        &a.feature,
+                                        &b.feature,
+                                        pad_clearances,
+                                        &mut candidate,
+                                    );
+                                    let Some(candidate) = candidate.pop() else {
+                                        continue;
+                                    };
+                                    let key = (
+                                        layer,
+                                        a.logical_id.min(b.logical_id),
+                                        a.logical_id.max(b.logical_id),
+                                    );
+                                    match aggregated.entry(key) {
+                                        std::collections::btree_map::Entry::Vacant(entry) => {
+                                            entry.insert(candidate);
+                                        }
+                                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                            let current = entry.get();
+                                            let candidate_deficit =
+                                                candidate.measured - candidate.required;
+                                            let current_deficit =
+                                                current.measured - current.required;
+                                            if candidate_deficit < current_deficit
+                                                || (candidate_deficit == current_deficit
+                                                    && violation_cmp(&candidate, current).is_lt())
+                                            {
+                                                entry.insert(candidate);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -269,9 +433,22 @@ impl DrcBoard {
                 }
             }
         }
+        out.extend(aggregated.into_values());
     }
 
+    #[cfg(test)]
     fn test_clearance_pair(&self, layer: u32, a: &Feature, b: &Feature, out: &mut Vec<Violation>) {
+        self.test_clearance_pair_with_pad_rules(layer, a, b, None, out);
+    }
+
+    fn test_clearance_pair_with_pad_rules(
+        &self,
+        layer: u32,
+        a: &Feature,
+        b: &Feature,
+        pad_clearances: Option<PadClearances>,
+        out: &mut Vec<Violation>,
+    ) {
         if !nets_conflict(&a.net, &b.net) {
             return;
         }
@@ -281,12 +458,211 @@ impl DrcBoard {
         // threshold before running the more expensive exact shape-distance code.
         // This is only enabled for a positive threshold: an overlapping capsule can
         // have a negative exact gap while its (overlapping) AABBs have zero gap.
-        let violation_threshold = self.rules.clearance - EPS;
+        let required = required_clearance(self.rules.clearance, pad_clearances, a, b);
+        let violation_threshold = required - EPS;
         if aabbs_separated_by_at_least(a, b, violation_threshold) {
             return;
         }
 
-        self.report_clearance_pair(layer, a, b, out);
+        self.report_clearance_pair(layer, a, b, required, out);
+    }
+
+    /// Centralized via-site arbitration for a declared net-independent drill rule.
+    /// Raw representations feed one spatial broadphase, but at most one row is
+    /// emitted per canonical physical-site pair. Exact duplicate records are
+    /// collapsed first; the remaining work is near-linear for the producer's
+    /// bounded sibling-representation multiplicity (not for adversarially many
+    /// distinct representations at one site). Hole owns an equality tie; a
+    /// foreign-net annular-copper row owns only when its *violating actual pair*
+    /// has a strictly larger centre requirement.
+    fn check_canonical_via_pair_rules(
+        &self,
+        out: &mut Vec<Violation>,
+        hole_clearance: f64,
+        sites: &[PhysicalViaSite],
+    ) {
+        #[derive(Clone, Debug)]
+        struct Candidate {
+            violation: Violation,
+            centre_requirement: f64,
+        }
+
+        #[derive(Default)]
+        struct PairCandidates {
+            hole: Option<Candidate>,
+            copper: Option<Candidate>,
+        }
+
+        let representations: Vec<(usize, &Via)> = sites
+            .iter()
+            .enumerate()
+            .flat_map(|(site_id, site)| site.representations.iter().map(move |via| (site_id, via)))
+            .collect();
+        if representations.len() < 2 {
+            return;
+        }
+        let max_drill_radius = representations
+            .iter()
+            .map(|(_, via)| via.drill_diameter / 2.0)
+            .fold(0.0_f64, f64::max);
+        let max_pad_radius = representations
+            .iter()
+            .map(|(_, via)| via.pad_diameter / 2.0)
+            .fold(0.0_f64, f64::max);
+        let cell = (hole_clearance + 2.0 * max_drill_radius)
+            .max(self.rules.clearance + 2.0 * max_pad_radius)
+            .max(f64::MIN_POSITIVE);
+        let mut bins: std::collections::HashMap<(i64, i64), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (index, (_, via)) in representations.iter().enumerate() {
+            let key = (
+                (via.center.0 / cell).floor() as i64,
+                (via.center.1 / cell).floor() as i64,
+            );
+            bins.entry(key).or_default().push(index);
+        }
+
+        let mut pairs: std::collections::BTreeMap<(usize, usize), PairCandidates> =
+            std::collections::BTreeMap::new();
+        let retain_worst = |slot: &mut Option<Candidate>, candidate: Candidate| {
+            let replace = slot.as_ref().is_none_or(|current| {
+                let candidate_deficit = candidate.violation.measured - candidate.violation.required;
+                let current_deficit = current.violation.measured - current.violation.required;
+                candidate
+                    .centre_requirement
+                    .total_cmp(&current.centre_requirement)
+                    .is_gt()
+                    || (candidate.centre_requirement == current.centre_requirement
+                        && (candidate_deficit.total_cmp(&current_deficit).is_lt()
+                            || (candidate_deficit == current_deficit
+                                && violation_cmp(&candidate.violation, &current.violation)
+                                    .is_lt())))
+            });
+            if replace {
+                *slot = Some(candidate);
+            }
+        };
+        let sorted_nets = |a: &Via, b: &Via| {
+            if a.net <= b.net {
+                (a.net.clone(), b.net.clone())
+            } else {
+                (b.net.clone(), a.net.clone())
+            }
+        };
+        let layer_count = self.layers.len() as u32;
+
+        for (&(bx, by), indices) in &bins {
+            for &i in indices {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        let Some(neighbours) = bins.get(&(bx + dx, by + dy)) else {
+                            continue;
+                        };
+                        for &j in neighbours {
+                            if i >= j {
+                                continue;
+                            }
+                            let (a_site, a) = representations[i];
+                            let (b_site, b) = representations[j];
+                            if a_site == b_site {
+                                continue;
+                            }
+                            // First-anchor canonical sites are intentionally not
+                            // transitively clustered. Even across two such IDs,
+                            // however, the producer treats a same-net raw pair at
+                            // <= 0.005 mm as one coincident representation.
+                            if same_physical_via_location(a, b) {
+                                continue;
+                            }
+                            let key = (a_site.min(b_site), a_site.max(b_site));
+                            let pair = pairs.entry(key).or_default();
+                            let distance = dist(a.center, b.center);
+                            let hole_measured =
+                                distance - a.drill_diameter / 2.0 - b.drill_diameter / 2.0;
+                            if hole_measured < hole_clearance - EPS {
+                                retain_worst(
+                                    &mut pair.hole,
+                                    Candidate {
+                                        violation: Violation {
+                                            class: ViolationClass::Clearance,
+                                            layer: a
+                                                .from_layer
+                                                .min(a.to_layer)
+                                                .min(b.from_layer.min(b.to_layer)),
+                                            location: (
+                                                (a.center.0 + b.center.0) / 2.0,
+                                                (a.center.1 + b.center.1) / 2.0,
+                                            ),
+                                            nets: sorted_nets(a, b),
+                                            measured: hole_measured,
+                                            required: hole_clearance,
+                                        },
+                                        centre_requirement: a.drill_diameter / 2.0
+                                            + b.drill_diameter / 2.0
+                                            + hole_clearance,
+                                    },
+                                );
+                            }
+
+                            if a.net == b.net {
+                                continue;
+                            }
+                            let overlap = match (
+                                in_stack_via_span(a, layer_count),
+                                in_stack_via_span(b, layer_count),
+                            ) {
+                                (Some((a_lo, a_hi)), Some((b_lo, b_hi)))
+                                    if a_lo <= b_hi && b_lo <= a_hi =>
+                                {
+                                    Some(a_lo.max(b_lo))
+                                }
+                                _ => None,
+                            };
+                            let Some(layer) = overlap else {
+                                continue;
+                            };
+                            let copper_measured =
+                                distance - a.pad_diameter / 2.0 - b.pad_diameter / 2.0;
+                            if copper_measured < self.rules.clearance - EPS {
+                                retain_worst(
+                                    &mut pair.copper,
+                                    Candidate {
+                                        violation: Violation {
+                                            class: ViolationClass::Clearance,
+                                            layer,
+                                            location: (
+                                                (a.center.0 + b.center.0) / 2.0,
+                                                (a.center.1 + b.center.1) / 2.0,
+                                            ),
+                                            nets: sorted_nets(a, b),
+                                            measured: copper_measured,
+                                            required: self.rules.clearance,
+                                        },
+                                        centre_requirement: a.pad_diameter / 2.0
+                                            + b.pad_diameter / 2.0
+                                            + self.rules.clearance,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for pair in pairs.into_values() {
+            let chosen = match (pair.hole, pair.copper) {
+                (Some(hole), Some(copper))
+                    if copper.centre_requirement > hole.centre_requirement + EPS =>
+                {
+                    copper
+                }
+                (Some(hole), _) => hole,
+                (None, Some(copper)) => copper,
+                (None, None) => continue,
+            };
+            out.push(chosen.violation);
+        }
     }
 
     #[cfg(test)]
@@ -300,7 +676,7 @@ impl DrcBoard {
         if !nets_conflict(&a.net, &b.net) {
             return;
         }
-        self.report_clearance_pair(layer, a, b, out);
+        self.report_clearance_pair(layer, a, b, self.rules.clearance, out);
     }
 
     fn report_clearance_pair(
@@ -308,10 +684,11 @@ impl DrcBoard {
         layer: u32,
         a: &Feature,
         b: &Feature,
+        required: f64,
         out: &mut Vec<Violation>,
     ) {
         let gap = feature_gap(a, b);
-        if gap < self.rules.clearance - EPS {
+        if gap < required - EPS {
             let (ax, ay) = a.centroid();
             let (bx, by) = b.centroid();
             // Canonicalise the net pair so the row is independent of which feature
@@ -325,7 +702,7 @@ impl DrcBoard {
                 location: ((ax + bx) * 0.5, (ay + by) * 0.5),
                 nets,
                 measured: gap,
-                required: self.rules.clearance,
+                required,
             });
         }
     }
@@ -384,6 +761,36 @@ impl DrcBoard {
 /// below the rule by more than this, so features placed exactly at the rule pass.
 const EPS: f64 = 1e-9;
 
+#[derive(Clone, Copy, Debug)]
+struct PadClearances {
+    trace_to_pad: f64,
+    via_to_pad: f64,
+    pad_to_pad: f64,
+    via_hole_to_hole: Option<f64>,
+}
+
+fn required_clearance(
+    generic: f64,
+    pad_clearances: Option<PadClearances>,
+    a: &Feature,
+    b: &Feature,
+) -> f64 {
+    let Some(rules) = pad_clearances else {
+        return generic;
+    };
+    match (&a.shape, &b.shape) {
+        (Shape::Segment { .. }, Shape::Rect { .. })
+        | (Shape::Rect { .. }, Shape::Segment { .. }) => rules.trace_to_pad,
+        (Shape::Segment { .. }, Shape::Point { .. })
+        | (Shape::Point { .. }, Shape::Segment { .. }) => rules.trace_to_pad,
+        (Shape::Point { .. }, Shape::Rect { .. }) | (Shape::Rect { .. }, Shape::Point { .. }) => {
+            rules.via_to_pad
+        }
+        (Shape::Rect { .. }, Shape::Rect { .. }) => rules.pad_to_pad,
+        _ => generic,
+    }
+}
+
 /// Two nets conflict when they are different. A `None` net (unknown pad) is treated
 /// as a distinct always-foreign net, so it conflicts with everything — including
 /// another `None`.
@@ -392,6 +799,116 @@ fn nets_conflict(a: &Option<String>, b: &Option<String>) -> bool {
         (Some(x), Some(y)) => x != y,
         _ => true,
     }
+}
+
+fn physical_via_representation_cmp(a: &Via, b: &Via) -> std::cmp::Ordering {
+    a.net
+        .cmp(&b.net)
+        .then_with(|| a.center.0.total_cmp(&b.center.0))
+        .then_with(|| a.center.1.total_cmp(&b.center.1))
+        .then_with(|| {
+            a.from_layer
+                .min(a.to_layer)
+                .cmp(&b.from_layer.min(b.to_layer))
+        })
+        .then_with(|| {
+            a.from_layer
+                .max(a.to_layer)
+                .cmp(&b.from_layer.max(b.to_layer))
+        })
+        .then_with(|| a.pad_diameter.total_cmp(&b.pad_diameter))
+        .then_with(|| a.drill_diameter.total_cmp(&b.drill_diameter))
+        .then_with(|| match (a.antipad_radius, b.antipad_radius) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+}
+
+fn same_physical_via_location(a: &Via, b: &Via) -> bool {
+    a.net == b.net && dist(a.center, b.center) <= SAME_VIA_LOCATION_EPS
+}
+
+#[derive(Clone, Debug)]
+struct PhysicalViaSite {
+    /// Deterministic canonical record used only for broadphase placement and the
+    /// union layer span / maximum fabrication geometry.
+    physical: Via,
+    /// Original producer records. Exact checks always select the worst actual
+    /// representation pair instead of measuring synthetic canonical geometry.
+    representations: Vec<Via>,
+}
+
+/// Canonicalize sibling same-net via records into physical drill sites in
+/// deterministic near-linear time. The first sorted representation remains the
+/// site centre; later records within 0.005 mm merge without moving it, matching
+/// the producer's pairwise same-location convention rather than transitive
+/// clustering.
+fn physical_via_sites(vias: &[Via]) -> Vec<PhysicalViaSite> {
+    let mut sorted_vias = vias.to_vec();
+    sorted_vias.sort_by(physical_via_representation_cmp);
+    let mut sites: Vec<PhysicalViaSite> = Vec::with_capacity(sorted_vias.len());
+    let mut canonical_bins: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut current_net: Option<String> = None;
+    for via in sorted_vias {
+        if current_net.as_deref() != Some(via.net.as_str()) {
+            canonical_bins.clear();
+            current_net = Some(via.net.clone());
+        }
+        let bin = (
+            (via.center.0 / SAME_VIA_LOCATION_EPS).floor() as i64,
+            (via.center.1 / SAME_VIA_LOCATION_EPS).floor() as i64,
+        );
+        let mut canonical_index = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(indices) = canonical_bins.get(&(bin.0 + dx, bin.1 + dy)) {
+                    for &index in indices {
+                        if same_physical_via_location(&sites[index].physical, &via) {
+                            canonical_index = Some(
+                                canonical_index.map_or(index, |current: usize| current.min(index)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(index) = canonical_index {
+            let existing = &mut sites[index];
+            let lo = existing
+                .physical
+                .from_layer
+                .min(existing.physical.to_layer)
+                .min(via.from_layer.min(via.to_layer));
+            let hi = existing
+                .physical
+                .from_layer
+                .max(existing.physical.to_layer)
+                .max(via.from_layer.max(via.to_layer));
+            existing.physical.from_layer = lo;
+            existing.physical.to_layer = hi;
+            existing.physical.pad_diameter = existing.physical.pad_diameter.max(via.pad_diameter);
+            existing.physical.drill_diameter =
+                existing.physical.drill_diameter.max(via.drill_diameter);
+            // Fully identical sibling records are adjacent under the complete
+            // deterministic sort above. Collapsing them avoids the common
+            // duplicate-soup K² case in typed via-site arbitration without
+            // changing the legacy no-hole checker stream.
+            if existing.representations.last() != Some(&via) {
+                existing.representations.push(via);
+            }
+        } else {
+            let index = sites.len();
+            sites.push(PhysicalViaSite {
+                physical: via.clone(),
+                representations: vec![via],
+            });
+            canonical_bins.entry(bin).or_default().push(index);
+        }
+    }
+    sites
 }
 
 /// A copper feature reduced to its clearance geometry on one layer.
@@ -1402,6 +1919,515 @@ mod tests {
                 "pairing should produce exactly one clearance violation: {board:?}"
             );
         }
+    }
+
+    #[test]
+    fn pad_pair_rules_do_not_raise_unrelated_copper_clearance() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.05;
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![
+                seg("A", 0, (-1.0, 0.0), (1.0, 0.0), 0.1),
+                seg("B", 0, (-1.0, 0.16), (1.0, 0.16), 0.1),
+            ],
+            pads: vec![],
+            vias: vec![],
+            rules: pair_rules,
+        };
+        assert!(board
+            .check_with_pad_clearances(0.07, 0.08, None, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn typed_trace_and_via_pad_rules_use_their_own_exact_boundaries() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.05;
+        let pad = Pad {
+            net: Some("pad".into()),
+            layer: 0,
+            center: (0.0, 0.0),
+            width: 0.2,
+            height: 0.2,
+        };
+
+        let trace_board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![seg("trace", 0, (0.21, -1.0), (0.21, 1.0), 0.1)],
+            pads: vec![pad.clone()],
+            vias: vec![],
+            rules: pair_rules,
+        };
+        assert!(trace_board.check().is_empty());
+        let trace_findings = trace_board.check_with_pad_clearances(0.07, 0.08, None, None);
+        assert_eq!(trace_findings.len(), 1);
+        assert_eq!(trace_findings[0].required, 0.07);
+
+        let via_board = |x| DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![pad.clone()],
+            vias: vec![Via {
+                net: "via".into(),
+                center: (x, 0.0),
+                pad_diameter: 0.4,
+                drill_diameter: 0.2,
+                from_layer: 0,
+                to_layer: 0,
+                antipad_radius: None,
+            }],
+            rules: pair_rules,
+        };
+        let just_inside =
+            via_board(0.38 - 2.0 * EPS).check_with_pad_clearances(0.07, 0.08, None, None);
+        assert_eq!(just_inside.len(), 1);
+        assert_eq!(just_inside[0].required, 0.08);
+        assert!(
+            via_board(0.38)
+                .check_with_pad_clearances(0.07, 0.08, None, None)
+                .is_empty(),
+            "an annulus exactly at the via→pad rule is legal"
+        );
+
+        let pad_board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![
+                pad,
+                Pad {
+                    net: Some("other-pad".into()),
+                    layer: 0,
+                    center: (0.29, 0.0),
+                    width: 0.2,
+                    height: 0.2,
+                },
+            ],
+            vias: vec![],
+            rules: pair_rules,
+        };
+        assert!(pad_board.check().is_empty());
+        let pad_findings = pad_board.check_with_pad_clearances(0.07, 0.08, Some(0.1), None);
+        assert_eq!(pad_findings.len(), 1);
+        assert_eq!(pad_findings[0].required, 0.1);
+    }
+
+    #[test]
+    fn typed_trace_rule_governs_via_to_trace_at_the_exact_boundary() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.04;
+        pair_rules.min_annular_ring = 0.0;
+        let board_at = |x| DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![seg("trace", 0, (x, -1.0), (x, 1.0), 0.1)],
+            pads: vec![],
+            vias: vec![Via {
+                net: "via".into(),
+                center: (0.0, 0.0),
+                pad_diameter: 0.4,
+                drill_diameter: 0.2,
+                from_layer: 0,
+                to_layer: 0,
+                antipad_radius: None,
+            }],
+            rules: pair_rules,
+        };
+        assert!(board_at(0.32).check().is_empty());
+        assert!(
+            board_at(0.32)
+                .check_with_pad_clearances(0.07, 0.09, None, None)
+                .is_empty(),
+            "a via annulus exactly at the SRJ trace rule is legal"
+        );
+        let findings = board_at(0.32 - 2.0 * EPS).check_with_pad_clearances(0.07, 0.09, None, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].required, 0.07);
+    }
+
+    #[test]
+    fn via_hole_clearance_can_dominate_annular_pad_clearance() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.02;
+        pair_rules.min_annular_ring = 0.0;
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![
+                Via {
+                    net: "a".into(),
+                    center: (0.0, 0.0),
+                    pad_diameter: 0.2,
+                    drill_diameter: 0.18,
+                    from_layer: 0,
+                    to_layer: 0,
+                    antipad_radius: None,
+                },
+                Via {
+                    net: "b".into(),
+                    center: (0.25, 0.0),
+                    pad_diameter: 0.2,
+                    drill_diameter: 0.18,
+                    from_layer: 0,
+                    to_layer: 0,
+                    antipad_radius: None,
+                },
+            ],
+            rules: pair_rules,
+        };
+        assert!(
+            board.check().is_empty(),
+            "0.05 annular edge gap satisfies generic 0.02"
+        );
+        let findings = board.check_with_pad_clearances(0.02, 0.02, None, Some(0.1));
+        assert_eq!(findings.len(), 1);
+        assert!((findings[0].measured - 0.07).abs() < 1e-12);
+        assert!((findings[0].required - 0.1).abs() < 1e-12);
+
+        let mut equal_rules = board.clone();
+        equal_rules.vias[1].center.0 = 0.2;
+        let equal_findings = equal_rules.check_with_pad_clearances(0.02, 0.02, None, Some(0.04));
+        assert_eq!(
+            equal_findings.len(),
+            1,
+            "the equal-strength rule has one owner"
+        );
+        assert!((equal_findings[0].measured - 0.02).abs() < 1e-12);
+        assert!((equal_findings[0].required - 0.04).abs() < 1e-12);
+
+        let mut same_net = board.clone();
+        same_net.vias[1].net = "a".into();
+        let same_net_findings = same_net.check_with_pad_clearances(0.02, 0.02, None, Some(0.1));
+        assert_eq!(same_net_findings.len(), 1);
+        assert_eq!(same_net_findings[0].nets, ("a".into(), "a".into()));
+        assert!((same_net_findings[0].measured - 0.07).abs() < 1e-12);
+        assert!((same_net_findings[0].required - 0.1).abs() < 1e-12);
+
+        same_net.vias[1].center.0 = 0.28;
+        assert!(
+            same_net
+                .check_with_pad_clearances(0.02, 0.02, None, Some(0.1))
+                .is_empty(),
+            "same-net holes exactly at the fabrication rule are legal"
+        );
+
+        let mut duplicate_representation = same_net.clone();
+        duplicate_representation.vias[1] = duplicate_representation.vias[0].clone();
+        duplicate_representation.layers = vec![LayerKind::Signal; 3];
+        duplicate_representation.vias[1].to_layer = 2;
+        duplicate_representation.vias[1].pad_diameter = 0.24;
+        duplicate_representation.vias[1].drill_diameter = 0.19;
+        assert!(
+            duplicate_representation
+                .check_with_pad_clearances(0.02, 0.02, None, Some(0.1))
+                .is_empty(),
+            "partial/full sibling records with different geometry are one physical hole"
+        );
+
+        duplicate_representation.vias[1].center.0 = SAME_VIA_LOCATION_EPS;
+        assert!(
+            duplicate_representation
+                .check_with_pad_clearances(0.02, 0.02, None, Some(0.1))
+                .is_empty(),
+            "same-net records exactly 0.005 mm apart are one producer-defined site"
+        );
+        duplicate_representation.vias[1].center.0 = SAME_VIA_LOCATION_EPS + 2.0 * EPS;
+        let outside_coincidence =
+            duplicate_representation.check_with_pad_clearances(0.02, 0.02, None, Some(0.1));
+        assert_eq!(outside_coincidence.len(), 1);
+        assert_eq!(outside_coincidence[0].nets, ("a".into(), "a".into()));
+
+        let mut interleaved = duplicate_representation.clone();
+        interleaved.vias = vec![
+            duplicate_representation.vias[0].clone(),
+            Via {
+                center: (0.002, 100.0),
+                ..duplicate_representation.vias[0].clone()
+            },
+            Via {
+                center: (0.004, 0.0),
+                ..duplicate_representation.vias[1].clone()
+            },
+        ];
+        assert!(
+            interleaved
+                .check_with_pad_clearances(0.02, 0.02, None, Some(0.1))
+                .is_empty(),
+            "a far-y via interleaved by x-sort cannot split one coincident site"
+        );
+    }
+
+    #[test]
+    fn disjoint_foreign_via_spans_still_enforce_hole_spacing() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.2;
+        pair_rules.min_annular_ring = 0.0;
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal; 4],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![
+                Via {
+                    net: "a".into(),
+                    center: (0.0, 0.0),
+                    pad_diameter: 1.0,
+                    drill_diameter: 0.2,
+                    from_layer: 0,
+                    to_layer: 1,
+                    antipad_radius: None,
+                },
+                Via {
+                    net: "b".into(),
+                    center: (0.3, 0.0),
+                    pad_diameter: 1.0,
+                    drill_diameter: 0.2,
+                    from_layer: 2,
+                    to_layer: 3,
+                    antipad_radius: None,
+                },
+            ],
+            rules: pair_rules,
+        };
+        assert!(board.check().is_empty(), "annular copper spans do not meet");
+        let findings = board.check_with_pad_clearances(0.2, 0.2, None, Some(0.15));
+        assert_eq!(findings.len(), 1);
+        assert!((findings[0].measured - 0.1).abs() < 1e-12);
+        assert!((findings[0].required - 0.15).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merged_site_geometry_cannot_hide_a_hole_rule_from_actual_layer_copper() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.1;
+        pair_rules.min_annular_ring = 0.0;
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal; 2],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![
+                Via {
+                    net: "site".into(),
+                    center: (0.0, 0.0),
+                    pad_diameter: 2.0,
+                    drill_diameter: 0.2,
+                    from_layer: 0,
+                    to_layer: 0,
+                    antipad_radius: None,
+                },
+                Via {
+                    net: "site".into(),
+                    center: (0.0, 0.0),
+                    pad_diameter: 0.2,
+                    drill_diameter: 0.2,
+                    from_layer: 1,
+                    to_layer: 1,
+                    antipad_radius: None,
+                },
+                Via {
+                    net: "foreign".into(),
+                    center: (0.35, 0.0),
+                    pad_diameter: 0.2,
+                    drill_diameter: 0.2,
+                    from_layer: 1,
+                    to_layer: 1,
+                    antipad_radius: None,
+                },
+            ],
+            rules: pair_rules,
+        };
+        assert!(
+            board.check().is_empty(),
+            "the only physically overlapping layer carries the small legal pads"
+        );
+        let findings = board.check_with_pad_clearances(0.1, 0.1, None, Some(0.2));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].nets, ("foreign".into(), "site".into()));
+        assert!((findings[0].measured - 0.15).abs() < 1e-12);
+        assert!((findings[0].required - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hole_site_reports_the_worst_original_coincident_representation_pair() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.0;
+        pair_rules.min_annular_ring = 0.0;
+        let via_at = |x| Via {
+            net: "same".into(),
+            center: (x, 0.0),
+            pad_diameter: 0.2,
+            drill_diameter: 0.2,
+            from_layer: 0,
+            to_layer: 0,
+            antipad_radius: None,
+        };
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![via_at(0.0), via_at(0.005), via_at(0.301)],
+            rules: pair_rules,
+        };
+        let findings = board.check_with_pad_clearances(0.0, 0.0, None, Some(0.1));
+        assert_eq!(findings.len(), 1);
+        assert!((findings[0].measured - 0.096).abs() < 1e-12);
+        assert!((findings[0].location.0 - 0.153).abs() < 1e-12);
+        assert_eq!(findings[0].required, 0.1);
+        let mut reversed_shifted = board.clone();
+        reversed_shifted.vias.reverse();
+        assert_eq!(
+            reversed_shifted.check_with_pad_clearances(0.0, 0.0, None, Some(0.1)),
+            findings,
+            "shifted same-site worst-gap selection is input-order independent"
+        );
+
+        let chain = DrcBoard {
+            vias: vec![via_at(0.0), via_at(0.004), via_at(0.008)],
+            ..board
+        };
+        let chain_findings = chain.check_with_pad_clearances(0.0, 0.0, None, Some(0.1));
+        assert_eq!(chain_findings.len(), 1);
+        assert!((chain_findings[0].measured + 0.192).abs() < 1e-12);
+        assert!((chain_findings[0].location.0 - 0.004).abs() < 1e-12);
+        assert_eq!(chain_findings[0].required, 0.1);
+        assert_eq!(
+            physical_via_sites(&vec![via_at(0.0); 64])[0]
+                .representations
+                .len(),
+            1,
+            "identical sibling soup records collapse before typed pair scanning"
+        );
+    }
+
+    #[test]
+    fn via_pair_ownership_uses_the_strictest_violating_actual_rule() {
+        let mut pair_rules = rules();
+        pair_rules.clearance = 0.09;
+        pair_rules.min_annular_ring = 0.0;
+        let via = |net: &str, x: f64, pad: f64, drill: f64| Via {
+            net: net.into(),
+            center: (x, 0.0),
+            pad_diameter: pad,
+            drill_diameter: drill,
+            from_layer: 0,
+            to_layer: 0,
+            antipad_radius: None,
+        };
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![
+                via("site", 0.0, 0.21, 0.209),
+                via("site", 0.005, 0.21, 0.2),
+                via("foreign", 0.304, 0.214, 0.2),
+            ],
+            rules: pair_rules,
+        };
+
+        let findings = board.check_with_pad_clearances(0.09, 0.09, None, Some(0.1));
+        assert_eq!(findings.len(), 1);
+        assert!((findings[0].required - 0.1).abs() < 1e-12);
+        assert!((findings[0].measured - 0.0995).abs() < 1e-12);
+        assert!((findings[0].location.0 - 0.152).abs() < 1e-12);
+        let original_vias = board.vias.clone();
+        for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let mut permuted = board.clone();
+            permuted.vias = order
+                .into_iter()
+                .map(|index| original_vias[index].clone())
+                .collect();
+            assert_eq!(
+                permuted.check_with_pad_clearances(0.09, 0.09, None, Some(0.1)),
+                findings,
+                "strictest-rule ownership is byte-identical under every input permutation"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_via_pair_arbitration_emits_one_strongest_physical_row() {
+        let board_with = |vias: Vec<Via>, clearance: f64| {
+            let mut pair_rules = rules();
+            pair_rules.clearance = clearance;
+            pair_rules.min_annular_ring = 0.0;
+            DrcBoard {
+                layers: vec![LayerKind::Signal; 2],
+                segments: vec![],
+                pads: vec![],
+                vias,
+                rules: pair_rules,
+            }
+        };
+        let via = |net: &str, x: f64, pad: f64, drill: f64, from_layer: u32, to_layer: u32| Via {
+            net: net.into(),
+            center: (x, 0.0),
+            pad_diameter: pad,
+            drill_diameter: drill,
+            from_layer,
+            to_layer,
+            antipad_radius: None,
+        };
+
+        // The large drill is on a disjoint layer while the overlapping copper rep
+        // is smaller. Synthetic max-pad/union-span geometry would choose copper,
+        // but the actual stronger physical rule is the net-independent hole row.
+        let split_geometry = board_with(
+            vec![
+                via("site", 0.0, 1.0, 1.0, 0, 0),
+                via("site", 0.0, 0.8, 0.2, 1, 1),
+                via("foreign", 0.5, 0.2, 0.2, 1, 1),
+            ],
+            0.1,
+        );
+        let split = split_geometry.check_with_pad_clearances(0.1, 0.1, None, Some(0.2));
+        assert_eq!(split.len(), 1);
+        assert!((split[0].measured + 0.1).abs() < 1e-12);
+        assert_eq!(split[0].required, 0.2);
+
+        // Duplicate soup records are one physical site. Copper is strictly
+        // stronger here, so it owns exactly one row rather than one per duplicate.
+        let duplicate = via("a", 0.0, 1.0, 0.2, 0, 0);
+        let copper_board = board_with(
+            vec![duplicate.clone(), duplicate, via("b", 0.25, 1.0, 0.2, 0, 0)],
+            0.1,
+        );
+        assert_eq!(
+            copper_board.check().len(),
+            2,
+            "without a declared hole rule, raw-via copper rows retain legacy multiplicity"
+        );
+        let copper = copper_board.check_with_pad_clearances(0.1, 0.1, None, Some(0.1));
+        assert_eq!(copper.len(), 1);
+        assert!((copper[0].measured + 0.75).abs() < 1e-12);
+        assert_eq!(copper[0].required, 0.1);
+
+        let mut reversed = copper_board.clone();
+        reversed.vias.reverse();
+        assert_eq!(
+            reversed.check_with_pad_clearances(0.1, 0.1, None, Some(0.1)),
+            copper,
+            "canonical arbitration is byte-identical under input permutation"
+        );
+
+        // A hole-clean pair still reports its violating annular copper once.
+        let hole_clean = board_with(
+            vec![via("a", 0.0, 1.0, 0.2, 0, 0), via("b", 0.5, 1.0, 0.2, 0, 0)],
+            0.1,
+        )
+        .check_with_pad_clearances(0.1, 0.1, None, Some(0.1));
+        assert_eq!(hole_clean.len(), 1);
+        assert!((hole_clean[0].measured + 0.5).abs() < 1e-12);
+
+        // The same logical site is also aggregated against non-via copper.
+        let mut site_to_trace = board_with(
+            vec![via("a", 0.0, 0.2, 0.1, 0, 0), via("a", 0.0, 0.2, 0.1, 0, 0)],
+            0.1,
+        );
+        site_to_trace
+            .segments
+            .push(seg("b", 0, (0.15, -0.5), (0.15, 0.5), 0.1));
+        let trace_rows = site_to_trace.check_with_pad_clearances(0.1, 0.1, None, Some(0.1));
+        assert_eq!(trace_rows.len(), 1);
     }
 
     #[test]

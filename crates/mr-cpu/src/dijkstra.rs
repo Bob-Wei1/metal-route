@@ -298,6 +298,9 @@ where
             }
             // Edge-aware: price the move `u -> v`, not just entering `v`.
             let step = cost_fn(u, v);
+            if step == Cost::MAX {
+                return;
+            }
             let nd = du.saturating_add(step);
             let nh = hu.saturating_add(1);
             let old = buf.dist_of(v);
