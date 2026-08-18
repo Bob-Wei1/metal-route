@@ -76,14 +76,15 @@ congestion + equal unrouted set, under the shared canonical tie-break):
   boundaries, and concurrent calls — **pass**. This is broad regression coverage,
   not an exhaustive proof over every cost grid.
 
-The Rust source suite now contains **385 test cases** (384 passing, one explicitly
-ignored live-tool test), up from 243, plus two passing doctests. The added cases
+The Rust source suite now contains **429 test cases** (426 passing and three
+explicitly ignored frontier/performance/live-tool tests), up from 243, plus two
+passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
 physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
 layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
-memory caps, fixed-fixture and fixed-seed Metal equivalence, cached isolation
-diagnoses, parallel scheduling determinism, authoritative DRC acceptance, and
-topology-preserving via repair.
+memory caps, fixed-fixture and fixed-seed Metal equivalence, exact via-spacing
+guards and exemption lookup, cached isolation diagnoses, parallel scheduling
+determinism, authoritative DRC acceptance, and topology-preserving via repair.
 `research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
 regression-gate tests for benchmark reports.
 
@@ -162,36 +163,68 @@ scripts/bench-corpus.sh srj15      # just one sub-corpus
 scripts/vendor-corpus.sh           # refresh the fixtures from upstream
 ```
 
-Exact baseline run on 2026-08-17 and final/recheck on 2026-08-18 (`negotiated`,
-identical 112 boards and settings):
+The corrected historical baseline and current final both use the `negotiated`
+router on identical copies of all 112 boards with the same settings. The archived
+baseline traces were replayed through the current checker, so the DRC comparison
+uses one checker contract rather than mixing historical semantics:
 
 | corpus | before | after | fully routed before → after |
 |--------|-------:|------:|----------------------------:|
-| `srj15` | 705/720 (97.9%) | **718/720 (99.7%)** | 46 → **53** |
-| `bug-reports` | 1996/2447 (81.6%) | **2011/2447 (82.2%)** | 32 → **38** |
-| **total** | 2701/3167 (85.3%) | **2729/3167 (86.2%)** | 78 → **91** |
+| `bug-reports` | 1996/2447 (81.6%) | **2270/2447 (92.8%)** | 32 → **38** |
+| `srj15` | 705/720 (97.9%) | **719/720 (99.9%)** | 46 → **54** |
+| **total** | 2701/3167 (85.3%) | **2989/3167 (94.4%)** | 78 → **92** |
 
 Using the same corrected DRC checker on both route sets, exact-geometry findings
-fall **1227 → 714**, algorithmic route cost falls **340,055 → 332,354**,
-clean boards rise **49 → 66**, and fully-routed-clean boards rise **46 → 63**.
-The hardened scorer returns **`KEEP`**: workload identity is exact,
-completion and full-board counts improve in both corpus groups, errors remain
-zero, and every aggregate DRC/clean-board gate improves. This is an aggregate
-claim: 43 boards improve and four worsen; 18 boards become clean and one becomes
-dirty; 19 become fully-routed-clean and two lose that status.
+fall **1227 → 443**, clean boards rise **49 → 72**, and fully-routed-clean
+boards rise **46 → 66**. Total route cost rises 340,055 → 377,164 while the
+router retains 288 additional nets, so cost is reported rather than treated as a
+like-for-like route-quality regression. The overall hardened scorer returns
+**`KEEP`** with exact workload identity, zero errors, improved completion in both
+groups, and improved aggregate DRC/clean-board gates.
 
-The exact finished-code run improves the headline median and tail summaries:
-standard median **1.392 s → 0.080 s** (17.3×), nearest-rank p95
-**339.9 s → 41.7 s** (8.15×), sum of overlapping board timers
-**4715 s → 546 s** (8.63×), and
-external elapsed **715.55 s → 83.04 s** (8.62×). With 112 boards, the reported
-median is the arithmetic mean of sorted observations 56 and 57 (one-indexed), not
-a lower- or upper-middle value; nearest-rank p95 is observation 107. Peak per-board
-time falls 679.5 s → 83.0 s. The principal speed wins are unique-cell SRJ pad-halo
-filtering, O(1) exact Hanan-distance heuristics, and fused Jacobi pricing with
-planar/via neighbor enumeration that avoids per-expansion allocation; exact A/Bs
-retained normalized route output. Pad-ownership-aware smoothing and one bounded,
-board-wide DRC-scored via move contribute to the separate physical-quality work.
+Across that original-to-final comparison, standard median board time falls
+**1.392 s → 0.089 s**, nearest-rank p95 **339.922 s → 64.224 s**, maximum
+**679.474 s → 96.231 s**, and the sum of overlapping board timers **4715.180 s
+→ 702.733 s**. End-to-end external elapsed falls **715.55 s → 99.52 s**.
+
+The accepted pre-feature baseline at `21a0570` isolates the final via-spacing
+change from the earlier improvements. Against that baseline, routed nets improve
+**2965 → 2989**, full boards **91 → 92**, DRC **483 → 443**, clean boards
+**68 → 72**, and fully-routed-clean boards **65 → 66**. Route cost is
+effectively flat at 377,159 → 377,164 while 24 more nets are retained. Per-group
+completion is `bug-reports` 2247/2447 → 2270/2447 and `srj15` 718/720 →
+719/720. The per-group DRC result is deliberately stated: `bug-reports` improves
+345 → 295 (-50), while `srj15` regresses 138 → 148 (+10); the aggregate gate
+still improves by 40 findings.
+
+For that isolated A/B, median and nearest-rank p95 move slightly the other way
+(0.081 s → 0.089 s and 61.623 s → 64.224 s), while maximum time improves
+100.632 s → 96.231 s, the sum of overlapping per-board timers falls **732.030 s
+→ 702.733 s**, and end-to-end external elapsed falls **106.53 s → 99.52 s**.
+Ten boards gain 26 routed nets; `bugreport63` loses two while its DRC count improves
+2 → 0, for the net +24. DRC counts improve on 12 boards and worsen on six; the
+largest increases are `sample12` +20 and `sample16` +3, while `bugreport50` -18
+and `bugreport11` -16 are the largest reductions. The isolated baseline and final
+report SHA-256 values are respectively
+`8e200e19ecaf0867ef212e739c3a37c7a8ec645b543ffde86f2ca79276985903`
+and `defe7106f2562e4d89685f7c9f2aab4c6d7ddc43db399ca001085d13a6c22c51`.
+
+The physical rule is feature-aware: via-to-trace centre spacing is via radius +
+edge clearance + trace radius, while via-to-via centre spacing is both via radii
+plus edge clearance. Committed features stamp exact Euclidean exclusion disks into a
+dense group-aware landing guard (`free`, one owning group, or mixed owners), so a
+candidate via checks two cells in O(1); same-group copper remains exempt and planar
+moves continue to use their ordinary halo. The guard is rebuilt after rip-up and is
+not allocated for legacy callers that omit physical via spacing. Against the
+equivalent scan implementation on `bugreport50`, route time falls **117.657 s →
+44.390 s** with identical timing-stripped semantics (SHA-256
+`8803762864a31e1e376eedad3ae409283136195711b5219133fd630b75716b30`).
+
+The principal earlier speed wins remain unique-cell SRJ pad-halo filtering, O(1)
+exact Hanan-distance heuristics, and fused Jacobi pricing with planar/via neighbor
+enumeration that avoids per-expansion allocation. Pad-ownership-aware smoothing
+and one bounded, board-wide DRC-scored via move contribute to the separate
+physical-quality work.
 Legacy unlabeled-pad ownership is inferred only from immutable trace endpoints,
 preventing a moved interior via from claiming a foreign pad during repair scoring.
 The DRC bridge now preserves the standard physical
