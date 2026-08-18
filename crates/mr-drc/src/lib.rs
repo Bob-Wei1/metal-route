@@ -251,7 +251,7 @@ impl DrcBoard {
         }
         self.check_via_through_plane(&mut out);
         self.check_annular_ring(&mut out);
-        out.sort_by(violation_cmp);
+        sort_violations(&mut out);
         out
     }
 
@@ -1228,6 +1228,13 @@ fn violation_cmp(a: &Violation, b: &Violation) -> std::cmp::Ordering {
         .then_with(|| a.location.1.total_cmp(&b.location.1))
         .then_with(|| a.measured.total_cmp(&b.measured))
         .then_with(|| a.required.total_cmp(&b.required))
+}
+
+/// Sort an augmented violation stream by the checker's canonical deterministic
+/// ordering. Callers that add format-specific findings (for example board-edge
+/// checks) use this instead of duplicating the float/tie-break contract.
+pub fn sort_violations(violations: &mut [Violation]) {
+    violations.sort_by(violation_cmp);
 }
 
 #[cfg(test)]

@@ -29,8 +29,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mr_core::LayerMap;
-use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation};
-use mr_srj::{PcbTrace, RoutePoint, SimpleRouteJson};
+use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation, ViolationClass};
+use mr_srj::{BoardOutlineConstraint, PcbTrace, RoutePoint, SimpleRouteJson};
 
 use crate::{VIA_DRILL_MM, VIA_PAD_MM};
 
@@ -446,7 +446,7 @@ pub fn solution_to_drc_board(
 /// coherence gate is active; legacy and partial-rule inputs retain the historical
 /// single-clearance checker path.
 pub(crate) fn check_with_srj_rules(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation> {
-    srj.uniform_physical_rules().map_or_else(
+    let mut violations = srj.uniform_physical_rules().map_or_else(
         || board.check(),
         |physical| {
             board.check_with_pad_clearances(
@@ -456,7 +456,90 @@ pub(crate) fn check_with_srj_rules(srj: &SimpleRouteJson, board: &DrcBoard) -> V
                 physical.via_hole_to_hole_clearance_mm,
             )
         },
-    )
+    );
+    violations.extend(check_board_outline(srj, board));
+    mr_drc::sort_violations(&mut violations);
+    violations
+}
+
+/// Exact board-edge DRC for every emitted trace capsule and via disk. Board edge
+/// findings reuse the public `clearance` class with a reserved second identity so
+/// existing report schemas remain stable while repair gates can still distinguish
+/// them from copper-pair findings.
+fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation> {
+    const BOARD_EDGE_NET: &str = "__board_edge__";
+    const DEFAULT_TRACE_WIDTH: f64 = 0.15;
+    const DEFAULT_VIA_PAD_DIAMETER: f64 = 0.45;
+    const EDGE_EPS: f64 = 1e-9;
+
+    let trace_width = board
+        .segments
+        .iter()
+        .map(|segment| segment.width)
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .fold(0.0_f64, f64::max)
+        .max(
+            srj.min_trace_width
+                .filter(|width| width.is_finite() && *width > 0.0)
+                .unwrap_or(DEFAULT_TRACE_WIDTH),
+        );
+    let via_pad = board
+        .vias
+        .iter()
+        .map(|via| via.pad_diameter)
+        .filter(|diameter| diameter.is_finite() && *diameter > 0.0)
+        .fold(DEFAULT_VIA_PAD_DIAMETER, f64::max);
+    let constraint = match BoardOutlineConstraint::from_srj(srj, trace_width, via_pad) {
+        Ok(None) => return Vec::new(),
+        Ok(Some(constraint)) => Some(constraint),
+        Err(_) => None,
+    };
+    let required = srj
+        .physical_rules
+        .min_board_edge_clearance
+        .filter(|clearance| clearance.is_finite() && *clearance >= 0.0)
+        .unwrap_or(mr_srj::DEFAULT_MIN_BOARD_EDGE_CLEARANCE_MM);
+    let mut out = Vec::new();
+
+    for segment in &board.segments {
+        let radius = segment.width / 2.0;
+        let gap = constraint
+            .as_ref()
+            .and_then(|outline| outline.trace_edge_gap_with_radius(segment.a, segment.b, radius));
+        if gap.is_some_and(|measured| measured + EDGE_EPS >= required) {
+            continue;
+        }
+        out.push(Violation {
+            class: ViolationClass::Clearance,
+            layer: segment.layer,
+            location: (
+                (segment.a.0 + segment.b.0) / 2.0,
+                (segment.a.1 + segment.b.1) / 2.0,
+            ),
+            nets: (segment.net.clone(), BOARD_EDGE_NET.into()),
+            measured: gap.unwrap_or_else(|| -radius.abs().max(EDGE_EPS)),
+            required,
+        });
+    }
+
+    for via in &board.vias {
+        let radius = via.pad_diameter / 2.0;
+        let gap = constraint
+            .as_ref()
+            .and_then(|outline| outline.disk_edge_gap(via.center, radius));
+        if gap.is_some_and(|measured| measured + EDGE_EPS >= required) {
+            continue;
+        }
+        out.push(Violation {
+            class: ViolationClass::Clearance,
+            layer: via.from_layer.min(via.to_layer),
+            location: via.center,
+            nets: (via.net.clone(), BOARD_EDGE_NET.into()),
+            measured: gap.unwrap_or_else(|| -radius.abs().max(EDGE_EPS)),
+            required,
+        });
+    }
+    out
 }
 
 /// Quantise a coordinate to a fixed sub-micron grid so two vertices the router
@@ -594,6 +677,99 @@ mod tests {
 
     fn wire(x: f64, y: f64) -> RoutePoint {
         wire_on(x, y, "top")
+    }
+
+    #[test]
+    fn board_edge_drc_detects_concave_crossing_trace_and_outside_via() {
+        const FIXTURE: &str = include_str!(
+            "../../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+        );
+        let srj: SimpleRouteJson = serde_json::from_str(FIXTURE).unwrap();
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal, LayerKind::Signal],
+            segments: vec![Segment {
+                net: "n".into(),
+                layer: 0,
+                a: (-4.1066667, -4.7666667),
+                b: (5.1266667, -4.7666667),
+                width: 0.15,
+            }],
+            pads: Vec::new(),
+            vias: vec![Via {
+                net: "v".into(),
+                center: (0.0, -4.0),
+                pad_diameter: 0.45,
+                drill_diameter: 0.2,
+                from_layer: 0,
+                to_layer: 1,
+                antipad_radius: None,
+            }],
+            rules: DrcRules {
+                clearance: 0.15,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+        };
+        assert!(
+            board.check().is_empty(),
+            "generic copper DRC has no board shape"
+        );
+        let findings = check_with_srj_rules(&srj, &board);
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .all(|finding| finding.nets.1 == "__board_edge__"));
+        assert_eq!(findings[0].required, 0.2);
+    }
+
+    #[test]
+    fn board_edge_drc_accepts_capsules_and_disk_inside_inset() {
+        const FIXTURE: &str = include_str!(
+            "../../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+        );
+        let srj: SimpleRouteJson = serde_json::from_str(FIXTURE).unwrap();
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal, LayerKind::Signal],
+            segments: vec![
+                Segment {
+                    net: "n".into(),
+                    layer: 0,
+                    a: (-4.0, -4.0),
+                    b: (-2.4, 2.4),
+                    width: 0.15,
+                },
+                Segment {
+                    net: "n".into(),
+                    layer: 0,
+                    a: (-2.4, 2.4),
+                    b: (2.4, 2.4),
+                    width: 0.15,
+                },
+                Segment {
+                    net: "n".into(),
+                    layer: 0,
+                    a: (2.4, 2.4),
+                    b: (5.0, -4.0),
+                    width: 0.15,
+                },
+            ],
+            pads: Vec::new(),
+            vias: vec![Via {
+                net: "v".into(),
+                center: (-4.0, 0.0),
+                pad_diameter: 0.45,
+                drill_diameter: 0.2,
+                from_layer: 0,
+                to_layer: 1,
+                antipad_radius: None,
+            }],
+            rules: DrcRules {
+                clearance: 0.15,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+        };
+        assert!(check_with_srj_rules(&srj, &board).is_empty());
     }
 
     #[test]

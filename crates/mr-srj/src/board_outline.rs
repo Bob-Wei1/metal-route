@@ -143,13 +143,21 @@ impl BoardOutlineConstraint {
     /// Whether the complete capsule around centreline `[a,b]` lies inside the
     /// physical polygon with the declared edge clearance.
     pub fn trace_segment_is_legal(&self, a: Point, b: Point) -> bool {
+        self.trace_segment_with_radius_is_legal(a, b, self.trace_radius_mm)
+    }
+
+    /// Radius-parameterized form used by DRC for mixed-width external soups.
+    pub fn trace_segment_with_radius_is_legal(&self, a: Point, b: Point, radius: f64) -> bool {
+        if !radius.is_finite() || radius < 0.0 {
+            return false;
+        }
         if !finite_point(a) || !finite_point(b) || !point_in_polygon(a, &self.vertices) {
             return false;
         }
         if !point_in_polygon(b, &self.vertices) {
             return false;
         }
-        let required = self.trace_keepout_mm();
+        let required = self.edge_clearance_mm + radius;
         polygon_edges(&self.vertices)
             .all(|(p, q)| seg_seg_dist(a, b, p, q) + GEOMETRY_EPS >= required)
     }
@@ -157,6 +165,14 @@ impl BoardOutlineConstraint {
     /// Copper-edge gap from a trace capsule to the physical boundary. `None`
     /// means the centreline is not wholly contained by the polygon.
     pub fn trace_edge_gap(&self, a: Point, b: Point) -> Option<f64> {
+        self.trace_edge_gap_with_radius(a, b, self.trace_radius_mm)
+    }
+
+    /// Radius-parameterized copper-edge gap used by DRC for actual segment widths.
+    pub fn trace_edge_gap_with_radius(&self, a: Point, b: Point, radius: f64) -> Option<f64> {
+        if !radius.is_finite() || radius < 0.0 {
+            return None;
+        }
         if !finite_point(a)
             || !finite_point(b)
             || !point_in_polygon(a, &self.vertices)
@@ -173,16 +189,24 @@ impl BoardOutlineConstraint {
         if distance <= GEOMETRY_EPS && segment_crosses_polygon_boundary(a, b, &self.vertices) {
             return None;
         }
-        Some(distance - self.trace_radius_mm)
+        Some(distance - radius)
     }
 
     /// Copper-edge gap from a via disk to the physical boundary. `None` means the
     /// centre itself lies outside the polygon.
     pub fn via_edge_gap(&self, center: Point) -> Option<f64> {
+        self.disk_edge_gap(center, self.via_radius_mm)
+    }
+
+    /// Copper-edge gap for an arbitrary disk, used by DRC for actual via pads.
+    pub fn disk_edge_gap(&self, center: Point, radius: f64) -> Option<f64> {
+        if !radius.is_finite() || radius < 0.0 {
+            return None;
+        }
         if !finite_point(center) || !point_in_polygon(center, &self.vertices) {
             return None;
         }
-        Some(min_point_edge_distance(center, &self.vertices) - self.via_radius_mm)
+        Some(min_point_edge_distance(center, &self.vertices) - radius)
     }
 
     fn point_with_keepout_is_legal(&self, point: Point, required: f64) -> bool {

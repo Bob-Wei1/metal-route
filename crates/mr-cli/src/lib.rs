@@ -745,7 +745,9 @@ fn route_problem_impl(
     // soup and retain the beautified candidate only when the complete supported
     // projection is non-worsening. Legacy inputs keep their established path.
     let beautified = mr_srj::beautify_traces(traces.clone(), &srj.obstacles, min_clearance);
-    let traces = if physical.is_some() {
+    let board_edge_active = !srj.physical_rules.outline.is_empty()
+        || srj.physical_rules.min_board_edge_clearance.is_some();
+    let traces = if physical.is_some() || board_edge_active {
         select_nonworsening_srj_geometry(srj, traces, beautified, layer_count)
     } else {
         beautified
@@ -2089,6 +2091,48 @@ mod tests {
             violations.is_empty(),
             "bugreport01 must be DRC-clean after own-pad-aware via repair: {violations:#?}"
         );
+    }
+
+    /// Regression for the historical direct segment through bugreport21's
+    /// bottom-open concave cutout. The production route must remain fully connected
+    /// while every emitted trace capsule and via disk passes authoritative edge DRC.
+    #[test]
+    fn bugreport21_routes_around_concave_board_cutout() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport21 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport21");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route bugreport21");
+
+        assert_eq!((summary.routed, summary.total), (1, 1));
+        let violations = check_srj_solution(&srj, &traces, srj.layer_count);
+        assert!(
+            violations.is_empty(),
+            "bugreport21 route must clear the concave board edge: {violations:#?}"
+        );
+        assert!(traces
+            .iter()
+            .flat_map(|trace| trace.route.windows(2))
+            .all(|pair| match (&pair[0], &pair[1]) {
+                (
+                    RoutePoint::Wire {
+                        x: ax,
+                        y: ay,
+                        layer: al,
+                        ..
+                    },
+                    RoutePoint::Wire {
+                        x: bx,
+                        y: by,
+                        layer: bl,
+                        ..
+                    },
+                ) if al == bl => !(*ay < 2.0 && *by < 2.0 && *ax < -2.0 && *bx > 2.0),
+                _ => true,
+            }));
     }
 
     /// Coarse bounds-derived fill spacing must not inflate the physical clearance
