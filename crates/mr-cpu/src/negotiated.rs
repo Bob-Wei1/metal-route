@@ -3591,6 +3591,19 @@ fn dependency_guided_order(seed_order: &[usize], dependencies: &[Vec<usize>]) ->
     order
 }
 
+fn dependency_guided_restart_order(
+    seed_order: &[usize],
+    dependencies: &[Vec<usize>],
+) -> Option<Vec<usize>> {
+    if dependencies.len() != seed_order.len()
+        || !dependencies.iter().any(|targets| !targets.is_empty())
+    {
+        return None;
+    }
+    let order = dependency_guided_order(seed_order, dependencies);
+    (order != seed_order).then_some(order)
+}
+
 #[inline]
 fn guided_candidate_is_better(guided: &Committed, current: &Committed) -> bool {
     guided.iter().filter(|path| path.is_some()).count()
@@ -3999,9 +4012,7 @@ fn ripup_legalize(
     // One bounded global restart through the existing legalization primitive.
     // It is evaluated only when blocker telemetry changed the winning seed order,
     // and can replace the FIFO result only on a strict completion gain.
-    let has_dependency = dependencies.iter().any(|targets| !targets.is_empty());
-    let guided_order = dependency_guided_order(seed_group_order, &dependencies);
-    if has_dependency && guided_order != seed_group_order {
+    if let Some(guided_order) = dependency_guided_restart_order(seed_group_order, &dependencies) {
         let guided = legalize_in_order(
             grid,
             coords,
@@ -4567,6 +4578,13 @@ mod tests {
         assert!(!should_collect_guided_dependencies(
             GUIDED_RESTART_MAX_GROUPS + 1
         ));
+
+        let over_cap_seed: Vec<usize> = (0..=GUIDED_RESTART_MAX_GROUPS).collect();
+        assert_eq!(
+            dependency_guided_restart_order(&over_cap_seed, &[]),
+            None,
+            "an over-cap route carries no dependency table and must remain inert"
+        );
 
         let one = vec![Some(vec![0]), None];
         let equal_but_different = vec![None, Some(vec![1])];
