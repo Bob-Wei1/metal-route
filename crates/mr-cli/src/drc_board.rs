@@ -26,7 +26,7 @@
 //! roots follow stable trace order, layer indices follow the standard physical
 //! stack, and the checker itself sorts its output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mr_core::LayerMap;
 use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via};
@@ -82,6 +82,51 @@ fn obstacle_layers(obstacle: &mr_srj::Obstacle, layers: &LayerMap) -> Vec<u32> {
     }
 }
 
+/// Map every `connectedTo` alias carried by a directly connectivity-labelled
+/// obstacle to the declared electrical-net labels that use it. An alias may be
+/// ambiguous; callers only promote obstacles whose complete alias union resolves
+/// to exactly one label.
+fn connectivity_alias_map(obstacles: &[mr_srj::Obstacle]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for obstacle in obstacles {
+        let Some(net) = mr_srj::obstacle_connectivity_net(obstacle) else {
+            continue;
+        };
+        let label = format!("c{net}");
+        for alias in &obstacle.connected_to {
+            aliases
+                .entry(alias.clone())
+                .or_default()
+                .insert(label.clone());
+        }
+    }
+    aliases
+}
+
+/// Resolve an obstacle's authoritative electrical label. A direct
+/// `connectivity_netNNNN` declaration wins. Otherwise, connected aliases promote
+/// it only when their known label union contains exactly one connectivity net;
+/// ambiguous or entirely unknown aliases retain the conservative legacy fallback.
+fn obstacle_connectivity_label(
+    obstacle: &mr_srj::Obstacle,
+    aliases: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    if let Some(net) = mr_srj::obstacle_connectivity_net(obstacle) {
+        return Some(format!("c{net}"));
+    }
+    let resolved: BTreeSet<&String> = obstacle
+        .connected_to
+        .iter()
+        .filter_map(|alias| aliases.get(alias))
+        .flatten()
+        .collect();
+    if resolved.len() == 1 {
+        resolved.first().map(|label| (*label).clone())
+    } else {
+        None
+    }
+}
+
 fn point_xy(point: &RoutePoint) -> (f64, f64) {
     match point {
         RoutePoint::Wire { x, y, .. } | RoutePoint::Via { x, y, .. } => (*x, *y),
@@ -113,6 +158,15 @@ struct TaggedEndpoint {
     /// Physical layer at this terminal side. A first terminal Via owns only its
     /// `from_layer`; a last terminal Via owns only its `to_layer`.
     layer: u32,
+}
+
+/// Stable pre-connectivity identity. Keep tagged router groups distinct from
+/// untagged union-find roots even if a hand-built tag happens to look like a
+/// generated `net#N` display name.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum InitialNetIdentity {
+    Tagged(String),
+    Untagged(usize),
 }
 
 /// Build a physical [`DrcBoard`] from a routed SRJ solution.
@@ -162,26 +216,32 @@ pub fn reconstruct_net_labels(
         }
     }
     let mut net_name: Vec<String> = Vec::with_capacity(traces.len());
+    let mut net_identity: Vec<InitialNetIdentity> = Vec::with_capacity(traces.len());
     let mut root_name: BTreeMap<usize, String> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
-        let name = match &t.net {
-            Some(n) => n.clone(),
+        let (identity, name) = match &t.net {
+            Some(n) => (InitialNetIdentity::Tagged(n.clone()), n.clone()),
             None => {
                 let r = uf.find(i);
                 let n = root_name.len();
-                root_name
-                    .entry(r)
-                    .or_insert_with(|| format!("net#{n}"))
-                    .clone()
+                (
+                    InitialNetIdentity::Untagged(r),
+                    root_name
+                        .entry(r)
+                        .or_insert_with(|| format!("net#{n}"))
+                        .clone(),
+                )
             }
         };
+        net_identity.push(identity);
         net_name.push(name);
     }
-    let conn_pads: Vec<(&mr_srj::Obstacle, &str, Vec<u32>)> = srj
+    let connectivity_aliases = connectivity_alias_map(&srj.obstacles);
+    let conn_pads: Vec<(&mr_srj::Obstacle, String, Vec<u32>)> = srj
         .obstacles
         .iter()
         .filter_map(|obstacle| {
-            mr_srj::obstacle_connectivity_net(obstacle)
+            obstacle_connectivity_label(obstacle, &connectivity_aliases)
                 .map(|net| (obstacle, net, obstacle_layers(obstacle, &effective_layers)))
         })
         .collect();
@@ -195,23 +255,42 @@ pub fn reconstruct_net_labels(
                     && (y - o.center.y).abs() <= o.height / 2.0 + 1e-6
                     && occupied_layers.contains(&endpoint_layer)
             })
-            .min_by(|(a, _, _), (b, _, _)| {
+            .min_by(|(a, an, _), (b, bn, _)| {
                 (a.width * a.height)
                     .partial_cmp(&(b.width * b.height))
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| an.cmp(bn))
             })
-            .map(|(_, n, _)| format!("c{n}"))
+            .map(|(_, n, _)| n.clone())
     };
+    // A router group / untagged union-find component is already one electrical
+    // net. If any member terminates on a declared connectivity pad, promote that
+    // identity to every member; relabelling only the touching trace would split
+    // same-net copper into false `c...` versus `g...` clearance pairs. Malformed
+    // input can tie one group to several declared nets. Pick the lexicographically
+    // smallest label deterministically for the whole group; every other pad keeps
+    // its distinct declared label and therefore still exposes the short.
+    let mut connectivity_by_group: BTreeMap<InitialNetIdentity, BTreeSet<String>> = BTreeMap::new();
     for (i, t) in traces.iter().enumerate() {
-        let endpoint_net = [
+        for endpoint_net in [
             (t.route.first(), EndpointSide::First),
             (t.route.last(), EndpointSide::Last),
         ]
         .into_iter()
         .filter_map(|(point, side)| point.and_then(|point| connectivity_at(point, side)))
-        .next();
-        if let Some(c) = endpoint_net {
-            net_name[i] = c;
+        {
+            connectivity_by_group
+                .entry(net_identity[i].clone())
+                .or_default()
+                .insert(endpoint_net);
+        }
+    }
+    for (name, identity) in net_name.iter_mut().zip(net_identity) {
+        if let Some(connectivity) = connectivity_by_group
+            .get(&identity)
+            .and_then(|labels| labels.first())
+        {
+            name.clone_from(connectivity);
         }
     }
     net_name
@@ -224,6 +303,7 @@ pub fn solution_to_drc_board(
     layers: u32,
 ) -> DrcBoard {
     let effective_layers = LayerMap::standard(layers);
+    let connectivity_aliases = connectivity_alias_map(&srj.obstacles);
     let mut segments: Vec<Segment> = Vec::new();
     let mut vias: Vec<Via> = Vec::new();
     let mut pads: Vec<Pad> = Vec::new();
@@ -326,18 +406,17 @@ pub fn solution_to_drc_board(
         }
     }
 
-    // Obstacles: one Pad per occupied layer. The pad's net is the net of whichever
-    // trace terminates inside it (a routed net ends on its own pad) — so own-pad
-    // contact is immune. An obstacle no trace lands in is foreign copper / a keepout
-    // and keeps net `None` (conflicts with every net — never hides a real short).
+    // Obstacles: one Pad per occupied layer. Prefer declared connectivity and its
+    // unambiguous aliases; legacy pads fall back to the net of whichever trace
+    // terminates inside them. An unresolved obstacle no trace lands in is foreign
+    // copper / a keepout and keeps net `None` (never hiding a real short).
     for o in &srj.obstacles {
-        // A pad declaring a connectivity net is labelled `c<net>` to match the
-        // traces relabelled above, so the pad is immune to EVERY trace of its own
-        // electrical net (including the many sub-nets that share a junction pad). A
-        // pad with no connectivity net falls back to the trace-containment tag.
+        // A pad declaring a connectivity net, directly or through aliases that
+        // resolve uniquely, is labelled `c<net>` to match the traces relabelled
+        // above. An unresolved pad falls back to the trace-containment tag.
         for l in obstacle_layers(o, &effective_layers) {
             pads.push(Pad {
-                net: pad_net(o, l, &tagged_endpoints),
+                net: pad_net(o, l, &tagged_endpoints, &connectivity_aliases),
                 layer: l,
                 center: (o.center.x, o.center.y),
                 width: o.width,
@@ -367,14 +446,18 @@ fn quantize(v: f64) -> i64 {
 }
 
 /// The electrical net of obstacle `o`. Prefer the ground-truth `connectivity_netNNNN`
-/// it declares (labelled `c<net>` to match the connectivity-relabelled traces), so a
-/// pad is immune to its own net even when several router sub-nets share it. With no
-/// declared connectivity net, fall back to the net of whichever tagged trace endpoint
-/// lands inside the pad rect (inclusive); failing that, `None` (foreign / keepout —
-/// conflicts with every net, never hiding a real short).
-fn pad_net(o: &mr_srj::Obstacle, layer: u32, tagged: &[TaggedEndpoint]) -> Option<String> {
-    if let Some(n) = mr_srj::obstacle_connectivity_net(o) {
-        return Some(format!("c{n}"));
+/// it declares, directly or through aliases that resolve uniquely (labelled `c<net>`
+/// to match the connectivity-relabelled traces). Otherwise fall back to whichever
+/// tagged trace endpoint lands inside the pad rect (inclusive); failing that, `None`
+/// (foreign / keepout — conflicts with every net, never hiding a real short).
+fn pad_net(
+    o: &mr_srj::Obstacle,
+    layer: u32,
+    tagged: &[TaggedEndpoint],
+    connectivity_aliases: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<String> {
+    if let Some(net) = obstacle_connectivity_label(o, connectivity_aliases) {
+        return Some(net);
     }
     let (hw, hh) = (o.width / 2.0, o.height / 2.0);
     let (cx, cy) = (o.center.x, o.center.y);
@@ -630,6 +713,222 @@ mod tests {
             board.check().is_empty(),
             "sub-nets sharing a connectivity pad must be one electrical net: {:?}",
             board.check()
+        );
+    }
+
+    #[test]
+    fn unique_connectivity_alias_labels_routed_and_unrouted_obstacles() {
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 8.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [
+                {
+                    "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["pcb_smtpad_owner", "connectivity_net7", "source_net_3"]
+                },
+                {
+                    "type": "rect", "center": {"x": 3.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["pcb_smtpad_endpoint", "source_net_3"]
+                },
+                {
+                    "type": "rect", "center": {"x": 6.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["source_net_3"]
+                }
+            ],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let trace = PcbTrace::new(vec![wire(3.0, 0.0), wire(4.0, 0.0)]).with_net("g9");
+
+        assert_eq!(
+            reconstruct_net_labels(&srj, std::slice::from_ref(&trace), 1),
+            ["cconnectivity_net7"],
+            "an endpoint pad must inherit the unique connectivity label declared by a sibling alias"
+        );
+
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
+        let board = solution_to_drc_board(&srj, &[trace], rules, 1);
+        assert_eq!(
+            board
+                .pads
+                .iter()
+                .map(|pad| pad.net.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("cconnectivity_net7"),
+                Some("cconnectivity_net7"),
+                Some("cconnectivity_net7")
+            ],
+            "unique aliases must label fixed obstacles even without a routed terminal"
+        );
+        assert!(
+            board.check().is_empty(),
+            "same-net alias pads and their routed copper must be immune"
+        );
+    }
+
+    #[test]
+    fn ambiguous_connectivity_alias_keeps_obstacle_foreign() {
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 8.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [
+                {
+                    "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["connectivity_net7", "shared_alias"]
+                },
+                {
+                    "type": "rect", "center": {"x": 3.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["connectivity_net8", "shared_alias"]
+                },
+                {
+                    "type": "rect", "center": {"x": 6.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["shared_alias"]
+                }
+            ],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
+        let board = solution_to_drc_board(&srj, &[], rules, 1);
+
+        assert_eq!(
+            board
+                .pads
+                .iter()
+                .map(|pad| pad.net.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("cconnectivity_net7"), Some("cconnectivity_net8"), None],
+            "an alias shared by distinct connectivity nets must not confer ownership"
+        );
+    }
+
+    #[test]
+    fn connectivity_relabel_propagates_across_router_group() {
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 5.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.4, "height": 0.4, "layers": ["top"],
+                "connectedTo": ["connectivity_net7"]
+            }],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let traces = vec![
+            PcbTrace::new(vec![wire(0.0, 0.0), wire(4.0, 0.0)]).with_net("g2"),
+            // Same router group, but neither terminal touches the pad.
+            PcbTrace::new(vec![wire(1.0, 0.05), wire(4.0, 0.05)]).with_net("g2"),
+        ];
+
+        assert_eq!(
+            reconstruct_net_labels(&srj, &traces, 1),
+            ["cconnectivity_net7", "cconnectivity_net7"]
+        );
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
+        let board = solution_to_drc_board(&srj, &traces, rules, 1);
+        assert!(
+            board.check().is_empty(),
+            "a connectivity hit must not split one router group into false c/g conflicts"
+        );
+    }
+
+    #[test]
+    fn connectivity_relabel_propagates_across_untagged_component() {
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 5.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.4, "height": 0.4, "layers": ["top"],
+                "connectedTo": ["connectivity_net7"]
+            }],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let traces = vec![
+            PcbTrace::new(vec![wire(0.0, 0.0), wire(4.0, 0.0)]),
+            // Shares one physical top-layer vertex with the first trace, so the
+            // untagged union-find fallback makes both traces one component.
+            PcbTrace::new(vec![wire(4.0, 0.0), wire(4.0, 0.05), wire(1.0, 0.05)]),
+        ];
+
+        assert_eq!(
+            reconstruct_net_labels(&srj, &traces, 1),
+            ["cconnectivity_net7", "cconnectivity_net7"]
+        );
+    }
+
+    #[test]
+    fn multiple_connectivity_nets_choose_canonical_group_label_and_conflict() {
+        let v = serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": -1.0, "maxX": 5.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [
+                {
+                    "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["connectivity_net9"]
+                },
+                {
+                    "type": "rect", "center": {"x": 4.0, "y": 0.0},
+                    "width": 0.4, "height": 0.4, "layers": ["top"],
+                    "connectedTo": ["connectivity_net2"]
+                }
+            ],
+            "connections": [],
+        });
+        let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
+        let left = PcbTrace::new(vec![wire(0.0, 0.0), wire(2.0, 0.0)]).with_net("g0");
+        let right = PcbTrace::new(vec![wire(4.0, 0.0), wire(2.0, 0.0)]).with_net("g0");
+
+        assert_eq!(
+            reconstruct_net_labels(&srj, &[left.clone(), right.clone()], 1),
+            ["cconnectivity_net2", "cconnectivity_net2"]
+        );
+        assert_eq!(
+            reconstruct_net_labels(&srj, &[right.clone(), left.clone()], 1),
+            ["cconnectivity_net2", "cconnectivity_net2"],
+            "canonical connectivity identity must not depend on trace order"
+        );
+
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
+        let board = solution_to_drc_board(&srj, &[left, right], rules, 1);
+        let findings = board.check();
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.class == ViolationClass::Clearance)
+                .count(),
+            1,
+            "the noncanonical connectivity pad must remain foreign and expose the short"
+        );
+        assert_eq!(
+            findings[0].nets,
+            ("cconnectivity_net2".into(), "cconnectivity_net9".into())
         );
     }
 
