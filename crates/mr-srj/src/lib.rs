@@ -268,6 +268,9 @@ fn uniform_lines(origin: f64, res: f64, count: u32) -> Vec<f64> {
 /// pitch (sub-micron on a mm board) so genuinely distinct features survive.
 const LINE_EPSILON: f64 = 1e-6;
 
+/// Mirrors the authoritative clearance comparison tolerance in `mr-drc`.
+const DRC_CLEARANCE_EPSILON: f64 = 1e-9;
+
 /// Default soft ceiling on the planar cell count (`x_lines.len() · y_lines.len()`).
 /// This is the historical fixed budget and remains the **default** (lever C1 is
 /// tunable, not on-by-default): a subset sweep found that raising it strands no extra
@@ -1159,7 +1162,14 @@ pub fn rasterize_with_layers(
             for layer in obstacle_layers(obstacle, &layers) {
                 for y in y_range.clone() {
                     for x in x_range.clone() {
-                        via_forbidden[mapping.dims.idx3(x, y, layer) as usize] = true;
+                        if point_in_via_halo(
+                            obstacle,
+                            mapping.x_lines[x as usize],
+                            mapping.y_lines[y as usize],
+                            via_margin_mm,
+                        ) {
+                            via_forbidden[mapping.dims.idx3(x, y, layer) as usize] = true;
+                        }
                     }
                 }
             }
@@ -1414,13 +1424,36 @@ fn via_pad_cells_for_point(
         !obstacles.iter().enumerate().any(|(index, obstacle)| {
             !owned.contains(&index)
                 && occupied_layers[index].contains(&layer)
-                && lx >= obstacle.center.x - obstacle.width / 2.0 - via_margin_mm
-                && lx <= obstacle.center.x + obstacle.width / 2.0 + via_margin_mm
-                && ly >= obstacle.center.y - obstacle.height / 2.0 - via_margin_mm
-                && ly <= obstacle.center.y + obstacle.height / 2.0 + via_margin_mm
+                && point_in_via_halo(obstacle, lx, ly, via_margin_mm)
         })
     });
     candidates
+}
+
+/// Whether a via centre at `(x, y)` falls within `margin` of an obstacle rectangle.
+/// This is the exact Euclidean point-to-rectangle distance: the via annulus is
+/// circular, so diagonal points outside the rounded corner remain legal. Like the
+/// authoritative DRC, a separation exactly at `margin` is legal and the 1e-9
+/// comparison epsilon is applied to the required distance. Malformed non-finite or
+/// negative geometry blocks conservatively.
+fn point_in_via_halo(obstacle: &Obstacle, x: f64, y: f64, margin: f64) -> bool {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !margin.is_finite()
+        || margin < 0.0
+        || !obstacle.center.x.is_finite()
+        || !obstacle.center.y.is_finite()
+        || !obstacle.width.is_finite()
+        || !obstacle.height.is_finite()
+        || obstacle.width < 0.0
+        || obstacle.height < 0.0
+    {
+        return true;
+    }
+    let dx = ((x - obstacle.center.x).abs() - obstacle.width / 2.0).max(0.0);
+    let dy = ((y - obstacle.center.y).abs() - obstacle.height / 2.0).max(0.0);
+    let conflict_distance = (margin - DRC_CLEARANCE_EPSILON).max(0.0);
+    dx.hypot(dy) < conflict_distance
 }
 
 /// Half-open index range of sorted finite line coordinates within the inclusive
@@ -2761,6 +2794,140 @@ mod tests {
         assert!(
             prob.grid.is_via_forbidden(probe),
             "0.225 mm via radius + 0.15 mm clearance must reserve this landing"
+        );
+    }
+
+    fn euclidean_via_halo_probe(
+        point: (f64, f64),
+        add_owned_pad: bool,
+    ) -> (RasterizedProblem, CellIdx) {
+        let mut obstacles = vec![Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 0.0,
+                y: 0.0,
+                layer: None,
+            },
+            width: 0.2,
+            height: 0.2,
+            layers: vec!["top".into()],
+            connected_to: vec!["foreign".into()],
+        }];
+        if add_owned_pad {
+            obstacles.push(Obstacle {
+                kind: "rect".into(),
+                center: Point {
+                    x: point.0,
+                    y: point.1,
+                    layer: None,
+                },
+                width: 0.01,
+                height: 0.01,
+                layers: vec!["top".into()],
+                connected_to: vec!["probe".into()],
+            });
+        }
+        let srj = SimpleRouteJson {
+            layer_count: 2,
+            min_trace_width: Some(0.15),
+            min_clearance: Some(0.15),
+            obstacles,
+            connections: vec![Connection {
+                name: "probe".into(),
+                root_connection_name: None,
+                points_to_connect: vec![
+                    Point {
+                        x: point.0,
+                        y: point.1,
+                        layer: Some("top".into()),
+                    },
+                    Point {
+                        x: 1.5,
+                        y: 1.5,
+                        layer: Some("top".into()),
+                    },
+                ],
+            }],
+            bounds: Bounds {
+                min_x: -1.0,
+                max_x: 2.0,
+                min_y: -1.0,
+                max_y: 2.0,
+            },
+        };
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 1, 0.15, 0.45);
+        let cell = prob.mapping.point_to_cell_layer(point, 0);
+        (prob, cell)
+    }
+
+    #[test]
+    fn via_halo_diagonal_just_outside_is_legal_and_preserves_own_exemption() {
+        let margin = 0.15 + 0.45 / 2.0;
+        let offset = 0.1 + margin / std::f64::consts::SQRT_2 + 1e-6;
+        let point = (offset, offset);
+
+        let (foreign_only, cell) = euclidean_via_halo_probe(point, false);
+        assert!(
+            !foreign_only.grid.is_via_forbidden(cell),
+            "a diagonal landing just outside the circular via halo must remain legal"
+        );
+
+        let (with_owned_pad, owned_cell) = euclidean_via_halo_probe(point, true);
+        assert!(with_owned_pad.grid.is_via_forbidden(owned_cell));
+        assert!(with_owned_pad.nets[0].passable_pads.contains(&owned_cell));
+        assert!(
+            with_owned_pad.nets[0]
+                .via_passable_pads
+                .contains(&owned_cell),
+            "foreign-halo clipping must use the same Euclidean corner as the global mask"
+        );
+    }
+
+    #[test]
+    fn via_halo_diagonal_just_inside_is_blocked_and_clips_own_exemption() {
+        let margin = 0.15 + 0.45 / 2.0;
+        let offset = 0.1 + margin / std::f64::consts::SQRT_2 - 1e-6;
+        let point = (offset, offset);
+
+        let (foreign_only, cell) = euclidean_via_halo_probe(point, false);
+        assert!(
+            foreign_only.grid.is_via_forbidden(cell),
+            "a diagonal landing just inside the circular via halo must be blocked"
+        );
+
+        let (with_owned_pad, owned_cell) = euclidean_via_halo_probe(point, true);
+        assert!(with_owned_pad.grid.is_via_forbidden(owned_cell));
+        assert!(with_owned_pad.nets[0].passable_pads.contains(&owned_cell));
+        assert!(
+            !with_owned_pad.nets[0]
+                .via_passable_pads
+                .contains(&owned_cell),
+            "the same foreign halo must clip an overlapping own-pad exemption"
+        );
+    }
+
+    #[test]
+    fn via_halo_axis_boundary_is_legal_but_two_eps_inside_is_blocked() {
+        let margin = 0.15 + 0.45 / 2.0;
+        let boundary = (0.1 + margin, 0.0);
+        let (prob, cell) = euclidean_via_halo_probe(boundary, false);
+        assert!(
+            !prob.grid.is_via_forbidden(cell),
+            "a via exactly at the required clearance is legal under DRC epsilon semantics"
+        );
+
+        let just_inside = (boundary.0 - 2.0 * DRC_CLEARANCE_EPSILON, boundary.1);
+        let (prob, cell) = euclidean_via_halo_probe(just_inside, false);
+        assert!(
+            prob.grid.is_via_forbidden(cell),
+            "a via two DRC epsilons inside the axis boundary must be blocked"
+        );
+
+        let just_outside = (boundary.0 + 1e-6, boundary.1);
+        let (prob, cell) = euclidean_via_halo_probe(just_outside, false);
+        assert!(
+            !prob.grid.is_via_forbidden(cell),
+            "the first point beyond the axis boundary must remain legal"
         );
     }
 
