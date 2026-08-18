@@ -45,8 +45,12 @@ use crate::dijkstra::dijkstra;
 /// neighbour with distance `prev_dist`, or `Cost::MAX` if either side is blocked /
 /// unreachable.
 #[inline]
-fn relax(grid: &Grid, n: CellIdx, prev_dist: Cost) -> Cost {
-    if prev_dist == Cost::MAX || grid.is_obstacle(n) {
+fn relax(grid: &Grid, prev: CellIdx, n: CellIdx, prev_dist: Cost) -> Cost {
+    if prev_dist == Cost::MAX
+        || grid.is_obstacle(n)
+        || grid.is_board_forbidden(n)
+        || grid.is_board_planar_step_forbidden(prev, n)
+    {
         return Cost::MAX;
     }
     prev_dist.saturating_add(grid.cost_at(n))
@@ -61,7 +65,11 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
     let dims = grid.dims;
     let (w, h) = (dims.w, dims.h);
     let mut dist = vec![Cost::MAX; dims.len()];
-    if dims.is_empty() || !dims.contains(src) || grid.is_obstacle(src) {
+    if dims.is_empty()
+        || !dims.contains(src)
+        || grid.is_obstacle(src)
+        || grid.is_board_forbidden(src)
+    {
         return dist;
     }
     dist[src as usize] = 0;
@@ -79,7 +87,7 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
             for x in 1..w {
                 let cur = dims.idx3(x, y, layer);
                 let prev = dims.idx3(x - 1, y, layer);
-                let cand = relax(grid, cur, dist[prev as usize]);
+                let cand = relax(grid, prev, cur, dist[prev as usize]);
                 if cand < dist[cur as usize] {
                     dist[cur as usize] = cand;
                     changed = true;
@@ -89,7 +97,7 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
             for x in (0..w.saturating_sub(1)).rev() {
                 let cur = dims.idx3(x, y, layer);
                 let prev = dims.idx3(x + 1, y, layer);
-                let cand = relax(grid, cur, dist[prev as usize]);
+                let cand = relax(grid, prev, cur, dist[prev as usize]);
                 if cand < dist[cur as usize] {
                     dist[cur as usize] = cand;
                     changed = true;
@@ -103,7 +111,7 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
             for y in 1..h {
                 let cur = dims.idx3(x, y, layer);
                 let prev = dims.idx3(x, y - 1, layer);
-                let cand = relax(grid, cur, dist[prev as usize]);
+                let cand = relax(grid, prev, cur, dist[prev as usize]);
                 if cand < dist[cur as usize] {
                     dist[cur as usize] = cand;
                     changed = true;
@@ -113,7 +121,7 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
             for y in (0..h.saturating_sub(1)).rev() {
                 let cur = dims.idx3(x, y, layer);
                 let prev = dims.idx3(x, y + 1, layer);
-                let cand = relax(grid, cur, dist[prev as usize]);
+                let cand = relax(grid, prev, cur, dist[prev as usize]);
                 if cand < dist[cur as usize] {
                     dist[cur as usize] = cand;
                     changed = true;
@@ -328,6 +336,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sweep_matches_bfs_with_board_nodes_and_asymmetric_edge_masks() {
+        let dims = Dims::new(3, 2);
+        let mut grid = Grid::filled(dims, 1);
+        grid.board_constraint = vec![0; dims.len()];
+        // Only the destination half of 0 <-> 1 carries the exclusion. The core
+        // predicate must still reject both traversal directions.
+        grid.board_constraint[dims.idx(1, 0) as usize] |= Grid::BOARD_EDGE_NEG_X;
+        grid.board_constraint[dims.idx(2, 1) as usize] |= Grid::BOARD_TRACE_NODE;
+
+        for src in 0..dims.len() as CellIdx {
+            assert_eq!(
+                sweep_distance_field(&grid, src),
+                bfs_distance_field(&grid, src),
+                "source {src}"
+            );
+        }
+        let field = sweep_distance_field(&grid, dims.idx(0, 0));
+        assert_eq!(field[dims.idx(1, 0) as usize], 3);
+        assert_eq!(field[dims.idx(2, 1) as usize], Cost::MAX);
     }
 
     #[test]

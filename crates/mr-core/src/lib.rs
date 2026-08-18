@@ -475,18 +475,24 @@ impl Grid {
         if ul != vl {
             return true;
         }
-        let bit = if ux == vx && uy == vy + 1 {
-            Self::BOARD_EDGE_NEG_Y
+        let (source_bit, destination_bit) = if ux == vx && uy == vy + 1 {
+            (Self::BOARD_EDGE_NEG_Y, Self::BOARD_EDGE_POS_Y)
         } else if uy == vy && ux == vx + 1 {
-            Self::BOARD_EDGE_NEG_X
+            (Self::BOARD_EDGE_NEG_X, Self::BOARD_EDGE_POS_X)
         } else if uy == vy && ux + 1 == vx {
-            Self::BOARD_EDGE_POS_X
+            (Self::BOARD_EDGE_POS_X, Self::BOARD_EDGE_NEG_X)
         } else if ux == vx && uy + 1 == vy {
-            Self::BOARD_EDGE_POS_Y
+            (Self::BOARD_EDGE_POS_Y, Self::BOARD_EDGE_NEG_Y)
         } else {
             return true;
         };
-        self.board_constraint[u as usize] & bit != 0
+        let Some(&source_mask) = self.board_constraint.get(u as usize) else {
+            return true;
+        };
+        let Some(&destination_mask) = self.board_constraint.get(v as usize) else {
+            return true;
+        };
+        source_mask & source_bit != 0 || destination_mask & destination_bit != 0
     }
 
     pub fn has_board_constraints(&self) -> bool {
@@ -999,6 +1005,33 @@ mod tests {
         let board: BoardRoute =
             serde_json::from_str(r#"{"results":[],"unrouted":[],"congestion":[0,0]}"#).unwrap();
         assert!(board.groups.is_empty());
+    }
+
+    #[test]
+    fn board_planar_edge_masks_are_symmetric_from_either_endpoint() {
+        let dims = Dims::new(2, 2);
+        for (u, v, source_bit, destination_bit) in [
+            (
+                dims.idx(0, 0),
+                dims.idx(1, 0),
+                Grid::BOARD_EDGE_POS_X,
+                Grid::BOARD_EDGE_NEG_X,
+            ),
+            (
+                dims.idx(0, 0),
+                dims.idx(0, 1),
+                Grid::BOARD_EDGE_POS_Y,
+                Grid::BOARD_EDGE_NEG_Y,
+            ),
+        ] {
+            for (cell, bit) in [(u, source_bit), (v, destination_bit)] {
+                let mut grid = Grid::filled(dims, 1);
+                grid.board_constraint = vec![0; dims.len()];
+                grid.board_constraint[cell as usize] = bit;
+                assert!(grid.is_board_planar_step_forbidden(u, v));
+                assert!(grid.is_board_planar_step_forbidden(v, u));
+            }
+        }
     }
 
     #[test]

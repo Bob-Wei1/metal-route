@@ -62,6 +62,11 @@ pub const VIA_DRILL_MM: f64 = 0.2;
 /// accepted geometry change.
 const DRC_SCORE_QUANTUM_MM: f64 = 1e-6;
 
+/// Reserved pseudo-net used by the exact outline checker. Geometry transforms may
+/// improve ordinary copper DRC, but never by introducing or worsening one of these
+/// physical-board-boundary findings.
+const BOARD_EDGE_NET: &str = "__board_edge__";
+
 /// Stable identity available in the public DRC result. Location is deliberately
 /// excluded: moving a vertex or via changes the checker-reported feature centroid,
 /// even when it is the same physical finding being improved. Because `Violation`
@@ -121,6 +126,52 @@ fn drc_severity_profiles(
     profiles
 }
 
+fn board_edge_severity_profiles(
+    violations: &[mr_drc::Violation],
+) -> std::collections::BTreeMap<DrcFindingIdentity, Vec<u64>> {
+    let mut profiles = std::collections::BTreeMap::<DrcFindingIdentity, Vec<u64>>::new();
+    for violation in violations.iter().filter(|violation| {
+        violation.nets.0 == BOARD_EDGE_NET || violation.nets.1 == BOARD_EDGE_NET
+    }) {
+        profiles
+            .entry(drc_finding_identity(violation))
+            .or_default()
+            .push(drc_severity(violation));
+    }
+    for severity in profiles.values_mut() {
+        severity.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    profiles
+}
+
+/// Board-edge safety is a hard constraint above the ordinary total-finding score.
+/// Removing findings is allowed, but every retained identity/multiplicity rank must
+/// have existed before and be no more severe. This prevents a transform from
+/// trading two copper findings for one newly unsafe outline crossing.
+fn board_edge_findings_are_not_worse(
+    before: &[mr_drc::Violation],
+    candidate: &[mr_drc::Violation],
+) -> bool {
+    let before = board_edge_severity_profiles(before);
+    let candidate = board_edge_severity_profiles(candidate);
+    for (identity, candidate_severity) in &candidate {
+        let Some(before_severity) = before.get(identity) else {
+            return false;
+        };
+        if candidate_severity.len() > before_severity.len() {
+            return false;
+        }
+        if candidate_severity
+            .iter()
+            .zip(before_severity)
+            .any(|(after, before)| after > before)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether a candidate is an unambiguous authoritative DRC improvement.
 ///
 /// Fewer findings remains the primary objective. At equal count, identities and
@@ -132,6 +183,9 @@ fn drc_candidate_is_not_worse(
     before: &[mr_drc::Violation],
     candidate: &[mr_drc::Violation],
 ) -> bool {
+    if !board_edge_findings_are_not_worse(before, candidate) {
+        return false;
+    }
     if candidate.len() != before.len() {
         return candidate.len() < before.len();
     }
@@ -1587,6 +1641,33 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_drc_comparator_never_trades_board_edge_safety_for_count() {
+        let ordinary_before = [
+            clearance_violation(0.05, ("A", "B")),
+            clearance_violation(0.06, ("C", "D")),
+        ];
+        let introduced_edge = [clearance_violation(0.19, ("trace", BOARD_EDGE_NET))];
+        assert!(
+            !drc_candidate_is_better(&ordinary_before, &introduced_edge),
+            "fewer total findings cannot introduce a board-edge violation"
+        );
+
+        let before = [
+            clearance_violation(0.15, ("trace", BOARD_EDGE_NET)),
+            clearance_violation(0.05, ("A", "B")),
+        ];
+        let worsened_edge = [clearance_violation(0.10, ("trace", BOARD_EDGE_NET))];
+        assert!(
+            !drc_candidate_is_better(&before, &worsened_edge),
+            "removing an ordinary finding cannot worsen the retained board edge"
+        );
+
+        let improved_edge = [clearance_violation(0.16, ("trace", BOARD_EDGE_NET))];
+        assert!(drc_candidate_is_better(&before, &improved_edge));
+        assert!(drc_candidate_is_better(&before, &[]));
+    }
+
+    #[test]
     fn authoritative_drc_comparator_quantises_float_jitter() {
         let before = [clearance_violation(0.100_000_0, ("A", "B"))];
         let sub_nanometre_change = [clearance_violation(0.100_000_4, ("A", "B"))];
@@ -1931,7 +2012,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn ragged_metal_adapter_preserves_exact_output_and_static_mask_fallback() {
+    fn ragged_metal_adapter_preserves_exact_output_and_cpu_fallbacks() {
         let dims = mr_core::Dims::with_layers(9, 7, 3);
         let coords = GridCoords::from_lines(
             vec![0.0, 0.2, 0.7, 1.9, 2.0, 4.5, 4.7, 8.0, 8.1],
@@ -1997,6 +2078,25 @@ mod tests {
         assert!(
             !provider.succeeded.get(),
             "a selected static via mask must fail the ragged request closed"
+        );
+        assert_eq!(fallback, cpu);
+
+        // Exact board masks include directed planar-edge permissions that the
+        // Metal kernels do not carry yet. The public backend rejects even an
+        // otherwise all-zero selected mask, and the negotiated router reruns the
+        // complete isolated batch on CPU without changing its result.
+        let mut outlined_grid = grid.clone();
+        outlined_grid.board_constraint = vec![0; dims.len()];
+        outlined_grid.board_constraint[dims.idx3(1, 1, 0) as usize] |= Grid::BOARD_EDGE_POS_X;
+        let cpu = router.route_with_outcome(&outlined_grid, &nets).unwrap();
+        let provider = RecordingSystemMetalProvider::default();
+        let fallback = router
+            .route_with_isolated_provider(&outlined_grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(provider.calls.get(), 1);
+        assert!(
+            !provider.succeeded.get(),
+            "an exact board mask must fail the ragged request closed"
         );
         assert_eq!(fallback, cpu);
     }

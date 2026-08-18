@@ -34,11 +34,29 @@
 //!
 //! On non-macOS targets the public surface still exists, but every entry point
 //! returns [`RouterError::BackendUnavailable`] so the workspace compiles
-//! everywhere.
+//! everywhere. Exact board-outline masks likewise fail every public Metal field,
+//! router, and isolated-batch operation closed until the kernels carry those
+//! node/edge constraints; provider callers then rerun the whole batch on CPU.
 
 use mr_core::{BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError};
 
 type FlatBatchedSweep = (Vec<Cost>, Option<Vec<u32>>);
+
+const BOARD_CONSTRAINT_UNAVAILABLE: &str =
+    "Metal routing does not yet support exact board-outline constraints";
+
+/// Metal kernels currently carry cell costs but not the exact board node, via,
+/// and directed-edge masks. Fail the complete public operation closed so callers
+/// can rerun it on the CPU without ever accepting a path through the outline.
+fn reject_board_constraints(grid: &Grid) -> Result<(), RouterError> {
+    if grid.has_board_constraints() {
+        Err(RouterError::BackendUnavailable(
+            BOARD_CONSTRAINT_UNAVAILABLE.into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Inclusive planar rectangle used by [`metal_route_isolated_batch`].
 ///
@@ -113,12 +131,14 @@ mod gpu;
 /// source) are `Cost::MAX`. Equal to `mr_cpu::bfs_distance_field`.
 #[cfg(target_os = "macos")]
 pub fn metal_wavefront_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+    reject_board_constraints(grid)?;
     gpu::wavefront_field(grid, src)
 }
 
 /// Non-macOS fallback: the Metal backend is unavailable.
 #[cfg(not(target_os = "macos"))]
-pub fn metal_wavefront_field(_grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+pub fn metal_wavefront_field(grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+    reject_board_constraints(grid)?;
     Err(RouterError::BackendUnavailable(
         "Metal compute is only available on macOS".into(),
     ))
@@ -130,12 +150,14 @@ pub fn metal_wavefront_field(_grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, R
 /// `mr_cpu::bfs_distance_field`.
 #[cfg(target_os = "macos")]
 pub fn metal_sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+    reject_board_constraints(grid)?;
     gpu::sweep_field(grid, src)
 }
 
 /// Non-macOS fallback: the Metal backend is unavailable.
 #[cfg(not(target_os = "macos"))]
-pub fn metal_sweep_field(_grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+pub fn metal_sweep_field(grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+    reject_board_constraints(grid)?;
     Err(RouterError::BackendUnavailable(
         "Metal compute is only available on macOS".into(),
     ))
@@ -148,6 +170,7 @@ pub fn metal_sweep_field(_grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, Route
 /// would exceed the documented safety bound return an error before allocation.
 #[cfg(target_os = "macos")]
 pub fn metal_sweep_fields(grid: &Grid, sources: &[CellIdx]) -> Result<Vec<Vec<Cost>>, RouterError> {
+    reject_board_constraints(grid)?;
     if !grid.is_well_formed() {
         return Err(RouterError::MalformedGrid);
     }
@@ -171,9 +194,10 @@ pub fn metal_sweep_fields(grid: &Grid, sources: &[CellIdx]) -> Result<Vec<Vec<Co
 /// Non-macOS fallback: the Metal backend is unavailable.
 #[cfg(not(target_os = "macos"))]
 pub fn metal_sweep_fields(
-    _grid: &Grid,
+    grid: &Grid,
     _sources: &[CellIdx],
 ) -> Result<Vec<Vec<Cost>>, RouterError> {
+    reject_board_constraints(grid)?;
     Err(RouterError::BackendUnavailable(
         "Metal compute is only available on macOS".into(),
     ))
@@ -393,6 +417,7 @@ pub fn metal_route_isolated_batch(
     windows: &[MetalWindow],
     edges: MetalEdgeCosts<'_>,
 ) -> Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+    reject_board_constraints(grid)?;
     if !grid.is_well_formed() {
         return Err(RouterError::MalformedGrid);
     }
@@ -684,6 +709,7 @@ fn ragged_isolated_batch_impl(
     edges: MetalEdgeCosts<'_>,
 ) -> Result<(Vec<Option<MetalIsolatedRoute>>, RaggedRouteStats), RouterError> {
     let unavailable = |message: String| RouterError::BackendUnavailable(message);
+    reject_board_constraints(grid)?;
     if !grid.is_well_formed() {
         return Err(unavailable(
             "ragged isolated batch has a malformed grid".into(),
@@ -961,11 +987,12 @@ fn ragged_isolated_batch_impl(
 #[cfg(not(target_os = "macos"))]
 #[doc(hidden)]
 pub fn metal_route_isolated_batch_ragged(
-    _grid: &Grid,
+    grid: &Grid,
     _nets: &[NetEndpoints],
     _windows: &[MetalWindow],
     _edges: MetalEdgeCosts<'_>,
 ) -> Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+    reject_board_constraints(grid)?;
     Err(RouterError::BackendUnavailable(
         "Metal compute is only available on macOS".into(),
     ))
@@ -974,11 +1001,12 @@ pub fn metal_route_isolated_batch_ragged(
 /// Non-macOS fallback. Callers must retry the same batch on the CPU.
 #[cfg(not(target_os = "macos"))]
 pub fn metal_route_isolated_batch(
-    _grid: &Grid,
+    grid: &Grid,
     _nets: &[NetEndpoints],
     _windows: &[MetalWindow],
     _edges: MetalEdgeCosts<'_>,
 ) -> Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+    reject_board_constraints(grid)?;
     Err(RouterError::BackendUnavailable(
         "Metal compute is only available on macOS".into(),
     ))
@@ -1114,6 +1142,7 @@ fn has_unit_costs(grid: &Grid) -> bool {
 
 impl Router for MetalRouter {
     fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
+        reject_board_constraints(grid)?;
         if !grid.is_well_formed() {
             return Err(RouterError::MalformedGrid);
         }
@@ -1202,6 +1231,57 @@ impl Router for MetalRouter {
             congestion,
             groups: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod board_constraint_contract_tests {
+    use super::*;
+
+    fn assert_board_constraint_unavailable<T: std::fmt::Debug>(result: Result<T, RouterError>) {
+        assert!(matches!(
+            result,
+            Err(RouterError::BackendUnavailable(message))
+                if message == BOARD_CONSTRAINT_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn every_public_metal_operation_rejects_any_nonempty_board_mask() {
+        let dims = mr_core::Dims::new(2, 1);
+        let mut grid = Grid::filled(dims, 1);
+        // Even an all-zero vector selects the exact board-constraint contract.
+        grid.board_constraint = vec![0; dims.len()];
+        let net = NetEndpoints {
+            net: "board-mask".into(),
+            src: 0,
+            dst: 1,
+            passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
+        };
+        let windows = [MetalWindow::full(dims)];
+        let edges = MetalEdgeCosts {
+            x: &[1],
+            y: &[],
+            vias: &[],
+        };
+
+        assert_board_constraint_unavailable(metal_wavefront_field(&grid, 0));
+        assert_board_constraint_unavailable(metal_sweep_field(&grid, 0));
+        assert_board_constraint_unavailable(metal_sweep_fields(&grid, &[0]));
+        assert_board_constraint_unavailable(MetalRouter.route(&grid, std::slice::from_ref(&net)));
+        assert_board_constraint_unavailable(metal_route_isolated_batch(
+            &grid,
+            std::slice::from_ref(&net),
+            &windows,
+            edges,
+        ));
+        assert_board_constraint_unavailable(metal_route_isolated_batch_ragged(
+            &grid,
+            std::slice::from_ref(&net),
+            &windows,
+            edges,
+        ));
     }
 }
 

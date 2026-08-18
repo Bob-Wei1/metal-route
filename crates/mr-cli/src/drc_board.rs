@@ -32,7 +32,7 @@ use mr_core::LayerMap;
 use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation, ViolationClass};
 use mr_srj::{BoardOutlineConstraint, PcbTrace, RoutePoint, SimpleRouteJson};
 
-use crate::{VIA_DRILL_MM, VIA_PAD_MM};
+use crate::{BOARD_EDGE_NET, VIA_DRILL_MM, VIA_PAD_MM};
 
 /// Resolve a routed layer name against the effective physical stack. This is
 /// the same defensive fallback as SRJ point rasterization: absent or unknown
@@ -323,6 +323,9 @@ pub fn solution_to_drc_board(
     // deterministic and same-net immunity holds within each net component.
     for (i, t) in traces.iter().enumerate() {
         let net = net_name[i].clone();
+        let trace_segment_start = segments.len();
+        let mut zero_length_wire: Option<(f64, f64, f64, u32)> = None;
+        let mut has_via = false;
         // Only route terminals establish ownership for an unlabelled legacy pad.
         // The first/last coordinates are fixed by every geometry repair pass.
         for (point, side) in [
@@ -347,6 +350,13 @@ pub fn solution_to_drc_board(
             match rp {
                 RoutePoint::Wire { x, y, width, layer } => {
                     let l = named_layer(layer, &effective_layers);
+                    match &mut zero_length_wire {
+                        None => zero_length_wire = Some((*x, *y, *width, l)),
+                        Some((px, py, widest, pl)) if (*px, *py, *pl) == (*x, *y, l) => {
+                            *widest = widest.max(*width);
+                        }
+                        Some(_) => {}
+                    }
                     if let Some((px, py)) = pending_landing.take() {
                         if (px, py) != (*x, *y) {
                             segments.push(Segment {
@@ -378,6 +388,7 @@ pub fn solution_to_drc_board(
                     from_layer,
                     to_layer,
                 } => {
+                    has_via = true;
                     let from = named_layer(from_layer, &effective_layers);
                     let to = named_layer(to_layer, &effective_layers);
                     // Hand-built/external soups may omit the source landing as well.
@@ -406,6 +417,21 @@ pub fn solution_to_drc_board(
                     });
                     pending_landing = Some((*x, *y));
                 }
+            }
+        }
+        // A routed zero-hop net is emitted as one Wire vertex. Preserve its
+        // physical copper as a zero-length capsule instead of silently dropping
+        // it from generic and board-edge DRC. A coincident Via already supplies a
+        // wider physical disk, so do not duplicate that representation.
+        if segments.len() == trace_segment_start && !has_via {
+            if let Some((x, y, width, layer)) = zero_length_wire {
+                segments.push(Segment {
+                    net,
+                    layer,
+                    a: (x, y),
+                    b: (x, y),
+                    width,
+                });
             }
         }
     }
@@ -467,7 +493,6 @@ pub(crate) fn check_with_srj_rules(srj: &SimpleRouteJson, board: &DrcBoard) -> V
 /// existing report schemas remain stable while repair gates can still distinguish
 /// them from copper-pair findings.
 fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation> {
-    const BOARD_EDGE_NET: &str = "__board_edge__";
     const DEFAULT_TRACE_WIDTH: f64 = 0.15;
     const DEFAULT_VIA_PAD_DIAMETER: f64 = 0.45;
     const EDGE_EPS: f64 = 1e-9;
@@ -770,6 +795,36 @@ mod tests {
             },
         };
         assert!(check_with_srj_rules(&srj, &board).is_empty());
+    }
+
+    #[test]
+    fn singleton_wire_emits_a_zero_length_capsule_checked_at_board_edge() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "minTraceWidth": 0.1,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        let trace = PcbTrace::new(vec![wire_on(0.9, 0.0, "top")]).with_net("point");
+        let board = solution_to_drc_board(
+            &srj,
+            &[trace],
+            DrcRules {
+                clearance: 0.0,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+            1,
+        );
+        assert_eq!(board.segments.len(), 1);
+        assert_eq!(board.segments[0].a, (0.9, 0.0));
+        assert_eq!(board.segments[0].b, (0.9, 0.0));
+        assert_eq!(board.segments[0].width, 0.1);
+
+        let findings = check_with_srj_rules(&srj, &board);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].nets.1, BOARD_EDGE_NET);
     }
 
     #[test]

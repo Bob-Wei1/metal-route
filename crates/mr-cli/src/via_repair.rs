@@ -13,7 +13,7 @@
 //! typed full-board DRC; at most one strictly lower-finding candidate is retained.
 
 use mr_drc::{dist, point_rect_gap, point_seg_dist, DrcBoard, DrcRules, Via, Violation};
-use mr_srj::{PcbTrace, RoutePoint, SimpleRouteJson};
+use mr_srj::{BoardOutlineConstraint, BoardOutlineError, PcbTrace, RoutePoint, SimpleRouteJson};
 
 use crate::{drc_board, drc_candidate_is_better, drc_severity};
 
@@ -86,6 +86,20 @@ struct TraceTopology {
 /// Stable soup indices and direction finish the total order without float comparison.
 type CandidateRank = (usize, u128, u64, usize, usize, usize);
 
+fn via_candidate_respects_board_outline(
+    outline: &Result<Option<BoardOutlineConstraint>, BoardOutlineError>,
+    center: (f64, f64),
+    radius: f64,
+) -> bool {
+    match outline {
+        Ok(None) => true,
+        Ok(Some(outline)) => outline
+            .disk_edge_gap(center, radius)
+            .is_some_and(|gap| gap + GEOMETRY_EPS_MM >= outline.edge_clearance_mm()),
+        Err(_) => false,
+    }
+}
+
 /// Try the bounded via portfolio once, returning the input byte-for-byte when no
 /// strictly lower-finding candidate survives structural and authoritative DRC gates.
 pub(crate) fn repair_clearance_vias(
@@ -122,6 +136,24 @@ pub(crate) fn repair_clearance_vias(
     let before_topology = topology_signature(&traces);
     let before_labels = drc_board::reconstruct_net_labels(srj, &traces, layers);
     let before_length = planar_copper_length(&before_board);
+    let routed_trace_width = before_board
+        .segments
+        .iter()
+        .map(|segment| segment.width)
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .fold(crate::DEFAULT_TRACE_WIDTH, f64::max)
+        .max(
+            srj.min_trace_width
+                .filter(|width| width.is_finite() && *width > 0.0)
+                .unwrap_or(crate::DEFAULT_TRACE_WIDTH),
+        );
+    let routed_via_pad = before_board
+        .vias
+        .iter()
+        .map(|via| via.pad_diameter)
+        .filter(|diameter| diameter.is_finite() && *diameter > 0.0)
+        .fold(crate::VIA_PAD_MM, f64::max);
+    let board_outline = BoardOutlineConstraint::from_srj(srj, routed_trace_width, routed_via_pad);
     let mut best: Option<(CandidateRank, Vec<PcbTrace>)> = None;
 
     for candidate_via in movable {
@@ -138,7 +170,11 @@ pub(crate) fn repair_clearance_vias(
                 via_inside_bounds(candidate_center, via_radius, srj)
             } else {
                 terminal_via_inside_bounds(candidate_center, (x, y), via_radius, srj)
-            };
+            } && via_candidate_respects_board_outline(
+                &board_outline,
+                candidate_center,
+                via_radius,
+            );
             let unique = candidate_site_is_unique(
                 &traces,
                 candidate_via.trace_index,
@@ -934,6 +970,24 @@ mod tests {
         assert_eq!(route_point_xy(&trace.route[2]), (0.1, -0.1));
         assert_eq!(trace.route[3], compressed_landing);
         assert!(trace_structure_is_valid(&trace));
+    }
+
+    #[test]
+    fn early_via_gate_rejects_concave_outline_cutout() {
+        const FIXTURE: &str = include_str!(
+            "../../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+        );
+        let srj: SimpleRouteJson = serde_json::from_str(FIXTURE).unwrap();
+        let outline = BoardOutlineConstraint::from_srj(&srj, 0.15, 0.45);
+        assert!(via_candidate_respects_board_outline(
+            &outline,
+            (-4.0, -4.0),
+            0.225,
+        ));
+        assert!(
+            !via_candidate_respects_board_outline(&outline, (0.0, -4.0), 0.225),
+            "the rectangular bounds gate alone would admit the concave cutout"
+        );
     }
 
     #[test]
