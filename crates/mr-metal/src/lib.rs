@@ -526,6 +526,117 @@ struct RaggedRouteStats {
     chunks: usize,
 }
 
+#[cfg(target_os = "macos")]
+fn ragged_window_shape(
+    dims: mr_core::Dims,
+    window: MetalWindow,
+) -> Result<gpu::RaggedBatchShape, RouterError> {
+    let unavailable = |message: &str| RouterError::BackendUnavailable(message.into());
+    if !window.is_valid(dims) {
+        return Err(unavailable("invalid ragged isolated window shape"));
+    }
+    let w = window
+        .x1
+        .checked_sub(window.x0)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| unavailable("ragged isolated window width overflowed"))?
+        as usize;
+    let h = window
+        .y1
+        .checked_sub(window.y0)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| unavailable("ragged isolated window height overflowed"))?
+        as usize;
+    let layers = dims.layers as usize;
+    let plane = w
+        .checked_mul(h)
+        .ok_or_else(|| unavailable("ragged isolated window plane is too large"))?;
+    let packed_cells = plane
+        .checked_mul(layers)
+        .ok_or_else(|| unavailable("ragged isolated window is too large"))?;
+    let row_lines = h
+        .checked_mul(layers)
+        .ok_or_else(|| unavailable("ragged isolated row descriptors are too large"))?;
+    let col_lines = w
+        .checked_mul(layers)
+        .ok_or_else(|| unavailable("ragged isolated column descriptors are too large"))?;
+    for (value, label) in [
+        (plane, "plane"),
+        (packed_cells, "cell count"),
+        (row_lines, "row descriptor count"),
+        (col_lines, "column descriptor count"),
+    ] {
+        u32::try_from(value).map_err(|_| {
+            unavailable(&format!(
+                "ragged isolated {label} exceeds 32-bit shader indexing"
+            ))
+        })?;
+    }
+    Ok(gpu::RaggedBatchShape {
+        fields: 1,
+        packed_cells,
+        row_lines,
+        col_lines,
+        max_plane: plane,
+        max_field_cells: packed_cells,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn ragged_chunk_shape(
+    dims: mr_core::Dims,
+    windows: &[MetalWindow],
+    batch_start: usize,
+) -> Result<(usize, gpu::RaggedBatchShape), RouterError> {
+    let unavailable = |message: &str| RouterError::BackendUnavailable(message.into());
+    if batch_start >= windows.len() {
+        return Err(unavailable("ragged isolated chunk starts out of range"));
+    }
+    let mut batch_end = batch_start;
+    let mut shape = gpu::RaggedBatchShape::default();
+    while batch_end < windows.len() && batch_end - batch_start < MAX_FIELDS_PER_BATCH {
+        let next = ragged_window_shape(dims, windows[batch_end])?;
+        let combined = gpu::RaggedBatchShape {
+            fields: shape
+                .fields
+                .checked_add(1)
+                .ok_or_else(|| unavailable("ragged isolated field count is too large"))?,
+            packed_cells: shape
+                .packed_cells
+                .checked_add(next.packed_cells)
+                .ok_or_else(|| unavailable("ragged isolated batch is too large"))?,
+            row_lines: shape
+                .row_lines
+                .checked_add(next.row_lines)
+                .ok_or_else(|| unavailable("ragged isolated row descriptors are too large"))?,
+            col_lines: shape
+                .col_lines
+                .checked_add(next.col_lines)
+                .ok_or_else(|| unavailable("ragged isolated column descriptors are too large"))?,
+            max_plane: shape.max_plane.max(next.max_plane),
+            max_field_cells: shape.max_field_cells.max(next.max_field_cells),
+        };
+        // Preserve the established single-large-field behavior. A field above
+        // the normal working-set target runs alone, but only after the caller's
+        // device preflight approves its concrete buffers.
+        if batch_end > batch_start && combined.packed_cells > MAX_BATCH_CELLS {
+            break;
+        }
+        if combined.packed_cells > u32::MAX as usize
+            || combined.row_lines > u32::MAX as usize
+            || combined.col_lines > u32::MAX as usize
+        {
+            return Err(unavailable(
+                "ragged isolated batch exceeds 32-bit shader indexing",
+            ));
+        }
+        shape = combined;
+        batch_end += 1;
+    }
+    debug_assert!(batch_end > batch_start);
+    Ok((batch_end, shape))
+}
+
 /// Experimental cropped/ragged implementation of
 /// [`metal_route_isolated_batch`].
 ///
@@ -611,17 +722,37 @@ fn ragged_isolated_batch_impl(
         return Ok((Vec::new(), RaggedRouteStats::default()));
     }
 
-    let via_edges: Vec<Cost> = edges
-        .vias
-        .iter()
-        .map(|edge| edge.unwrap_or_default())
-        .collect();
-    let via_allowed: Vec<u32> = edges
-        .vias
-        .iter()
-        .map(|edge| u32::from(edge.is_some()))
-        .collect();
-    let mut output = Vec::with_capacity(nets.len());
+    // Validate every chunk before allocating any derived edge/output vector or
+    // packed cost plane. In particular, the normal working-set cap deliberately
+    // admits one larger field; this pass makes that field conditional on the
+    // shader index domain and the selected device's actual buffer limit.
+    let mut preflight_start = 0usize;
+    while preflight_start < nets.len() {
+        let (preflight_end, shape) = ragged_chunk_shape(dims, windows, preflight_start)?;
+        gpu::preflight_ragged_edge_batch(
+            grid,
+            shape,
+            edges.x.len(),
+            edges.y.len(),
+            edges.vias.len(),
+        )?;
+        preflight_start = preflight_end;
+    }
+
+    let mut via_edges = Vec::new();
+    via_edges
+        .try_reserve_exact(edges.vias.len())
+        .map_err(|_| unavailable("cannot allocate ragged isolated via edges".into()))?;
+    via_edges.extend(edges.vias.iter().map(|edge| edge.unwrap_or_default()));
+    let mut via_allowed = Vec::new();
+    via_allowed
+        .try_reserve_exact(edges.vias.len())
+        .map_err(|_| unavailable("cannot allocate ragged isolated via permissions".into()))?;
+    via_allowed.extend(edges.vias.iter().map(|edge| u32::from(edge.is_some())));
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(nets.len())
+        .map_err(|_| unavailable("cannot allocate ragged isolated results".into()))?;
     let mut stats = RaggedRouteStats {
         full_field_cells: dims.len().checked_mul(nets.len()).ok_or_else(|| {
             unavailable("ragged isolated full-field comparison is too large".into())
@@ -630,33 +761,23 @@ fn ragged_isolated_batch_impl(
     };
 
     let window_cells = |window: MetalWindow| -> Result<usize, RouterError> {
-        let w = (window.x1 - window.x0 + 1) as usize;
-        let h = (window.y1 - window.y0 + 1) as usize;
-        w.checked_mul(h)
-            .and_then(|plane| plane.checked_mul(dims.layers as usize))
-            .ok_or_else(|| unavailable("ragged isolated window is too large".into()))
+        Ok(ragged_window_shape(dims, window)?.packed_cells)
     };
 
     let mut batch_start = 0usize;
     while batch_start < nets.len() {
-        let mut batch_end = batch_start;
-        let mut batch_cells = 0usize;
-        while batch_end < nets.len() && batch_end - batch_start < MAX_FIELDS_PER_BATCH {
-            let next = window_cells(windows[batch_end])?;
-            let combined = batch_cells
-                .checked_add(next)
-                .ok_or_else(|| unavailable("ragged isolated batch is too large".into()))?;
-            if batch_end > batch_start && combined > MAX_BATCH_CELLS {
-                break;
-            }
-            batch_cells = combined;
-            batch_end += 1;
-        }
+        let (batch_end, batch_shape) = ragged_chunk_shape(dims, windows, batch_start)?;
 
         let net_batch = &nets[batch_start..batch_end];
         let window_batch = &windows[batch_start..batch_end];
-        let mut fields = Vec::with_capacity(net_batch.len());
-        let mut packed_costs = Vec::with_capacity(batch_cells);
+        let mut fields = Vec::new();
+        fields
+            .try_reserve_exact(net_batch.len())
+            .map_err(|_| unavailable("cannot allocate ragged isolated field descriptors".into()))?;
+        let mut packed_costs = Vec::new();
+        packed_costs
+            .try_reserve_exact(batch_shape.packed_cells)
+            .map_err(|_| unavailable("cannot allocate ragged isolated costs".into()))?;
         for (net, &window) in net_batch.iter().zip(window_batch) {
             let w = window.x1 - window.x0 + 1;
             let h = window.y1 - window.y0 + 1;
@@ -696,7 +817,7 @@ fn ragged_isolated_batch_impl(
                 dst: packed_cell(net.dst),
             });
         }
-        if packed_costs.len() != batch_cells {
+        if packed_costs.len() != batch_shape.packed_cells {
             return Err(unavailable(
                 "ragged isolated packing disagrees with its preflight".into(),
             ));
@@ -1902,6 +2023,40 @@ mod tests {
             err,
             RouterError::BackendUnavailable(message)
                 if message == "ragged isolated Metal routing does not support static via masks"
+        ));
+    }
+
+    #[test]
+    fn ragged_chunk_preflight_plans_oversized_single_fields_without_allocating() {
+        let width = u32::try_from(MAX_BATCH_CELLS + 1).unwrap();
+        let dims = mr_core::Dims::new(width, 1);
+        let window = MetalWindow::full(dims);
+        // Two identical >64 MiB cost planes would be dangerous to discover by
+        // reserving first. Planning is allocation-free and keeps each one as an
+        // intentional single-field chunk for the later device preflight.
+        let windows = [window, window];
+        let (first_end, first) = ragged_chunk_shape(dims, &windows, 0).unwrap();
+        assert_eq!(first_end, 1);
+        assert_eq!(first.fields, 1);
+        assert_eq!(first.packed_cells, MAX_BATCH_CELLS + 1);
+        let (second_end, second) = ragged_chunk_shape(dims, &windows, 1).unwrap();
+        assert_eq!(second_end, 2);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn ragged_chunk_preflight_rejects_shader_index_overflow_without_allocating() {
+        let dims = mr_core::Dims {
+            w: u32::MAX,
+            h: 2,
+            layers: 1,
+        };
+        let window = MetalWindow::full(dims);
+        let err = ragged_chunk_shape(dims, &[window], 0).unwrap_err();
+        assert!(matches!(
+            err,
+            RouterError::BackendUnavailable(message)
+                if message.contains("exceeds 32-bit shader indexing")
         ));
     }
 

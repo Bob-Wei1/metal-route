@@ -771,6 +771,20 @@ pub(crate) struct RaggedPathBatch {
     pub(crate) readback_cells: usize,
 }
 
+/// Allocation-free description of every index space and buffer in one cropped
+/// batch.  The public wrapper builds this from windows before it reserves the
+/// packed cost plane; [`sweep_ragged_paths`] independently rebuilds it from the
+/// concrete descriptors before allocating its line/label buffers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RaggedBatchShape {
+    pub(crate) fields: usize,
+    pub(crate) packed_cells: usize,
+    pub(crate) row_lines: usize,
+    pub(crate) col_lines: usize,
+    pub(crate) max_plane: usize,
+    pub(crate) max_field_cells: usize,
+}
+
 /// A cached Metal context (device + queue + compiled pipelines).
 struct MetalCtx {
     device: Device,
@@ -946,6 +960,123 @@ fn validate_edge_batch_buffers(
         "edge-aware via permissions",
     )?;
     Ok(())
+}
+
+fn validate_ragged_index_shape(shape: RaggedBatchShape) -> Result<(), RouterError> {
+    if shape.fields == 0 {
+        if shape != RaggedBatchShape::default() {
+            return Err(RouterError::BackendUnavailable(
+                "empty ragged Metal shape contains work".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if shape.packed_cells == 0
+        || shape.row_lines == 0
+        || shape.col_lines == 0
+        || shape.max_plane == 0
+        || shape.max_field_cells == 0
+        || shape.fields > shape.packed_cells
+        || shape.row_lines > shape.packed_cells
+        || shape.col_lines > shape.packed_cells
+        || shape.max_plane > shape.max_field_cells
+        || shape.max_field_cells > shape.packed_cells
+    {
+        return Err(RouterError::BackendUnavailable(
+            "invalid ragged Metal batch shape".into(),
+        ));
+    }
+    for (value, label) in [
+        (shape.fields, "fields"),
+        (shape.packed_cells, "packed cells"),
+        (shape.row_lines, "row descriptors"),
+        (shape.col_lines, "column descriptors"),
+        (shape.max_plane, "maximum plane"),
+        (shape.max_field_cells, "maximum field"),
+    ] {
+        u32::try_from(value).map_err(|_| {
+            RouterError::BackendUnavailable(format!(
+                "ragged Metal {label} exceed 32-bit shader indexing"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_ragged_batch_buffers(
+    device: &Device,
+    shape: RaggedBatchShape,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+    via_allowed_elements: usize,
+) -> Result<(), RouterError> {
+    validate_edge_batch_buffers(
+        device,
+        shape.packed_cells,
+        shape.packed_cells,
+        x_elements,
+        y_elements,
+        via_elements,
+        via_allowed_elements,
+    )?;
+    let field_words = shape.fields.checked_mul(8).ok_or_else(|| {
+        RouterError::BackendUnavailable("ragged field descriptors are too large".into())
+    })?;
+    let row_words = shape.row_lines.checked_mul(4).ok_or_else(|| {
+        RouterError::BackendUnavailable("ragged row descriptors are too large".into())
+    })?;
+    let col_words = shape.col_lines.checked_mul(4).ok_or_else(|| {
+        RouterError::BackendUnavailable("ragged column descriptors are too large".into())
+    })?;
+    validate_buffer_len(device, field_words, "ragged fields")?;
+    validate_buffer_len(device, row_words, "ragged rows")?;
+    validate_buffer_len(device, col_words, "ragged columns")?;
+    validate_buffer_len(device, shape.fields, "ragged path lengths")?;
+    validate_buffer_len(device, shape.fields, "ragged route costs")?;
+    validate_buffer_len(device, shape.fields, "ragged path offsets")?;
+    // The compact output cannot exceed one simple path cell per packed field
+    // cell. Validate that worst case before any corresponding host allocation.
+    validate_buffer_len(device, shape.packed_cells, "ragged compact paths")?;
+    Ok(())
+}
+
+/// Validate an allocation-free cropped-batch plan against both the shader's
+/// 32-bit index domain and every Metal buffer it can create. Callers use this
+/// before reserving or packing the cost plane, so an oversized single field is
+/// still supported when the selected device can actually hold it.
+pub(crate) fn preflight_ragged_edge_batch(
+    grid: &Grid,
+    shape: RaggedBatchShape,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+) -> Result<(), RouterError> {
+    if !grid.is_well_formed() {
+        return Err(RouterError::BackendUnavailable(
+            "ragged Metal preflight received a malformed grid".into(),
+        ));
+    }
+    // Compact cells are converted back to the crate-wide u32 CellIdx domain in
+    // the path kernel, so a small crop cannot make an oversized global grid safe.
+    checked_batch_cells(grid.dims.len(), 1)?;
+    validate_edge_array_lengths(grid, x_elements, y_elements, via_elements, via_elements)?;
+    validate_ragged_index_shape(shape)?;
+    if shape.fields == 0 {
+        return Ok(());
+    }
+    autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            validate_ragged_batch_buffers(
+                &ctx.device,
+                shape,
+                x_elements,
+                y_elements,
+                via_elements,
+                via_elements,
+            )
+        })
+    })
 }
 
 pub(crate) fn checked_batch_cells(
@@ -1462,8 +1593,8 @@ pub(crate) fn sweep_ragged_paths(
     let mut expected_offset = 0usize;
     let mut max_field_cells = 0usize;
     let mut max_plane = 0usize;
-    let mut rows = Vec::new();
-    let mut cols = Vec::new();
+    let mut row_lines = 0usize;
+    let mut col_lines = 0usize;
     for field in fields {
         if field.w == 0
             || field.h == 0
@@ -1496,28 +1627,32 @@ pub(crate) fn sweep_ragged_paths(
         }
         max_field_cells = max_field_cells.max(cells);
         max_plane = max_plane.max(plane);
-
-        let plane_u32 = u32::try_from(plane)
-            .map_err(|_| RouterError::BackendUnavailable("ragged field is too large".into()))?;
-        for layer in 0..field.layers {
-            let layer_base = field.cell_offset + layer * plane_u32;
-            for y in 0..field.h {
-                rows.push(RaggedLine {
-                    base: layer_base + y * field.w,
-                    len: field.w,
-                    stride: 1,
-                    edge0: field.x0,
-                });
-            }
-            for x in 0..field.w {
-                cols.push(RaggedLine {
-                    base: layer_base + x,
-                    len: field.h,
-                    stride: field.w,
-                    edge0: field.y0,
-                });
-            }
-        }
+        row_lines = row_lines
+            .checked_add(
+                (field.h as usize)
+                    .checked_mul(field.layers as usize)
+                    .ok_or_else(|| {
+                        RouterError::BackendUnavailable(
+                            "ragged row descriptor count is too large".into(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                RouterError::BackendUnavailable("ragged row descriptors are too large".into())
+            })?;
+        col_lines = col_lines
+            .checked_add(
+                (field.w as usize)
+                    .checked_mul(field.layers as usize)
+                    .ok_or_else(|| {
+                        RouterError::BackendUnavailable(
+                            "ragged column descriptor count is too large".into(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                RouterError::BackendUnavailable("ragged column descriptors are too large".into())
+            })?;
         expected_offset = end;
     }
     if costs.len() != expected_offset {
@@ -1527,8 +1662,76 @@ pub(crate) fn sweep_ragged_paths(
     }
     let total = checked_batch_cells(costs.len(), 1)?;
 
-    let mut init = vec![Cost::MAX; total];
-    let mut hop_init = vec![u32::MAX; total];
+    let shape = RaggedBatchShape {
+        fields: fields.len(),
+        packed_cells: total,
+        row_lines,
+        col_lines,
+        max_plane,
+        max_field_cells,
+    };
+    preflight_ragged_edge_batch(grid, shape, x_edges.len(), y_edges.len(), via_edges.len())?;
+
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_lines).map_err(|_| {
+        RouterError::BackendUnavailable("cannot allocate ragged row descriptors".into())
+    })?;
+    let mut cols = Vec::new();
+    cols.try_reserve_exact(col_lines).map_err(|_| {
+        RouterError::BackendUnavailable("cannot allocate ragged column descriptors".into())
+    })?;
+    for field in fields {
+        let plane_u32 = field.w.checked_mul(field.h).ok_or_else(|| {
+            RouterError::BackendUnavailable("ragged field plane is too large".into())
+        })?;
+        for layer in 0..field.layers {
+            let layer_base = field
+                .cell_offset
+                .checked_add(layer.checked_mul(plane_u32).ok_or_else(|| {
+                    RouterError::BackendUnavailable("ragged field offset is too large".into())
+                })?)
+                .ok_or_else(|| {
+                    RouterError::BackendUnavailable("ragged field offset is too large".into())
+                })?;
+            for y in 0..field.h {
+                rows.push(RaggedLine {
+                    base: layer_base
+                        .checked_add(y.checked_mul(field.w).ok_or_else(|| {
+                            RouterError::BackendUnavailable("ragged row offset is too large".into())
+                        })?)
+                        .ok_or_else(|| {
+                            RouterError::BackendUnavailable("ragged row offset is too large".into())
+                        })?,
+                    len: field.w,
+                    stride: 1,
+                    edge0: field.x0,
+                });
+            }
+            for x in 0..field.w {
+                cols.push(RaggedLine {
+                    base: layer_base.checked_add(x).ok_or_else(|| {
+                        RouterError::BackendUnavailable("ragged column offset is too large".into())
+                    })?,
+                    len: field.h,
+                    stride: field.w,
+                    edge0: field.y0,
+                });
+            }
+        }
+    }
+    debug_assert_eq!(rows.len(), row_lines);
+    debug_assert_eq!(cols.len(), col_lines);
+
+    let mut init = Vec::new();
+    init.try_reserve_exact(total).map_err(|_| {
+        RouterError::BackendUnavailable("cannot allocate ragged distance labels".into())
+    })?;
+    init.resize(total, Cost::MAX);
+    let mut hop_init = Vec::new();
+    hop_init
+        .try_reserve_exact(total)
+        .map_err(|_| RouterError::BackendUnavailable("cannot allocate ragged hop labels".into()))?;
+    hop_init.resize(total, u32::MAX);
     let mut any_runnable = false;
     for field in fields {
         if field.src != u32::MAX && costs[field.src as usize] != Cost::MAX {
@@ -1549,20 +1752,14 @@ pub(crate) fn sweep_ragged_paths(
     autoreleasepool(|| {
         with_metal_ctx(|ctx| {
             let dev = &ctx.device;
-            validate_edge_batch_buffers(
+            validate_ragged_batch_buffers(
                 dev,
-                total,
-                costs.len(),
+                shape,
                 x_edges.len(),
                 y_edges.len(),
                 via_edges.len(),
                 via_allowed.len(),
             )?;
-            validate_buffer_len(dev, fields.len().saturating_mul(8), "ragged fields")?;
-            validate_buffer_len(dev, rows.len().saturating_mul(4), "ragged rows")?;
-            validate_buffer_len(dev, cols.len().saturating_mul(4), "ragged columns")?;
-            validate_buffer_len(dev, fields.len(), "ragged path lengths")?;
-            validate_buffer_len(dev, fields.len(), "ragged route costs")?;
 
             let zero = [0u32];
             let dist_buf = new_u32_buffer(dev, &init);
@@ -1816,6 +2013,48 @@ mod tests {
                 assert!(error_for(1, 1, too_many, 1, 1).contains("y edges"));
                 assert!(error_for(1, 1, 1, too_many, 1).contains("via edges"));
                 assert!(error_for(1, 1, 1, 1, too_many).contains("via permissions"));
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ragged_preflight_checks_descriptor_buffers_without_allocating_them() {
+        autoreleasepool(|| {
+            with_metal_ctx(|ctx| {
+                let max_words = ctx.device.max_buffer_length() as usize / 4;
+                let base = RaggedBatchShape {
+                    fields: 1,
+                    packed_cells: 1,
+                    row_lines: 1,
+                    col_lines: 1,
+                    max_plane: 1,
+                    max_field_cells: 1,
+                };
+
+                let mut fields = base;
+                fields.fields = max_words / 8 + 1;
+                assert!(
+                    validate_ragged_batch_buffers(&ctx.device, fields, 1, 1, 1, 1)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fields")
+                );
+
+                let mut rows = base;
+                rows.row_lines = max_words / 4 + 1;
+                assert!(validate_ragged_batch_buffers(&ctx.device, rows, 1, 1, 1, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("rows"));
+
+                let mut cols = base;
+                cols.col_lines = max_words / 4 + 1;
+                assert!(validate_ragged_batch_buffers(&ctx.device, cols, 1, 1, 1, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("columns"));
                 Ok(())
             })
         })
