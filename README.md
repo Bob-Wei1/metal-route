@@ -76,7 +76,7 @@ congestion + equal unrouted set, under the shared canonical tie-break):
   boundaries, and concurrent calls — **pass**. This is broad regression coverage,
   not an exhaustive proof over every cost grid.
 
-The Rust source suite now contains **470 test cases** (466 passing and four
+The Rust source suite now contains **482 test cases** (478 passing and four
 explicitly ignored frontier/performance/live-tool tests), up from 243, plus two
 passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
@@ -84,8 +84,9 @@ physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
 layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
 memory caps, fixed-fixture and fixed-seed Metal equivalence, exact via-spacing
 guards and exemption lookup, cached isolation diagnoses, parallel scheduling
-determinism, coherent typed-SRJ rules, authoritative DRC acceptance, and
-topology-preserving interior and terminal-via repair.
+determinism, coherent typed-SRJ rules, authoritative DRC acceptance,
+topology-preserving interior and terminal-via repair, and bounded
+blocker-informed/dihedral legalization portfolios.
 `research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
 regression-gate tests for benchmark reports.
 
@@ -132,6 +133,15 @@ targeted CPU A* by default. Experimental offload is explicit with
 `METALROUTE_EXPERIMENTAL_METAL_ISOLATED=1`; GPU contention or any command failure
 immediately takes the exact whole-batch CPU fallback.
 
+A separate research branch (`adba265`, not integrated) measured the remaining
+headroom for retiring each ragged Metal field as soon as it converged. Exact
+logical-work ratios (retired/current, lower is better) were 1.000/0.899 on
+bug05-shaped open/heterogeneous micro workloads and 1.000/0.844 on bug50-shaped
+workloads. All exceeded the predeclared 0.69 NO-GO boundary, so per-field
+retirement was rejected rather than adding production complexity for modest
+best-case savings. This was a synthetic logical-work probe, not a timed
+active-retirement implementation or real-board speedup.
+
 ### tscircuit-style synthetic benchmark
 
 `metalroute bench` generates ten deterministic 30-net SimpleRouteJson boards.
@@ -171,26 +181,24 @@ uses one checker contract rather than mixing historical semantics:
 
 | corpus | before | after | fully routed before → after |
 |--------|-------:|------:|----------------------------:|
-| `bug-reports` | 1996/2447 (81.6%) | **2270/2447 (92.8%)** | 32 → **38** |
+| `bug-reports` | 1996/2447 (81.6%) | **2281/2447 (93.2%)** | 32 → **40** |
 | `srj15` | 705/720 (97.9%) | **719/720 (99.9%)** | 46 → **54** |
-| **total** | 2701/3167 (85.3%) | **2989/3167 (94.4%)** | 78 → **92** |
+| **total** | 2701/3167 (85.3%) | **3000/3167 (94.7%)** | 78 → **94** |
 
 Using the same corrected DRC checker on both route sets, exact-geometry findings
-fall **1227 → 434**, clean boards rise **49 → 76**, and fully-routed-clean
-boards rise **46 → 70**. Total route cost rises 340,055 → 377,164 while the
-router retains 288 additional nets, so cost is reported rather than treated as a
+fall **1227 → 429**, clean boards rise **49 → 76**, and fully-routed-clean
+boards rise **46 → 71**. Total route cost rises 340,055 → 379,530 while the
+router retains 299 additional nets, so cost is reported rather than treated as a
 like-for-like route-quality regression. The overall hardened scorer returns
 **`KEEP`** with exact workload identity, zero errors, improved completion in both
 groups, and improved aggregate DRC/clean-board gates.
 
-Timing is observational rather than an acceptance gate. Two release repeats of
-the current `9e5b40a` router had identical timing-stripped report semantics but
-different scheduler profiles: median board time was 0.079024/0.086278 s,
-nearest-rank p95 60.684370/64.411409 s, maximum 104.177673/96.042215 s, the sum
-of overlapping board timers 742.690/1150.046 s, and external elapsed
-109.78/96.19 s. The large swing in the overlapping timer sum makes a new speedup
-claim inappropriate; the deterministic completion, cost, and DRC result is the
-gate.
+Timing is observational rather than an acceptance gate. The accepted `ddafd9a`
+release run took 104.91 s externally (910.69 s user, 2.84 s system); median board
+time was 0.121329 s, nearest-rank p95 44.619103 s, maximum 93.909936 s, and the
+sum of overlapping board timers 630.763 s. Its external time sits inside the
+96.19–109.78 s range of two timing-variable terminal-baseline repeats, so no new
+speedup is inferred; deterministic completion, cost, and DRC remain the gate.
 
 The accepted pre-feature baseline at `21a0570` isolates the dense via-spacing
 change at `02a7f95` from the earlier improvements. Against that baseline, routed
@@ -219,13 +227,36 @@ The subsequent bounded terminal-via repair keeps the same completion and route
 cost while reducing DRC **443 → 434**, raising clean boards **72 → 76**, and
 raising fully-routed-clean boards **66 → 70**. It cleans `sample13`, `sample18`,
 `sample19`, and `sample23` (two findings each) and removes one of five findings
-from `sample44`; no board worsens. The canonical final report SHA-256 is
+from `sample44`; no board worsens. The canonical terminal-baseline report SHA-256 is
 `8e52c3ab9a17188e28ab73d4d4314774261ea9dbdca3ba0367a4f583ccabf35f`.
-Deleting the report-level and per-board timing/rate fields and serializing with
-sorted keys gives the same independent-repeat SHA-256,
+Deleting report-level `total_wall_ms`/`nets_per_sec`, every group's
+`total_wall_ms`, and every board's `wall_ms`, then serializing compact JSON with
+sorted keys (including the trailing newline) gives the same independent-repeat SHA-256,
 `c8e11c7d5fef04dbbd3d7659dd1a5d66d80887be51ee916a7f11881dd3ffc1d1`.
-Final group physical totals are 295 DRC findings/35 clean/29 fully-routed-clean
+That stage's group physical totals are 295 DRC findings/35 clean/29 fully-routed-clean
 for `bug-reports` and 139/41/41 for `srj15`.
+
+The final bounded legalization portfolio then moves **2989 → 3000** routed
+nets and **92 → 94** fully routed boards, while DRC improves **434 → 429**,
+clean boards hold at 76, and fully-routed-clean boards rise **70 → 71**. Route
+cost moves 377,164 → 379,530 with 11 additional routes. Only seven boards
+change: `bugreport27`, `28`, `29`, `30`, `36-d4c6c2`, `50`, and `63`; all gain
+completion, `bugreport50` also drops five DRC findings, and no board loses a
+route or gains a finding.
+
+The blocker-informed candidate records failed-group→blocking-owner edges during
+the existing bounded rip-up pass, keeps the graph acyclic, and evaluates at most
+one stable topological restart. It is disabled above 192 groups, 384 nets, or
+1.5M cells. A separate incomplete-order fallback is limited to 6–16 groups, at
+most 32 nets and 250k cells, and samples at most four unique cyclic/dihedral
+orders. Both fallbacks may replace the established result only for a strict
+route-count gain; equal-completion alternatives leave the original bytes intact.
+The final report SHA-256 is
+`70f9c026f7e789cc1f0c6153ae9631b2fd22a64e4221c66c746aa38c199b7cc0`;
+its timing-stripped semantic SHA-256 is
+`1d507b5e091a3ca6b3c299f206c6eef5608c9112dbca16e7e1faf3e7dda0c6ab`.
+Final group physical totals are 290 DRC findings/35 clean/30
+fully-routed-clean for `bug-reports` and 139/41/41 for `srj15`.
 
 The physical rule is feature-aware: via-to-trace centre spacing is via radius +
 edge clearance + trace radius, while via-to-via centre spacing is both via radii
@@ -282,6 +313,15 @@ None of the locked 112 corpus boards satisfies the activation gate (0/112), and
 the pre-terminal typed-rule revision preserves the accepted legacy report's
 timing-stripped semantics exactly (SHA-256
 `6e1722326a644051f19d0b3fc13b8d2fde2b8f0c0383df061122b5980b442819`).
+
+[Upstream PR 2145](https://github.com/tscircuit/tscircuit-autorouter/pull/2145)
+exposed the next correctness frontier: the current `bugreport21-board-outline`
+route crosses a concave cutout while the legacy DRC reports it clean. A local
+four-commit research stack proved exact route masks and continuous board-edge DRC
+on that target, but is deliberately not integrated pending seven gates:
+legacy-byte portfolio preservation, sweep/Metal mask coverage, bidirectional edge
+hardening, a postprocess zero-edge gate, zero-length DRC, malformed-outline
+normalization, and spatial indexing/plane reuse.
 
 Typed acceptance is authoritative, but bounded via-repair discovery still uses
 the generic clearance: pair-only or drill-only findings do not independently
