@@ -52,7 +52,12 @@ use mr_core::{BoardRoute, CellIdx, Dims, Grid, GridCoords, LayerMap, NetEndpoint
 use mr_grid::GridBuilder;
 use serde::{Deserialize, Serialize};
 
+mod board_outline;
 mod smooth;
+
+pub use board_outline::{
+    BoardOutlineConstraint, BoardOutlineError, DEFAULT_MIN_BOARD_EDGE_CLEARANCE_MM,
+};
 pub use smooth::{beautify_traces, legalize_clearance};
 
 /// A 2-D point in continuous tscircuit coordinates.
