@@ -652,6 +652,10 @@ def summarize_engine(runs: list[dict[str, Any]], requested_runs: int) -> dict[st
         },
         key=lambda item: tuple(-1 if value is None else value for value in item),
     )
+    common_quality_counts = {
+        (item[0], item[1])
+        for item in quality_tuples
+    }
     return {
         "status": (
             "complete"
@@ -673,7 +677,10 @@ def summarize_engine(runs: list[dict[str, Any]], requested_runs: int) -> dict[st
             }
             for item in quality_tuples
         ],
-        "quality_stable_across_runs": len(quality_tuples) == 1,
+        # Freerouting's aggregate score is engine-specific diagnostics. The
+        # comparison's shared quality contract is only U/V, so score jitter must
+        # not make otherwise identical common quality look unstable.
+        "quality_stable_across_runs": len(common_quality_counts) == 1,
         "runs": runs,
     }
 
@@ -923,10 +930,14 @@ def quality_cell(engine: dict[str, Any]) -> str:
     qualities = engine["post_reload_quality"]
     if not qualities:
         return "—"
-    if len(qualities) != 1:
+    counts = {
+        (item["unconnected_items"], item["violations"])
+        for item in qualities
+    }
+    if len(counts) != 1:
         return "varies"
-    item = qualities[0]
-    return f"{item['unconnected_items']} / {item['violations']}"
+    unconnected, violations = next(iter(counts))
+    return f"{unconnected} / {violations}"
 
 
 def seconds_cell(value: float | None) -> str:

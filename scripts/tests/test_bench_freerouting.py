@@ -345,6 +345,24 @@ class HarnessTest(unittest.TestCase):
             {"engine": "metalroute", "factor": 2.0},
         )
 
+    def test_common_quality_stability_ignores_engine_specific_score_jitter(self) -> None:
+        runs = []
+        for run_number, score in enumerate((10.0, 11.0), start=1):
+            runs.append(
+                {
+                    "status": "ok",
+                    "external_wall_seconds": float(run_number),
+                    "post_reload_drc": {
+                        "unconnected_items": 1,
+                        "violations": 2,
+                        "quality_score": score,
+                    },
+                }
+            )
+        summary = bench.summarize_engine(runs, 2)
+        self.assertTrue(summary["quality_stable_across_runs"])
+        self.assertEqual(bench.quality_cell(summary), "1 / 2")
+
 
 if __name__ == "__main__":
     unittest.main()
