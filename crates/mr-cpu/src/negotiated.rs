@@ -41,6 +41,7 @@
 //! not fully settle. The router NEVER loops unbounded.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet},
 };
@@ -860,6 +861,35 @@ fn net_pad_lists_are_valid(dims: Dims, net: &NetEndpoints) -> bool {
     net.via_passable_pads
         .iter()
         .all(|cell| passable.contains(cell))
+}
+
+/// Normalize public/serde via-exemption lists once per top-level route. Rasterized
+/// SRJ inputs are already canonical and stay borrowed; unsorted or duplicate lists
+/// from other callers are cloned, sorted, and deduplicated without changing the
+/// public [`NetEndpoints`] ordering contract.
+fn normalize_via_exemptions(nets: &[NetEndpoints]) -> Cow<'_, [NetEndpoints]> {
+    let canonical = nets.iter().all(|net| {
+        net.via_passable_pads
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    });
+    if canonical {
+        return Cow::Borrowed(nets);
+    }
+
+    let mut normalized = nets.to_vec();
+    for net in &mut normalized {
+        net.via_passable_pads.sort_unstable();
+        net.via_passable_pads.dedup();
+    }
+    Cow::Owned(normalized)
+}
+
+/// Membership in a normalized via-exemption list. Kept generic so the test oracle
+/// can count comparisons while exercising the same standard-library binary search.
+#[inline]
+fn sorted_contains<T: Ord>(sorted: &[T], needle: &T) -> bool {
+    sorted.binary_search(needle).is_ok()
 }
 
 /// Invoke one trusted provider batch and defensively validate its shape and paths.
@@ -1875,6 +1905,11 @@ impl NegotiatedRouter {
         provider: Option<&dyn IsolatedRouteProvider>,
         recorder: Option<&mut RouteTrace>,
     ) -> Result<NegotiatedOutcome, RouterError> {
+        // Every negotiation/legalization search performs via-mask membership in its
+        // hot neighbour loop. Canonicalize once here so all variants and retries use
+        // logarithmic lookup while preserving unsorted public/serde inputs.
+        let normalized_nets = normalize_via_exemptions(nets);
+        let nets = normalized_nets.as_ref();
         let group_ids = connection_group_ids(nets);
         let has_named_group = has_named_subnet_group(nets);
         // The isolated batch is board-static: compute it at most once and share it
@@ -2091,8 +2126,8 @@ fn route_negotiated(
     // already blocks the via.
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
         if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v))
-            && (!base.is_via_forbidden(u) || via_passable_pads.contains(&u))
-            && (!base.is_via_forbidden(v) || via_passable_pads.contains(&v))
+            && (!base.is_via_forbidden(u) || sorted_contains(via_passable_pads, &u))
+            && (!base.is_via_forbidden(v) || sorted_contains(via_passable_pads, &v))
         {
             Some(priced_with_base(
                 v,
@@ -2250,8 +2285,8 @@ fn route_legal(
         if !via_model.is_step_legal(lu, lv) {
             return None;
         }
-        if (base.is_via_forbidden(u) && !via_passable_pads.contains(&u))
-            || (base.is_via_forbidden(v) && !via_passable_pads.contains(&v))
+        if (base.is_via_forbidden(u) && !sorted_contains(via_passable_pads, &u))
+            || (base.is_via_forbidden(v) && !sorted_contains(via_passable_pads, &v))
         {
             return None;
         }
@@ -3397,6 +3432,85 @@ mod tests {
             &ViaModel::through_hole(2),
             &[layer_local_only.src, layer_local_only.dst]
         ));
+    }
+
+    #[test]
+    fn unsorted_large_via_exemption_list_is_normalized_once_and_routes_identically() {
+        let dims = Dims::with_layers(1, 1, 2);
+        let mut grid = Grid::filled(dims, 1);
+        grid.via_forbidden = vec![true; dims.len()];
+        let src = dims.idx3(0, 0, 0);
+        let dst = dims.idx3(0, 0, 1);
+
+        let mut repeated_unsorted = Vec::with_capacity(80_000);
+        for _ in 0..40_000 {
+            repeated_unsorted.extend([dst, src]);
+        }
+        let unsorted = NetEndpoints {
+            net: "via".into(),
+            src,
+            dst,
+            passable_pads: vec![src, dst],
+            via_passable_pads: repeated_unsorted,
+        };
+        let normalized = normalize_via_exemptions(std::slice::from_ref(&unsorted));
+        assert!(matches!(normalized, Cow::Owned(_)));
+        assert_eq!(normalized[0].via_passable_pads, [src, dst]);
+
+        let canonical = NetEndpoints {
+            via_passable_pads: vec![src, dst],
+            ..unsorted.clone()
+        };
+        let router = NegotiatedRouter::new();
+        let expected = router.route(&grid, &[canonical]).unwrap();
+        let actual = router.route(&grid, &[unsorted]).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.results[0].path, [src, dst]);
+    }
+
+    #[test]
+    fn via_exemption_lookup_is_logarithmic_by_comparison_count() {
+        #[derive(Clone)]
+        struct CountedCell {
+            value: CellIdx,
+            comparisons: std::sync::Arc<AtomicUsize>,
+        }
+
+        impl PartialEq for CountedCell {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == std::cmp::Ordering::Equal
+            }
+        }
+        impl Eq for CountedCell {}
+        impl PartialOrd for CountedCell {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for CountedCell {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.comparisons.fetch_add(1, Ordering::Relaxed);
+                self.value.cmp(&other.value)
+            }
+        }
+
+        let comparisons = std::sync::Arc::new(AtomicUsize::new(0));
+        let cells: Vec<_> = (0..80_000)
+            .map(|value| CountedCell {
+                value,
+                comparisons: comparisons.clone(),
+            })
+            .collect();
+        let needle = CountedCell {
+            value: 79_999,
+            comparisons: comparisons.clone(),
+        };
+        assert!(sorted_contains(&cells, &needle));
+        let count = comparisons.load(Ordering::Relaxed);
+        assert!(
+            count <= 18,
+            "80k-entry lookup must remain logarithmic, got {count} comparisons"
+        );
     }
 
     struct InspectingFallbackProvider {
