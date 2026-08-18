@@ -76,13 +76,14 @@ congestion + equal unrouted set, under the shared canonical tie-break):
   boundaries, and concurrent calls — **pass**. This is broad regression coverage,
   not an exhaustive proof over every cost grid.
 
-The Rust source suite now contains **349 test cases** (348 passing, one explicitly
+The Rust source suite now contains **364 test cases** (363 passing, one explicitly
 ignored live-tool test), up from 243, plus two passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
 physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
 layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
 memory caps, fixed-fixture and fixed-seed Metal equivalence, cached isolation
-diagnoses, and parallel scheduling determinism.
+diagnoses, parallel scheduling determinism, authoritative DRC acceptance, and
+topology-preserving via repair.
 `research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
 regression-gate tests for benchmark reports.
 
@@ -168,23 +169,24 @@ Exact 2026-08-17 before/after run (`negotiated`, identical 112 boards and settin
 | `bug-reports` | 1996/2447 (81.6%) | **2011/2447 (82.2%)** | 32 → **38** |
 | **total** | 2701/3167 (85.3%) | **2729/3167 (86.2%)** | 78 → **91** |
 
-Total exact-geometry DRC findings fall **1493 → 1419**, algorithmic route cost
-falls **340,055 → 332,354**, clean boards rise **40 → 41**, and fully-routed-clean
-boards hold at 38. The hardened scorer returns **`KEEP`**: completion and full-board
-counts improve in both corpus groups without any workload, DRC, error, clean-board,
-or full-clean regression.
+Total exact-geometry DRC findings fall **1493 → 977**, algorithmic route cost
+falls **340,055 → 332,354**, clean boards rise **40 → 57**, and
+fully-routed-clean boards rise **38 → 54**. The hardened scorer returns
+**`KEEP`**: completion and full-board counts improve in both corpus groups without
+any workload, DRC, error, clean-board, or full-clean regression.
 
 The exact finished-code run improves the entire latency distribution: standard
-median **1.392 s → 0.135 s** (10.3×), nearest-rank p95 **339.9 s → 134.6 s** (2.53×),
-sum of overlapping board timers **4715 s → 1531 s** (3.08×), and external elapsed
-**715.55 s → 218.48 s** (3.28×). With 112 boards, the reported median is the
-arithmetic mean of sorted observations 56 and 57 (one-indexed), not a lower- or
-upper-middle value; nearest-rank p95 is observation 107. Peak per-board time falls
-679.5 s → 210.5 s.
-A matched isolated `bugreport05` run fell **564.226 s → 35.411 s** (15.9×) with
-every non-timing result identical. The principal wins are unique-cell SRJ pad-halo
-filtering and O(1) exact Hanan-distance heuristics; the DRC exact-gap fast reject
-adds a smaller measured 10.8% microbenchmark improvement.
+median **1.392 s → 0.050 s** (27.7×), nearest-rank p95 **339.9 s → 35.8 s**
+(9.49×), sum of overlapping board timers **4715 s → 658 s** (7.17×), and
+external elapsed **715.55 s → 89.64 s** (7.98×). With 112 boards, the reported
+median is the arithmetic mean of sorted observations 56 and 57 (one-indexed), not
+a lower- or upper-middle value; nearest-rank p95 is observation 107. Peak per-board
+time falls 679.5 s → 88.0 s. The principal speed wins are unique-cell SRJ pad-halo
+filtering, O(1) exact Hanan-distance heuristics, and a fused allocation-free Jacobi
+A* hot path; exact A/Bs retained normalized route output. Pad-ownership-aware
+smoothing and one bounded, board-wide DRC-scored via move produce the separate
+physical quality gain. The DRC exact-gap fast reject adds a smaller measured 10.8%
+microbenchmark improvement.
 
 The run writes a self-contained SVG gallery (`benchmarks/runs/<ts>-corpus/index.html`,
 gitignored) rendering obstacles, routed traces, and vias per board — failures
