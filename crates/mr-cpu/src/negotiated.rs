@@ -149,6 +149,12 @@ enum NegotiationMode {
 const RIPUP_GLOBAL_BUDGET_PER_NET: usize = 20;
 const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
 
+/// The blocker-informed restart stores and probes an O(groups) dependency graph,
+/// then pays for one more whole legalization pass. Keep that bounded on unusually
+/// fragmented inputs while retaining the 168-group bugreport50 recovery case.
+const GUIDED_RESTART_MAX_GROUPS: usize = 192;
+const _: () = assert!(GUIDED_RESTART_MAX_GROUPS >= 168);
+
 /// Per-net committed paths from one legalization pass, in input net order: `Some`
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
 type Committed = Vec<Option<Vec<CellIdx>>>;
@@ -3585,6 +3591,17 @@ fn dependency_guided_order(seed_order: &[usize], dependencies: &[Vec<usize>]) ->
     order
 }
 
+#[inline]
+fn guided_candidate_is_better(guided: &Committed, current: &Committed) -> bool {
+    guided.iter().filter(|path| path.is_some()).count()
+        > current.iter().filter(|path| path.is_some()).count()
+}
+
+#[inline]
+fn should_collect_guided_dependencies(n_groups: usize) -> bool {
+    n_groups <= GUIDED_RESTART_MAX_GROUPS
+}
+
 /// Bounded rip-up-and-reroute legalization.
 ///
 /// Produces a cell-disjoint-across-groups commit that, unlike [`legalize_in_order`],
@@ -3633,7 +3650,12 @@ fn ripup_legalize(
     let dims = grid.dims;
     let n_nets = nets.len();
     let n_groups = group_ids.iter().copied().max().map_or(0, |g| g + 1);
-    let mut dependencies = vec![Vec::<usize>::new(); n_groups];
+    let collect_dependencies = should_collect_guided_dependencies(n_groups);
+    let mut dependencies = if collect_dependencies {
+        vec![Vec::<usize>::new(); n_groups]
+    } else {
+        Vec::new()
+    };
 
     // A net needs the (expensive) full-board fallback only if its own alone-path
     // genuinely leaves its window. Nets whose alone-path fits the window never gain
@@ -3883,8 +3905,10 @@ fn ripup_legalize(
         // Learn every exact failed-group -> blocking-owner dependency. Reject an
         // edge that would close a cycle so the graph can safely drive one stable
         // topological restart after the ordinary bounded FIFO attempt.
-        for &blocker in &blocker_groups {
-            let _ = add_acyclic_dependency(&mut dependencies, g, blocker);
+        if collect_dependencies {
+            for &blocker in &blocker_groups {
+                let _ = add_acyclic_dependency(&mut dependencies, g, blocker);
+            }
         }
 
         let victim = blocker_groups[0];
@@ -3997,9 +4021,7 @@ fn ripup_legalize(
             protect_planar_from_vias,
             has_zero_cost,
         );
-        let guided_routed = guided.iter().filter(|path| path.is_some()).count();
-        let current_routed = committed.iter().filter(|path| path.is_some()).count();
-        if guided_routed > current_routed {
+        if guided_candidate_is_better(&guided, &committed) {
             committed = guided;
         }
     }
@@ -4535,6 +4557,23 @@ mod tests {
             vec![3, 2, 1, 0],
             "an empty dependency graph is byte-order inert"
         );
+    }
+
+    #[test]
+    fn guided_restart_is_bounded_and_requires_strict_completion_gain() {
+        assert!(should_collect_guided_dependencies(
+            GUIDED_RESTART_MAX_GROUPS
+        ));
+        assert!(!should_collect_guided_dependencies(
+            GUIDED_RESTART_MAX_GROUPS + 1
+        ));
+
+        let one = vec![Some(vec![0]), None];
+        let equal_but_different = vec![None, Some(vec![1])];
+        let two = vec![Some(vec![0]), Some(vec![1])];
+        assert!(!guided_candidate_is_better(&equal_but_different, &one));
+        assert!(!guided_candidate_is_better(&one, &one));
+        assert!(guided_candidate_is_better(&two, &one));
     }
 
     #[test]
