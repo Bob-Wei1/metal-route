@@ -9,7 +9,8 @@ aggregate gains from remaining regression gates.
 Historical baseline revision: `325d44d`. The previous measured candidate was
 `7aee642`, the isolated dense-via candidate is `02a7f95`, the coherent typed-SRJ
 projection is `f6c7fb0`, the accepted terminal-via baseline is `9e5b40a`, and the
-current measured router is `ddafd9a`. Every
+accepted pre-outline dependency/dihedral portfolio is `ddafd9a`. The current
+measured board-outline release is `c32e582`. Every
 corpus report in the comparisons below contains the same 112 board IDs and
 per-board net totals.
 The archived historical baseline used the former first-seen layer checker, so its
@@ -35,6 +36,14 @@ The accepted dependency/dihedral portfolio report has raw SHA-256
 Applying the same timing-field deletion and hashing the sorted compact JSON
 including its trailing newline gives semantic SHA-256
 `1d507b5e091a3ca6b3c299f206c6eef5608c9112dbca16e7e1faf3e7dda0c6ab`.
+
+The current exact-outline release has independent raw corpus SHA-256 values
+`17cb8fcd347f14ed55d5cd037cf484e853cb63ee5e49d9132c339b4e1c7f68f7`
+and `6950023a20b0674f6284cae1b894cc17d1c0d65cd380f69b2bb3bc54803c24d7`.
+After deleting `.total_wall_ms`, `.nets_per_sec`, each group `total_wall_ms`, and
+each board `wall_ms`, then serializing compact sorted JSON with its trailing
+newline, both normalize to SHA-256
+`d7f9a956f29211a45d1e4f18a1472886b6b3f9da8108136e566ee6e971843441`.
 
 At `f6c7fb0`, none of the locked corpus boards activated the fail-closed typed
 profile (0/112). Its raw corpus report SHA-256 is
@@ -83,9 +92,9 @@ rerunning the baseline revision uses its legacy checker.
 
 ## Test expansion
 
-Rust test attributes increased from 243 to 482. The current workspace executes
-478 conventional tests, has four explicitly ignored frontier/performance/live-tool
-tests, and passes two doctests. Six Criterion route-benchmark smoke cases also pass
+Rust test attributes increased from 243 to 543. The current workspace executes
+533 tests, has ten explicitly ignored manual frontier/performance/live/real-board
+gates, and passes two doctests. Six Criterion route-benchmark smoke cases also pass
 but are not counted as tests. Thirteen Python tests cover the benchmark scorer.
 Important new families:
 
@@ -111,7 +120,14 @@ Important new families:
 - exact DRC acceptance, compressed via-leg geometry, pad ownership, and bounded
   topology-preserving interior/stationary-terminal via repair;
 - acyclic blocker dependencies, cap-boundary no-ops, strict-gain selection,
-  unique dihedral-order sampling, and real-board completion/DRC portfolio gates.
+  unique dihedral-order sampling, and real-board completion/DRC portfolio gates;
+- exact concave/rectangular board-outline predicates, indexed-vs-naive raster
+  parity, bidirectional planar masks, trace/via radii, zero/sub-epsilon crossings,
+  singleton wire disks, malformed-contract failure, and narrow collinear-spur
+  normalization;
+- legacy-first final-soup selection, constrained DRC non-regression, emitted-width
+  parity, server `/solve`/`/api/trace` parity, Metal fail-closed fallback, and the
+  bounded 17–18-group strict-completion extension.
 
 ## Implemented changes
 
@@ -145,6 +161,24 @@ Important new families:
   that resolve unambiguously to its electrical group. Partial rules,
   mixed connection widths, unsupported geometry, bare endpoints, or ambiguous
   aliases retain the byte-stable legacy path.
+- A nonempty `outline` or explicit `minBoardEdgeClearance` independently activates
+  exact board-edge routing for coherent typed and partial/legacy inputs. An outline
+  without a clearance uses the producer's 0.2 mm default; an explicit clearance
+  without an outline constrains the declared bounds. Malformed active contracts
+  fail closed. Only exact zero-area collinear backtracking hairpins and their
+  resulting duplicate vertex are normalized; arbitrary self-intersections remain
+  errors.
+- The SRJ rasterizer projects exact continuous trace-centre, via-centre, and
+  bidirectional planar-edge predicates into a dependency-inverted core mask.
+  Trace keepout is edge clearance plus emitted radius; via keepout is edge
+  clearance plus routed via-pad radius. Partial profiles build the mask at the
+  width they actually emit rather than an unsupported declared width.
+- The product selector first runs the exact historical route with only the
+  board-edge contract removed, including every postprocessor, then validates the
+  final soup. Edge-clean bytes return unchanged. An unsafe route is ineligible and
+  triggers one constrained rerun, which must be edge-safe and non-worse under the
+  complete authoritative DRC profile. CLI `route`, server `/solve`, and
+  `/api/trace` use the same selection contract.
 - Legalization pre-stamps committed trace cells and via landings into a dense,
   group-aware via-landing guard. Each cell is free, owned by one connection group,
   or mixed, so a candidate via needs two O(1) tag reads while same-group sharing
@@ -175,6 +209,13 @@ Important new families:
   These alternatives are completion-only: they can replace the established
   winner only by routing strictly more nets, so equal-completion results preserve
   the original bytes.
+- Active board masks extend that completion-only cohort to exactly 17–18 groups,
+  still capped at 32 nets and 250k cells. Adaptive alone may evaluate at most four
+  cyclic/dihedral legalizations and one rip-up. The established Adaptive/
+  ForceSerial winner is chosen first; only a strict final routed-count gain can
+  atomically replace its board route, isolation diagnosis, and trace. This avoids
+  duplicating the extension in ForceSerial and makes equal-completion cost changes
+  inert.
 - The bounded rip-up pass records exact failed-group→blocking-owner edges while
   rejecting cycle-closing edges. It can make one stable topological legalization
   restart, again accepted only for a strict completion gain. Dependency collection
@@ -210,6 +251,11 @@ Important new families:
 - Public field results are chunked and capped before host/GPU allocation;
   multiplication overflow, empty-grid source explosions, device limits, and
   32-bit kernel indexing are rejected deterministically.
+- Metal kernels do not yet encode exact board trace-node, via-node, and directed
+  planar-edge masks. Every public Metal field, router, and isolated-batch entry
+  point therefore rejects any nonempty board mask before GPU work; provider
+  callers fall back atomically to the complete CPU batch. This is a fail-closed
+  boundary, not a claim that the GPU enforces outlines internally.
 - An exact edge-aware isolated-route batch supports non-uniform Hanan gaps,
   per-net windows and pads, restricted/zero-cost vias, weighted saturation, and
   canonical minimum-hop ties. A dependency-inverted CPU seam validates results
@@ -235,6 +281,15 @@ Important new families:
 
 ### Geometry and measurement
 
+- Board-mask rasterization uses deterministic row/column edge indexes whose
+  candidate sets are conservative supersets of every polygon edge that can affect
+  an exact predicate. Committed detailed-outline probes measured 25–317× over the
+  naive all-edges scan, and randomized indexed-vs-naive masks match exactly.
+- Continuous final-soup validation and DRC use actual emitted wire widths and via
+  pad diameters. Uncovered singleton wire points and zero-length segments retain
+  disk geometry; zero/sub-epsilon cutout crossings follow the same tolerance as
+  mask construction. Board-edge violations carry the reserved `__board_edge__`
+  pseudo-net so identity/severity comparisons remain deterministic.
 - Grid coordinate fallback, layer-aware pad passability, conservative unknown
   layers, per-vertex widths, strict DSN parsing/rules, and arbitrary rotated pad
   AABBs are now covered and corrected.
@@ -316,44 +371,47 @@ remeasured at `02a7f95`, so these numbers are not presented as a current-final A
 
 ### Exact 112-board corpus
 
-| Metric | Before | After | Change |
-|--------|-------:|------:|-------:|
-| Routed nets | 2701/3167 | **3000/3167** | +299 (+9.44 pp) |
-| Fully routed boards | 78/112 | **94/112** | +16 |
-| DRC findings | 1227 | **429** | -798 |
-| Clean boards | 49 | **76** | +27 |
-| Fully routed + clean | 46 | **71** | +25 |
-| Total route cost | 340,055 | 379,530 | +11.61% with 299 more routes |
+The current `c32e582` release enforces active outline and board-edge contracts.
+Both full runs reproduce this deterministic raw result:
 
-Timing is reported separately because the terminal baseline's two semantically
-identical runs had materially different nested-parallel scheduler profiles. The
-accepted portfolio run is included as a third observation, not a speed claim:
+| Metric | Current release |
+|--------|----------------:|
+| Routed nets | **2986/3167 (94.3%)** |
+| Fully routed boards | **90/112** |
+| Total route cost | **375,563** |
+| Native report DRC findings | **427** |
+| Clean boards | **77** |
+| Fully routed + clean | **71** |
+| Errors | **0** |
 
-| Observation | Terminal repeat 1 | Terminal repeat 2 | Portfolio `ddafd9a` |
-|-------------|------------------:|------------------:|---------------------:|
-| Median board time | 0.079024 s | 0.086278458 s | 0.121328938 s |
-| Nearest-rank P95 | 60.684370 s | 64.411409 s | **44.619103 s** |
-| Maximum board time | 104.177673 s | 96.042215 s | **93.909936 s** |
-| Sum of overlapping board timers | 742.689849 s | 1150.046112 s | **630.762518 s** |
-| External elapsed | 109.78 s | **96.19 s** | 104.91 s |
-| User / system CPU | not recorded | not recorded | 910.69 / 2.84 s |
+Per group, `bug-reports` routes 2267/2447 nets with 36/57 boards full;
+`srj15` routes 719/720 with 54/55 boards full. The raw predecessor retained
+3,000 nets and 94 boards but did not enforce outlines. An independent continuous
+identity audit rejects 37 of those routes across nine boards, so its physically
+valid baseline is 2,963 routes and 89 physically full boards. That makes the
+feature-aware acceptance table:
 
-For the even 112-board sample, median is the arithmetic mean of sorted
-observations 56 and 57 (one-indexed), not either middle observation. Nearest-rank
-p95 is sorted observation 107. The overlapping timer sum is especially sensitive
-to scheduler contention—it moves by more than 50% while external elapsed moves in
-the opposite direction. The portfolio's external time lies inside the terminal
-repeat range, so no new speedup is inferred.
+| Physical metric | Pre-outline portfolio | `c32e582` | Change |
+|-----------------|----------------------:|----------:|-------:|
+| Safe routed nets | 2963/3167 | **2986/3167** | **+23** |
+| Physically fully routed boards | 89/112 | **90/112** | **+1** |
+| Comparable ordinary DRC findings | 451 | **443** | **-8** |
+| Clean boards | 74 | **77** | **+3** |
+| Fully routed + clean | 70 | **71** | **+1** |
 
-Per group, `srj15` improves 705/720 → 719/720 and 46 → 54 full boards;
-its final physical totals are 139 DRC findings, 41 clean boards, and 41
-fully-routed-clean boards. `bug-reports` improves 1996/2447 → 2281/2447 and
-32 → 40 full boards, finishing with 290 DRC findings, 35 clean boards, and 30
-fully-routed-clean boards. The hardened scorer returns `KEEP`: exact workload
-identity is unchanged, both groups
-improve, errors remain zero, and aggregate DRC, clean-board, and
-fully-routed-clean gates improve. Total route cost is not compared as if the route
-sets were identical: the final retains 299 more nets.
+The native report's 427 findings and the audit's 443 comparable ordinary
+findings are different checker views and are reported separately. The latter is
+used only for a like-for-like predecessor comparison after excluding board-edge
+findings. The candidate itself has zero exact outline failures and zero
+board-edge findings.
+
+The first certified run took 324.27 s externally. The independent repeat took
+332.50 s externally, 2,593.23 s user CPU, 17.52 s system CPU, and
+1,385,381,888 bytes maximum RSS. A matched run of the physically invalid
+predecessor took 180.43 s on the same machine. Therefore this rollout is a
+correctness/quality gain, not a speed claim; exact safety and constrained reroutes
+have a measured runtime cost. The two raw and shared semantic hashes are recorded
+in “Reproducible baseline” above.
 
 ### Isolated feature-aware via-spacing rollout
 
@@ -393,20 +451,23 @@ non-regressing and every aggregate acceptance gate passes.
 The typed projection is intentionally narrower than the full modern SRJ schema.
 It enforces the coherent uniform subset described above: width, generic margin,
 trace↔pad/via↔trace, via↔pad, optional pad↔pad and drill↔drill clearances,
-and the exact declared routed via pad/hole geometry. `outline`,
-`minBoardEdgeClearance`, and `allowViaInPad` parse and round-trip but are not yet
-enforced; bus and differential-pair declarations remain outside routing
+and the exact declared routed via pad/hole geometry. Board `outline` and
+`minBoardEdgeClearance` now form a separate enforced contract over both coherent
+typed inputs and partial/legacy profiles. `allowViaInPad` still only parses and
+round-trips; bus and differential-pair declarations remain outside routing
 semantics. JSON compatibility is retained, but adding the optional fields is a
 source-level change for downstream Rust struct literals (the workspace is still
 version 0.1).
 
-The SRJ29 AM62L/LPDDR4 frontier fixture activates that supported subset. The
-no-resolution release CLI uses a 498×321×8 grid and routes **28/33** connections
-at cost **4,841** with zero findings under the supported typed DRC. The configured
-server `/solve` pins the same completion and DRC contract. The CLI solution
+The SRJ29 AM62L/LPDDR4 frontier fixture activated that typed subset at the
+pre-outline projection. Its no-resolution CLI used a 498×321×8 grid and routed
+**28/33** connections at cost **4,841** with zero findings under the supported
+typed DRC; configured server `/solve` pinned the same completion/DRC contract.
+The recorded CLI solution
 SHA-256 is
 `e5ac13e3621c6f81152d51bd4b745de3128901978838308311fbfffcca79c262`.
-This is not a full-SRJ claim: the fixture's outline, board-edge, via-in-pad, bus,
+The current product additionally enforces the fixture's rectangular outline and
+edge clearance when routed. This is still not a full-SRJ claim: via-in-pad, bus,
 and differential-pair constraints are not part of the asserted result.
 
 Relative to the typed corpus report, the bounded terminal-via repair preserves
@@ -426,7 +487,7 @@ ordinary router output, but an
 adversarial input with unbounded distinct coincident via representations can make
 its physical-site comparisons quadratic.
 
-### Bounded dependency and dihedral legalization portfolio
+### Pre-outline bounded dependency and dihedral legalization portfolio
 
 Against the terminal-via baseline, the accepted `ddafd9a` portfolio routes
 **2989/3167 → 3000/3167** nets and **92 → 94** boards fully. DRC improves
@@ -457,13 +518,62 @@ cyclic/dihedral orders rather than enumerating all rotations. Both candidates
 must strictly increase routed-net count; equal-completion cost or route changes
 cannot replace the established result.
 
+### Exact board-outline rollout
+
+The independent route-identity audit found 248 board-edge violations attached to
+37 routed identities on the nine active-outline boards. The constrained release
+has zero outline failures and zero edge findings. Unaffected board semantics are
+preserved; within the affected cohort, every board is non-regressing after the
+invalid predecessor identities are removed:
+
+| Board | Pre-outline raw | Invalid | Pre-outline safe | Release safe | Safe delta |
+|-------|----------------:|--------:|-----------------:|-------------:|-----------:|
+| `bugreport09-618e09` | 27 | 3 | 24 | 26 | **+2** |
+| `bugreport21-board-outline` | 1 | 1 | 0 | 1 | **+1** |
+| `bugreport43-e0f33a` | 16 | 1 | 15 | 17 | **+2** |
+| `bugreport46-ac4337` | 91 | 7 | 84 | 89 | **+5** |
+| `bugreport47-8ee80e-esp32-breakout` | 29 | 7 | 22 | 27 | **+5** |
+| `bugreport48-569cfe` | 16 | 3 | 13 | 15 | **+2** |
+| `bugreport49-8536f4` | 146 | 3 | 143 | 147 | **+4** |
+| `bugreport50-e1c376` | 303 | 8 | 295 | 295 | 0 |
+| `bugreport55-b7c349` | 10 | 4 | 6 | 8 | **+2** |
+| **Affected total** | **639** | **37** | **602** | **625** | **+23** |
+
+The legacy-first selector is central to both compatibility and runtime: it
+returns the historical final soup without a constrained solve whenever that soup
+is already exact-edge-safe. Only the nine unsafe boards reroute against trace/
+via/directed-edge masks, and every constrained soup passes the final continuous
+checker and full DRC non-regression gate. This preserves inactive-board topology
+and contract-stripped bytes, while malformed active contracts fail before routing.
+
+The 17–18-group extension is deliberately narrower than the existing 6–16-group
+portfolio. It is active only with exact board masks, at no more than 32 nets and
+250k cells, and only when the established result misses an individually routable
+net. At most four legalizations and one rip-up are evaluated on Adaptive; the
+established Adaptive/ForceSerial winner remains authoritative on any completion
+tie. On `bugreport09`, the constrained route moves 25/27 with six native findings
+to 26/27 with one; `bugreport43` pins the equal-completion no-change control.
+
+Two performance/hardening experiments were rejected from production:
+
+- A speculative parallel legacy+constrained selector improved focused
+  `bugreport46` wall time 14.90 → 13.09 s, but used 10% more CPU and 6% more
+  maximum RSS. The trade did not justify duplicating routing work, so it is a
+  NO-GO.
+- Dynamic phase-B revalidation of staged preferred paths passed exact semantic
+  review and focused tests, including the established via-ring and owner/halo/
+  endpoint semantics. In the full composition it caused excessive full-board
+  fallbacks and did not finish the corpus within 300 s. It remains a correctness-
+  sound research stack, not a production change, because the fallback/runtime
+  bound is unacceptable.
+
 The legacy baseline report contained 1,493 findings under the old first-seen layer
 checker; that number is intentionally not used in the comparison table. Rechecking
 the byte-identical baseline routes with the corrected physical-layer/ownership
 semantics yields the checker-comparable 1,227 above. For historical provenance,
 the intermediate `7aee642` run moved `bugreport05` 86/228 → 80/228, cost 37,109
 → 39,288, and findings 15 → 12; its six-board preflight was 70/113 with 31
-findings. Those intermediate values are not substituted into either current-final
+findings. Those intermediate values are not substituted into either current-release
 table. Corpus `total_wall_ms` is a sum of overlapping board timers; external
 elapsed is the real end-to-end measure.
 
@@ -482,13 +592,14 @@ Current upstream reviewed: `tscircuit-autorouter` v0.0.817 (`aee844f`,
 - [Upstream regression thresholds](https://github.com/tscircuit/tscircuit-autorouter/blob/main/scripts/benchmark/detect-benchmark-regressions.ts)
 - [Board-outline and edge-clearance enforcement frontier (PR 2145)](https://github.com/tscircuit/tscircuit-autorouter/pull/2145)
 
-PR 2145 exposed a concrete local gap: `bugreport21-board-outline` crosses a
-concave cutout while the current legacy checker reports zero findings. A local
-four-commit research stack proved exact route masks and continuous board-edge DRC
-on that target, but remains unmerged. It is held for legacy-byte portfolio
-preservation, sweep/Metal mask coverage, bidirectional edge hardening, a
-postprocess zero-edge gate, zero-length DRC, malformed-outline normalization,
-and spatial indexing/plane reuse.
+PR 2145 exposed the concrete `bugreport21-board-outline` concave-cutout gap that
+the current release now closes. The original research stack was expanded through
+all release gates: exact trace/via/bidirectional-edge masks, continuous final-soup
+DRC, legacy-byte preservation for already-safe routes, fail-closed Metal fallback,
+zero-length/singleton semantics, narrow malformed-outline normalization, and an
+indexed layer-invariant raster. The dynamic phase-B hardening experiment described
+above remains separate because of its unbounded fallback behavior, not because
+the shipped board-edge contract depends on it.
 
 The most credible next architecture is CPU coarse corridor/hypergraph planning,
 GPU-batched detailed candidate search/scoring, and exact CPU DRC acceptance with
