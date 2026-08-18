@@ -6848,6 +6848,7 @@ mod tests {
             )
             .unwrap()
             .board;
+        let mut serial_trace = empty_route_trace(dims);
         let serial = router
             .route_variant(
                 &grid,
@@ -6855,7 +6856,7 @@ mod tests {
                 &group_ids,
                 NegotiationMode::ForceSerial,
                 None,
-                None,
+                Some(&mut serial_trace),
             )
             .unwrap()
             .board;
@@ -6863,7 +6864,9 @@ mod tests {
         assert_eq!((primary.results.len(), primary.total_cost()), (9, 120));
         assert_eq!((serial.results.len(), serial.total_cost()), (10, 117));
         assert!(serial_candidate_is_better(&primary, &serial));
-        assert_eq!(router.route(&grid, &nets).unwrap(), serial);
+        let (board, trace) = router.route_traced(&grid, &nets).unwrap();
+        assert_eq!(board, serial);
+        assert_trace_eq(&trace, &serial_trace);
     }
 
     #[test]
