@@ -76,7 +76,26 @@ pub fn build_drc_board(
     trace_width: f64,
     rules: DrcRules,
     model_plane_antipads: bool,
-) -> DrcBoard {
+) -> Result<DrcBoard> {
+    anyhow::ensure!(
+        mapping.dims.layers == signal_layers.len(),
+        "routing grid has {} layers but signal layer map has {}",
+        mapping.dims.layers,
+        signal_layers.len()
+    );
+
+    // Resolve the complete signal-to-physical mapping up front and fail closed.
+    // Falling back to the signal index can silently alias a missing name onto an
+    // unrelated plane or signal layer in the physical stack.
+    let signal_to_physical: Vec<u32> = (0..signal_layers.len())
+        .map(|sl| {
+            let name = signal_layers.name(sl);
+            physical_layers
+                .index_of(name)
+                .with_context(|| format!("signal layer {name:?} is absent from physical stack"))
+        })
+        .collect::<Result<_>>()?;
+
     // physical layer index -> plane net (only for layers a plane fills).
     let mut plane_nets: HashMap<u32, String> = HashMap::new();
     for p in planes {
@@ -92,11 +111,7 @@ pub fn build_drc_board(
         .collect();
 
     // Resolve a signal-grid layer index to its physical-stackup index by name.
-    let sig_to_phys = |sl: u32| {
-        physical_layers
-            .index_of(signal_layers.name(sl))
-            .unwrap_or(sl)
-    };
+    let sig_to_phys = |sl: u32| signal_to_physical[sl as usize];
 
     let dims = mapping.dims;
     let mut segments = Vec::new();
@@ -190,13 +205,13 @@ pub fn build_drc_board(
         }
     }
 
-    DrcBoard {
+    Ok(DrcBoard {
         layers,
         segments,
         pads,
         vias,
         rules,
-    }
+    })
 }
 
 /// Arguments for the `drc` subcommand: the same routing knobs as `route-dsn`, plus
@@ -361,6 +376,44 @@ mod tests {
             default_rules(0.15),
             model_plane_antipads,
         )
+        .expect("fixture layer maps must be compatible")
+    }
+
+    #[test]
+    fn missing_signal_layer_in_physical_stack_fails_closed() {
+        let bounds = mr_srj::Bounds {
+            min_x: 0.0,
+            max_x: 2.0,
+            min_y: 0.0,
+            max_y: 2.0,
+        };
+        let mapping = Mapping::with_layers(&bounds, 1.0, 2);
+        let signal = LayerMap::from_names(vec!["top".to_string(), "bottom".to_string()]);
+        let physical = LayerMap::from_names(vec!["top".to_string(), "inner1".to_string()]);
+        let board = BoardRoute {
+            results: vec![],
+            unrouted: vec![],
+            congestion: vec![],
+            groups: vec![],
+        };
+
+        let err = build_drc_board(
+            &board,
+            &mapping,
+            &signal,
+            &physical,
+            &[],
+            &[],
+            &HashMap::new(),
+            0.15,
+            default_rules(0.15),
+            true,
+        )
+        .expect_err("a missing physical signal layer must not be silently aliased");
+        assert!(
+            err.to_string().contains("bottom") && err.to_string().contains("absent"),
+            "unexpected error: {err:#}"
+        );
     }
 
     /// Without the poured-zone model (bare copper), a foreign through-via shorts the

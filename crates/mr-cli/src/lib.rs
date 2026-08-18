@@ -1344,7 +1344,7 @@ pub fn route_dsn_problem(
         trace_width,
         drc::default_rules(stats.min_clearance_mm),
         model_plane_antipads,
-    );
+    )?;
 
     let report = DsnReport {
         stats,
