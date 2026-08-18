@@ -32,12 +32,20 @@ from typing import Any, Iterable, Sequence
 
 
 EXPECTED_FREEROUTING_VERSION = "2.3.0"
+EXPECTED_FREEROUTING_SHA256 = (
+    "3cf18d608437740bc497db6b8ef5888e2e60a08de0def20691d1bad0c0e0ee24"
+)
 SCHEMA_VERSION = "metalroute.freerouting-speed.v1"
 OFFICIAL_SMOKE_FIXTURES = (
     "DAC2020_bm08.dsn",
     "DAC2020_bm06.dsn",
     "DAC2020_bm07.dsn",
 )
+OFFICIAL_SMOKE_FIXTURE_SHA256 = {
+    "DAC2020_bm08.dsn": "5d3acaaac47c1851d439150e3b70751b85fe1e8b8afc55278f1487b692b32bc5",
+    "DAC2020_bm06.dsn": "31f38102d90a1bb4b901d4ca8d1877eb41752281ffa9de9f53a3cf69ba5231e2",
+    "DAC2020_bm07.dsn": "39d85afa3133caae9b274350183868ad1fce5a0c64e3d5c6874598a899007c85",
+}
 METALROUTE_ENV_OVERRIDES = (
     "METALROUTE_EXPERIMENTAL_METAL_ISOLATED",
     "MR_CELL_BUDGET",
@@ -237,6 +245,12 @@ def probe_tools(
     java: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    freerouting_sha256 = sha256_file(freerouting_jar)
+    if freerouting_sha256 != EXPECTED_FREEROUTING_SHA256:
+        raise BenchError(
+            "Freerouting JAR SHA-256 mismatch: expected "
+            f"{EXPECTED_FREEROUTING_SHA256}, found {freerouting_sha256}"
+        )
     metal = run_process([str(metalroute), "--version"], timeout_seconds=timeout_seconds)
     if metal.timed_out or metal.exit_code != 0:
         raise BenchError(
@@ -280,7 +294,7 @@ def probe_tools(
         },
         "freerouting": {
             "version": version,
-            "sha256": sha256_file(freerouting_jar),
+            "sha256": freerouting_sha256,
             "size_bytes": freerouting_jar.stat().st_size,
         },
         "java": {"version_output": java_version},
@@ -1065,6 +1079,14 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path, list[Path], b
             raise BenchError(
                 f"DSN path cannot contain '+', which Freerouting reserves for DSN+SES reload: {dsn}"
             )
+        if official_smoke:
+            expected = OFFICIAL_SMOKE_FIXTURE_SHA256[dsn.name]
+            actual = sha256_file(dsn)
+            if actual != expected:
+                raise BenchError(
+                    f"official fixture SHA-256 mismatch for {dsn.name}: "
+                    f"expected {expected}, found {actual}"
+                )
     if len(set(dsns)) != len(dsns):
         raise BenchError("the DSN fixture list contains duplicate paths")
     artifact_keys = [(slugify(dsn.stem), sha256_file(dsn)) for dsn in dsns]

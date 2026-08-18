@@ -33,9 +33,17 @@ Freerouting publishes its own benchmark DSNs under
 [`scripts/benchmark/fixtures`](https://github.com/freerouting/freerouting/tree/v2.3.0/scripts/benchmark/fixtures).
 The default smoke profile selects `DAC2020_bm08.dsn`, `DAC2020_bm06.dsn`, and
 `DAC2020_bm07.dsn` from an external copy of that directory. The harness records
-the exact v2.3.0 upstream paths and fixture hashes. These are a quick two-layer
-smoke set, not Freerouting's complete benchmark corpus. Keep the files outside
-this repository.
+the exact v2.3.0 upstream paths and rejects fixture or release-JAR hash
+mismatches. These are a quick two-layer smoke set, not Freerouting's complete
+benchmark corpus. Keep the files outside this repository.
+
+The official v2.3.0 JAR SHA-256 is
+`3cf18d608437740bc497db6b8ef5888e2e60a08de0def20691d1bad0c0e0ee24`.
+The selected fixture SHA-256 values are:
+
+- `DAC2020_bm08.dsn`: `5d3acaaac47c1851d439150e3b70751b85fe1e8b8afc55278f1487b692b32bc5`
+- `DAC2020_bm06.dsn`: `31f38102d90a1bb4b901d4ca8d1877eb41752281ffa9de9f53a3cf69ba5231e2`
+- `DAC2020_bm07.dsn`: `39d85afa3133caae9b274350183868ad1fce5a0c64e3d5c6874598a899007c85`
 
 ## Measurement contract
 

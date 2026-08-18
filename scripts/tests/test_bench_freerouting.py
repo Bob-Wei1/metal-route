@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -117,23 +118,26 @@ class HarnessTest(unittest.TestCase):
         os.environ["METALROUTE_EXPERIMENTAL_METAL_ISOLATED"] = "1"
         os.environ["MR_CELL_BUDGET"] = "adaptive"
         try:
-            exit_code = bench.main(
-                [
-                    "--metalroute",
-                    str(self.metalroute),
-                    "--freerouting-jar",
-                    str(self.jar),
-                    "--java",
-                    str(self.java),
-                    "--repetitions",
-                    "2",
-                    "--timeout",
-                    "5",
-                    "--output-dir",
-                    str(output),
-                    str(dsn),
-                ]
-            )
+            with mock.patch.object(
+                bench, "EXPECTED_FREEROUTING_SHA256", bench.sha256_file(self.jar)
+            ):
+                exit_code = bench.main(
+                    [
+                        "--metalroute",
+                        str(self.metalroute),
+                        "--freerouting-jar",
+                        str(self.jar),
+                        "--java",
+                        str(self.java),
+                        "--repetitions",
+                        "2",
+                        "--timeout",
+                        "5",
+                        "--output-dir",
+                        str(output),
+                        str(dsn),
+                    ]
+                )
         finally:
             if old_metal is None:
                 os.environ.pop("METALROUTE_EXPERIMENTAL_METAL_ISOLATED", None)
@@ -277,7 +281,12 @@ class HarnessTest(unittest.TestCase):
                 str(fixture_dir),
             ]
         )
-        _, _, dsns, official_smoke = bench.validate_inputs(args)
+        expected = {
+            filename: bench.sha256_file(fixture_dir / filename)
+            for filename in bench.OFFICIAL_SMOKE_FIXTURES
+        }
+        with mock.patch.object(bench, "OFFICIAL_SMOKE_FIXTURE_SHA256", expected):
+            _, _, dsns, official_smoke = bench.validate_inputs(args)
         self.assertTrue(official_smoke)
         self.assertEqual(
             [path.name for path in dsns], list(bench.OFFICIAL_SMOKE_FIXTURES)
