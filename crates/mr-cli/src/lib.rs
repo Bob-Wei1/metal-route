@@ -1346,14 +1346,35 @@ fn board_to_ses(
                 }
                 out.push_str(") (type route))\n");
             };
-            for k in 1..path.len() {
+            let mut k = 1;
+            while k < path.len() {
                 let l = dims.layer_of(path[k]);
                 if l == cur_layer {
                     let (x, y) = point(path[k], k == last);
                     run.push((to_raw(x), to_raw(y)));
+                    k += 1;
                 } else {
-                    // Layer change: a via at the shared (x, y) of path[k-1]/path[k].
-                    // We emit only the via padstack + position, tagged with its net
+                    // A through-via can cross several adjacent routing layers, but
+                    // SES represents that physical drill with one `(via ...)`. Find
+                    // the end of this maximal same-position vertical run so a
+                    // top→inner1→inner2→bottom route does not emit three coincident
+                    // vias.
+                    let (vx_cell, vy_cell, _) = dims.xyz(path[k]);
+                    let (px_cell, py_cell, _) = dims.xyz(path[k - 1]);
+                    let mut vertical_end = k;
+                    if (px_cell, py_cell) == (vx_cell, vy_cell) {
+                        while vertical_end + 1 < path.len() {
+                            let (nx, ny, nl) = dims.xyz(path[vertical_end + 1]);
+                            let previous_layer = dims.layer_of(path[vertical_end]);
+                            if (nx, ny) == (vx_cell, vy_cell) && nl != previous_layer {
+                                vertical_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Emit only the via padstack + position, tagged with its net
                     // (it sits inside this `(net ...)` block). Plane antipads are NOT
                     // emitted as explicit geometry: on import, KiCad's zone fill
                     // reliefs a foreign-net via automatically (the via's net is
@@ -1364,9 +1385,10 @@ fn board_to_ses(
                     let (vrx, vry) = (to_raw(vx), to_raw(vy));
                     flush(&mut out, cur_layer, &run);
                     out.push_str(&format!("        (via \"{via_name}\" {vrx} {vry})\n"));
-                    cur_layer = l;
-                    let (x, y) = point(path[k], k == last);
+                    cur_layer = dims.layer_of(path[vertical_end]);
+                    let (x, y) = point(path[vertical_end], vertical_end == last);
                     run = vec![(to_raw(x), to_raw(y))];
+                    k = vertical_end + 1;
                 }
             }
             flush(&mut out, cur_layer, &run);
@@ -1419,6 +1441,59 @@ fn project_via_model(
     };
     projected.step_cost = declared.step_cost;
     projected
+}
+
+/// Select the only via geometry `route-dsn` can currently reproduce faithfully.
+/// Legacy designs that declare no via retain the generated full-stack fallback;
+/// a declaration must resolve to exactly one uniform circular through-via.
+fn route_dsn_via_geometry(
+    declared_count: usize,
+    declared: Option<DsnViaGeometry>,
+    physical_layers: &LayerMap,
+) -> Result<DsnViaGeometry> {
+    let physical_layer_names = || {
+        (0..physical_layers.len())
+            .map(|layer| physical_layers.name(layer).to_string())
+            .collect::<Vec<_>>()
+    };
+
+    match (declared_count, declared) {
+        (0, None) => Ok(DsnViaGeometry {
+            padstack_name: format!(
+                "Via[0-{}]_450:200_um",
+                physical_layers.len().saturating_sub(1)
+            ),
+            pad_diameter_mm: VIA_PAD_MM,
+            drill_diameter_mm: Some(VIA_DRILL_MM),
+            layers: physical_layer_names(),
+            full_stack_uniform_circle: true,
+        }),
+        (0, Some(_)) => anyhow::bail!(
+            "route-dsn received via geometry although the DSN declares no via padstack"
+        ),
+        (1, None) => anyhow::bail!(
+            "route-dsn cannot resolve the sole declared via padstack; only one full-stack uniform circular via is supported"
+        ),
+        (1, Some(geometry)) => {
+            anyhow::ensure!(
+                geometry.full_stack_uniform_circle
+                    && geometry.layers == physical_layer_names(),
+                "route-dsn supports a declared via only when it is one resolvable full-stack uniform circular padstack; {:?} is unsupported",
+                geometry.padstack_name
+            );
+            anyhow::ensure!(
+                geometry
+                    .drill_diameter_mm
+                    .is_some_and(|diameter| diameter.is_finite() && diameter > 0.0),
+                "route-dsn cannot resolve a finite positive drill diameter for declared via {:?}",
+                geometry.padstack_name
+            );
+            Ok(geometry)
+        }
+        (count, _) => anyhow::bail!(
+            "route-dsn supports at most one declared via padstack, but the DSN declares {count}"
+        ),
+    }
 }
 
 /// Core `route-dsn` logic: convert a parsed DSN to a problem, route it, and build
@@ -1481,19 +1556,10 @@ pub fn route_dsn_problem(
     let layer_map = LayerMap::from_names(signal_layers);
     let mut via_model = project_via_model(&declared_via_model, &physical_layers, &layer_map);
 
-    // Use the first declared, geometrically resolvable DSN via. Legacy inputs
-    // without one retain metalroute's documented 0.45/0.20 mm fallback.
-    let via_geometry = via_geometry.unwrap_or_else(|| DsnViaGeometry {
-        padstack_name: format!(
-            "Via[0-{}]_450:200_um",
-            physical_layers.len().saturating_sub(1)
-        ),
-        pad_diameter_mm: VIA_PAD_MM,
-        drill_diameter_mm: Some(VIA_DRILL_MM),
-        layers: (0..physical_layers.len())
-            .map(|layer| physical_layers.name(layer).to_string())
-            .collect(),
-    });
+    // Fail closed unless the declaration is exactly the through-via geometry our
+    // router, SES writer, and physical DRC model all agree on. Legacy inputs with
+    // zero declared vias retain the generated 0.45/0.20 mm full-stack fallback.
+    let via_geometry = route_dsn_via_geometry(stats.vias_declared, via_geometry, &physical_layers)?;
     let via_pad_mm = via_geometry.pad_diameter_mm;
     let via_drill_mm = via_geometry
         .drill_diameter_mm
@@ -3508,9 +3574,10 @@ mod tests {
           (resolution um 10)
           (structure
             (layer Top (type signal))
+            (layer Inner (type signal))
             (layer Bottom (type signal))
             (boundary (rect pcb 0 0 10000 10000))
-            (via "Via[0-1]_600:300_um")
+            (via "Via[0-2]_600:300_um")
             (rule (width 150) (clearance 100)))
           (placement
             (component "top-pad" (place A 1000 1000 front 0))
@@ -3520,8 +3587,9 @@ mod tests {
             (image "bottom-pad" (pin "bottom" 1 0 0))
             (padstack "top" (shape (circle Top 600)))
             (padstack "bottom" (shape (circle Bottom 600)))
-            (padstack "Via[0-1]_600:300_um"
+            (padstack "Via[0-2]_600:300_um"
               (shape (circle Top 600))
+              (shape (circle Inner 600))
               (shape (circle Bottom 600))))
           (network (net "N" (pins A-1 B-1))))
         "#;
@@ -3538,13 +3606,219 @@ mod tests {
         assert!(drc.vias.iter().all(|via| {
             (via.pad_diameter - 0.6).abs() < 1e-12 && (via.drill_diameter - 0.3).abs() < 1e-12
         }));
+        assert!(drc
+            .vias
+            .iter()
+            .all(|via| (via.from_layer, via.to_layer) == (0, 2)));
 
         // Input circle 600 is 0.6 mm. A resolution-10 session writes that as
         // 6000 subunits while retaining the source padstack identity and layers.
-        assert!(ses.contains("(padstack \"Via[0-1]_600:300_um\""));
+        assert!(ses.contains("(padstack \"Via[0-2]_600:300_um\""));
         assert!(ses.contains("(shape (circle Top 6000))"));
+        assert!(ses.contains("(shape (circle Inner 6000))"));
         assert!(ses.contains("(shape (circle Bottom 6000))"));
-        assert!(ses.contains("(via \"Via[0-1]_600:300_um\""));
+        assert!(ses.contains("(via \"Via[0-2]_600:300_um\""));
+    }
+
+    #[test]
+    fn route_dsn_rejects_multiple_declared_vias_on_three_layer_board() {
+        let dsn = r#"
+        (pcb "multiple-vias.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Inner (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "via-a" "via-b"))
+          (library
+            (padstack "via-a" (shape (circle signal 600)))
+            (padstack "via-b" (shape (circle signal 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.stats.layers, 3);
+        assert_eq!(ingest.stats.vias_declared, 2);
+
+        let error = route_dsn_problem(ingest, "multiple-vias", Some(0.5), &[], None, None, true)
+            .expect_err("route-dsn must not pick one of multiple declared vias");
+        assert!(error.to_string().contains("at most one"), "{error:#}");
+    }
+
+    #[test]
+    fn route_dsn_rejects_partial_via_on_four_layer_board() {
+        let dsn = r#"
+        (pcb "partial-via.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Inner1 (type signal))
+            (layer Inner2 (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "buried"))
+          (library
+            (padstack "buried"
+              (shape (circle Inner1 600))
+              (shape (circle Inner2 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.stats.layers, 4);
+        let geometry = ingest
+            .via_geometry
+            .as_ref()
+            .expect("partial geometry parsed");
+        assert_eq!(geometry.layers, ["Inner1", "Inner2"]);
+        assert!(!geometry.full_stack_uniform_circle);
+
+        let error = route_dsn_problem(ingest, "partial-via", Some(0.5), &[], None, None, true)
+            .expect_err("route-dsn must not emit a partial via as through-hole");
+        assert!(error.to_string().contains("full-stack"), "{error:#}");
+    }
+
+    #[test]
+    fn route_dsn_rejects_nonuniform_via_on_three_layer_board() {
+        let dsn = r#"
+        (pcb "nonuniform-via.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Inner (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "nonuniform"))
+          (library
+            (padstack "nonuniform"
+              (shape (circle Top 600))
+              (shape (circle Inner 700))
+              (shape (circle Bottom 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.stats.layers, 3);
+        let geometry = ingest
+            .via_geometry
+            .as_ref()
+            .expect("nonuniform geometry parsed conservatively");
+        assert!((geometry.pad_diameter_mm - 0.7).abs() < 1e-12);
+        assert!(!geometry.full_stack_uniform_circle);
+
+        let error = route_dsn_problem(ingest, "nonuniform-via", Some(0.5), &[], None, None, true)
+            .expect_err("route-dsn must not flatten per-layer annulus sizes");
+        assert!(error.to_string().contains("uniform circular"), "{error:#}");
+    }
+
+    #[test]
+    fn route_dsn_rejects_declared_via_without_resolvable_drill() {
+        let dsn = r#"
+        (pcb "missing-drill.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Inner (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "through"))
+          (library
+            (padstack "through"
+              (shape (circle Top 600))
+              (shape (circle Inner 600))
+              (shape (circle Bottom 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.stats.layers, 3);
+        let geometry = ingest
+            .via_geometry
+            .as_ref()
+            .expect("uniform full-stack geometry parsed");
+        assert!(geometry.full_stack_uniform_circle);
+        assert_eq!(geometry.drill_diameter_mm, None);
+
+        let error = route_dsn_problem(ingest, "missing-drill", Some(0.5), &[], None, None, true)
+            .expect_err("route-dsn must not substitute a drill for a declared via");
+        assert!(
+            error.to_string().contains("drill diameter"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn route_dsn_zero_declarations_generate_a_full_stack_fallback() {
+        let physical = LayerMap::from_names(vec![
+            "Top".into(),
+            "Inner1".into(),
+            "Inner2".into(),
+            "Bottom".into(),
+        ]);
+        let geometry = route_dsn_via_geometry(0, None, &physical).unwrap();
+        assert_eq!(geometry.padstack_name, "Via[0-3]_450:200_um");
+        assert_eq!(geometry.layers, ["Top", "Inner1", "Inner2", "Bottom"]);
+        assert!(geometry.full_stack_uniform_circle);
+    }
+
+    #[test]
+    fn ses_collapses_a_four_layer_vertical_run_to_one_through_via() {
+        let bounds = mr_srj::Bounds {
+            min_x: 0.0,
+            max_x: 3.0,
+            min_y: 0.0,
+            max_y: 3.0,
+        };
+        let mapping = Mapping::with_layers(&bounds, 1.0, 4);
+        let dims = mapping.dims;
+        let layers = LayerMap::from_names(vec![
+            "Top".into(),
+            "Inner1".into(),
+            "Inner2".into(),
+            "Bottom".into(),
+        ]);
+        let board = BoardRoute {
+            results: vec![mr_core::RouteResult {
+                net: "N".into(),
+                path: vec![
+                    dims.idx3(0, 1, 0),
+                    dims.idx3(1, 1, 0),
+                    dims.idx3(1, 1, 1),
+                    dims.idx3(1, 1, 2),
+                    dims.idx3(1, 1, 3),
+                    dims.idx3(2, 1, 3),
+                ],
+                cost: 5,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+            groups: vec![],
+        };
+        let geometry = DsnViaGeometry {
+            padstack_name: "through".into(),
+            pad_diameter_mm: 0.6,
+            drill_diameter_mm: Some(0.3),
+            layers: (0..layers.len())
+                .map(|layer| layers.name(layer).to_string())
+                .collect(),
+            full_stack_uniform_circle: true,
+        };
+
+        let ses = board_to_ses(
+            "vertical-run",
+            &board,
+            &mapping,
+            &layers,
+            &HashMap::new(),
+            1_000.0,
+            "um",
+            1.0,
+            0.15,
+            &geometry,
+        );
+        assert_eq!(
+            ses.matches("(via \"through\"").count(),
+            1,
+            "one physical drill must not become coincident per-layer vias:\n{ses}"
+        );
+        assert_eq!(
+            ses.matches("(wire (path").count(),
+            2,
+            "planar wire on each side of the vertical run must survive:\n{ses}"
+        );
     }
 
     #[test]

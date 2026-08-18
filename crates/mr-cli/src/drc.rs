@@ -169,7 +169,10 @@ pub fn build_drc_board(
         }
 
         // Vias: collapse each maximal vertical run (same x,y, changing layer) into
-        // one through-via spanning the physical layers of its first and last cells.
+        // one emitted through-via. `route-dsn` accepts only a full-stack via (or
+        // generates its legacy full-stack fallback), so DRC must stamp the copper
+        // and barrel across the complete physical stack even when the router used
+        // only one adjacent hop to change signal layers.
         let mut i = 0;
         while i < path.len() {
             let (cx, cy, _) = dims.xyz(path[i]);
@@ -183,16 +186,13 @@ pub fn build_drc_board(
                 }
             }
             if j > i {
-                let l0 = dims.xyz(path[i]).2;
-                let l1 = dims.xyz(path[j]).2;
-                let (p0, p1) = (sig_to_phys(l0), sig_to_phys(l1));
                 vias.push(Via {
                     net: net.clone(),
                     center: mapping.cell_center(path[i]),
                     pad_diameter: via_pad_diameter,
                     drill_diameter: via_drill_diameter,
-                    from_layer: p0.min(p1),
-                    to_layer: p0.max(p1),
+                    from_layer: 0,
+                    to_layer: physical_layers.len().saturating_sub(1),
                     // Poured-zone relief (or `None` for the bare-copper model); see
                     // `model_plane_antipads` on `build_drc_board`.
                     antipad_radius: via_antipad,
@@ -544,6 +544,53 @@ mod tests {
         )
         .expect("a one-to-one signal projection must remain valid");
         assert_eq!(board.layers.len(), 3);
+    }
+
+    #[test]
+    fn adjacent_inner_route_hop_stamps_through_via_on_full_physical_stack() {
+        let physical = LayerMap::from_names(vec![
+            "top".to_string(),
+            "inner1".to_string(),
+            "inner2".to_string(),
+            "bottom".to_string(),
+        ]);
+        let signal = physical.clone();
+        let mapping = empty_mapping(4);
+        let dims = mapping.dims;
+        let board = BoardRoute {
+            results: vec![RouteResult {
+                net: "SIG".to_string(),
+                // The router changes only between the two inner grid layers. The
+                // emitted hardware is nevertheless the supported through-via.
+                path: vec![dims.idx3(1, 1, 1), dims.idx3(1, 1, 2)],
+                cost: 1,
+            }],
+            unrouted: vec![],
+            congestion: vec![],
+            groups: vec![],
+        };
+
+        let drc = build_drc_board(
+            &board,
+            &mapping,
+            &signal,
+            &physical,
+            &[],
+            &[],
+            &HashMap::new(),
+            0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
+            default_rules(0.15),
+            true,
+        )
+        .unwrap();
+        assert_eq!(drc.vias.len(), 1);
+        assert_eq!(
+            (drc.vias[0].from_layer, drc.vias[0].to_layer),
+            (0, 3),
+            "DRC must model the full physical drill, not just the route-hop span"
+        );
     }
 
     /// Without the poured-zone model (bare copper), a foreign through-via shorts the

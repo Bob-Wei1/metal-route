@@ -364,6 +364,11 @@ pub struct DsnViaGeometry {
     pub drill_diameter_mm: Option<f64>,
     /// Physical copper layers on which the padstack has shapes.
     pub layers: Vec<String>,
+    /// Whether this padstack is one resolvable, full-stack via with exactly one
+    /// centred circular annulus of the same diameter on every physical layer.
+    /// This is the conservative geometry subset `route-dsn` can reproduce as a
+    /// single through-via in both SES and DRC output.
+    pub full_stack_uniform_circle: bool,
 }
 
 impl DsnIngest {
@@ -603,7 +608,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     // spans -> a restricted model permitting exactly those adjacent steps.
     let via_names = declared_via_names(structure);
     let (via_model, vias_declared) = parse_via_model(pcb, &via_names, layer_count, &layer_map);
-    let via_geometry = parse_via_geometry(&via_names, &pad_sizes, &layer_map);
+    let via_geometry = parse_via_geometry(pcb, &via_names, &pad_sizes, &layer_map, &to_mm);
     let vias_through_hole = via_model == ViaModel::through_hole(layer_count);
 
     let stats = ParseStats {
@@ -845,18 +850,18 @@ fn pad_layer_names(declared: &[String], layer_map: &LayerMap) -> Vec<String> {
 ///   spans cover (a span `[lo, hi]` contributes the steps `lo..hi`).
 /// - When no vias are declared, or spans are ambiguous, we default to through-hole.
 fn declared_via_names(structure: &Sexpr) -> Vec<String> {
-    structure
-        .child_named("via")
-        .and_then(|v| v.as_list())
-        .map(|items| {
-            items
-                .iter()
-                .skip(1)
-                .filter_map(|n| n.as_atom())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut names = Vec::new();
+    for via in structure.children_named("via") {
+        let Some(items) = via.as_list() else {
+            continue;
+        };
+        for name in items.iter().skip(1).filter_map(|node| node.as_atom()) {
+            if !names.iter().any(|declared| declared == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Decode the drill suffix produced by KiCad, e.g. the `300` in
@@ -870,9 +875,11 @@ fn kicad_via_drill_mm(name: &str) -> Option<f64> {
 }
 
 fn parse_via_geometry(
+    pcb: &Sexpr,
     via_names: &[String],
     pad_sizes: &HashMap<String, PadSize>,
     layer_map: &LayerMap,
+    to_mm: &impl Fn(f64) -> f64,
 ) -> Option<DsnViaGeometry> {
     via_names.iter().find_map(|name| {
         let pad = pad_sizes.get(name)?;
@@ -885,8 +892,136 @@ fn parse_via_geometry(
             pad_diameter_mm: diameter,
             drill_diameter_mm: kicad_via_drill_mm(name),
             layers: pad_layer_names(&pad.layers, layer_map),
+            full_stack_uniform_circle: via_is_full_stack_uniform_circle(
+                pcb, name, layer_map, to_mm,
+            ),
         })
     })
+}
+
+/// Return whether `name` identifies the exact declared-via geometry that the
+/// current route/SES/DRC pipeline can preserve: one unambiguous padstack made of
+/// centred circles, with one equal-diameter circle on every physical copper layer
+/// (or one full-stack wildcard circle).
+///
+/// Anything more expressive fails closed at `route-dsn`: blind/buried spans,
+/// layer-dependent annuli, offset circles, rectangles, duplicate layers, unknown
+/// layers, and duplicate padstack definitions cannot be represented faithfully by
+/// the single through-via SES record we emit.
+fn via_is_full_stack_uniform_circle(
+    pcb: &Sexpr,
+    name: &str,
+    layer_map: &LayerMap,
+    to_mm: &impl Fn(f64) -> f64,
+) -> bool {
+    let Some(library) = pcb.child_named("library") else {
+        return false;
+    };
+    let mut matches = library.children_named("padstack").filter(|padstack| {
+        padstack
+            .as_list()
+            .and_then(|items| items.get(1))
+            .and_then(Sexpr::as_atom)
+            == Some(name)
+    });
+    let Some(padstack) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() {
+        return false;
+    }
+
+    let shapes: Vec<&Sexpr> = padstack.children_named("shape").collect();
+    if shapes.is_empty() {
+        return false;
+    }
+
+    let mut diameter_mm: Option<f64> = None;
+    let mut declared_layers = Vec::with_capacity(shapes.len());
+    for shape in &shapes {
+        // A shape wrapper must contain only its head and one circle. Additional
+        // geometry would make the emitted circular padstack lossy.
+        if shape.as_list().is_none_or(|items| items.len() != 2) {
+            return false;
+        }
+        let Some(circle) = shape.child_named("circle") else {
+            return false;
+        };
+        let Some(items) = circle.as_list() else {
+            return false;
+        };
+        if items.len() != 3 && items.len() != 5 {
+            return false;
+        }
+        let Some(layer) = items.get(1).and_then(Sexpr::as_atom) else {
+            return false;
+        };
+        let Some(raw_diameter) = items
+            .get(2)
+            .and_then(Sexpr::as_atom)
+            .and_then(|atom| atom.parse::<f64>().ok())
+        else {
+            return false;
+        };
+        let diameter = to_mm(raw_diameter).abs();
+        if !diameter.is_finite() || diameter <= 0.0 {
+            return false;
+        }
+        if let Some(expected) = diameter_mm {
+            let tolerance = 1e-12 * expected.abs().max(diameter.abs()).max(1.0);
+            if (diameter - expected).abs() > tolerance {
+                return false;
+            }
+        } else {
+            diameter_mm = Some(diameter);
+        }
+
+        // Optional circle offsets must both be numeric zero: SES via records carry
+        // only a centre and cannot reproduce an offset annulus.
+        if items.len() == 5 {
+            let Some(x) = items
+                .get(3)
+                .and_then(Sexpr::as_atom)
+                .and_then(|atom| atom.parse::<f64>().ok())
+            else {
+                return false;
+            };
+            let Some(y) = items
+                .get(4)
+                .and_then(Sexpr::as_atom)
+                .and_then(|atom| atom.parse::<f64>().ok())
+            else {
+                return false;
+            };
+            if !x.is_finite() || !y.is_finite() || x != 0.0 || y != 0.0 {
+                return false;
+            }
+        }
+        declared_layers.push(layer.to_string());
+    }
+
+    let is_wildcard = |layer: &str| {
+        let layer = layer.to_ascii_lowercase();
+        matches!(layer.as_str(), "signal" | "*" | "all" | "@1" | "")
+    };
+    if declared_layers.iter().any(|layer| is_wildcard(layer)) {
+        return declared_layers.len() == 1;
+    }
+
+    let mut indices = Vec::with_capacity(declared_layers.len());
+    for layer in &declared_layers {
+        let Some(index) = layer_map.index_of(layer) else {
+            return false;
+        };
+        indices.push(index);
+    }
+    indices.sort_unstable();
+    let before_dedup = indices.len();
+    indices.dedup();
+    if indices.len() != before_dedup || indices.len() as u32 != layer_map.len() {
+        return false;
+    }
+    indices.iter().copied().eq(0..layer_map.len())
 }
 
 fn parse_via_model(
@@ -1938,6 +2073,7 @@ mod tests {
         assert_eq!(geometry.pad_diameter_mm, 0.6);
         assert_eq!(geometry.drill_diameter_mm, None);
         assert_eq!(geometry.layers, vec!["F.Cu", "B.Cu"]);
+        assert!(geometry.full_stack_uniform_circle);
     }
 
     #[test]
@@ -1961,6 +2097,7 @@ mod tests {
         assert_eq!(geometry.pad_diameter_mm, 0.6);
         assert_eq!(geometry.drill_diameter_mm, Some(0.3));
         assert_eq!(geometry.layers, vec!["Top", "Bottom"]);
+        assert!(geometry.full_stack_uniform_circle);
     }
 
     #[test]
@@ -2020,6 +2157,33 @@ mod tests {
         assert!(v.is_step_legal(1, 2));
         assert!(!v.is_step_legal(0, 1), "top step not drilled");
         assert!(!v.is_step_legal(2, 3), "bottom step not drilled");
+        assert!(
+            !ingest
+                .via_geometry
+                .expect("partial via geometry remains inspectable")
+                .full_stack_uniform_circle
+        );
+    }
+
+    #[test]
+    fn declared_via_names_include_distinct_names_across_multiple_clauses() {
+        let dsn = r#"
+        (pcb "multiple-vias.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Inner (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "via-a")
+            (via "via-a" "via-b"))
+          (library
+            (padstack "via-a" (shape (circle signal 600)))
+            (padstack "via-b" (shape (circle signal 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        assert_eq!(ingest.stats.layers, 3);
+        assert_eq!(ingest.stats.vias_declared, 2);
     }
 
     #[test]
