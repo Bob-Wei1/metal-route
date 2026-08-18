@@ -4,10 +4,10 @@
 //! module owns the continuous polygon semantics used to build those masks and to
 //! validate emitted trace capsules / via disks, keeping the two decisions identical.
 
-use mr_core::Grid;
+use mr_core::{Grid, LayerMap};
 use mr_drc::{point_seg_dist, seg_seg_dist};
 
-use crate::{Bounds, OutlinePoint, SimpleRouteJson};
+use crate::{Bounds, OutlinePoint, PcbTrace, RoutePoint, SimpleRouteJson};
 
 type Point = (f64, f64);
 
@@ -482,6 +482,99 @@ fn interval_distance(a_min: f64, a_max: f64, b_min: f64, b_max: f64) -> f64 {
     }
 }
 
+/// Validate the complete emitted solution soup against an SRJ's active board
+/// outline contract.
+///
+/// This deliberately consumes the final [`PcbTrace`] representation rather than
+/// a router path: callers must run it after every beautification, legalization,
+/// and via-repair pass.  Singleton wire points are checked as copper disks, every
+/// physical wire leg is checked as a capsule at its actual emitted width, and
+/// every via is checked using `routed_via_pad_diameter_mm`. `effective_layer_count`
+/// must be the routed stack size used to emit the soup, including any product
+/// layer override, so unknown-name fallback and same-layer legs match DRC.
+pub fn solution_respects_board_outline(
+    srj: &SimpleRouteJson,
+    traces: &[PcbTrace],
+    routed_via_pad_diameter_mm: f64,
+    effective_layer_count: u32,
+) -> Result<bool, BoardOutlineError> {
+    // The stored nominal trace radius is not used below: emitted soups may mix
+    // widths, so every node and segment supplies its actual radius explicitly.
+    let Some(outline) = BoardOutlineConstraint::from_srj(srj, 1.0, routed_via_pad_diameter_mm)?
+    else {
+        return Ok(true);
+    };
+    // Match the authoritative emitted-soup DRC: standard stack names resolve to
+    // their numeric layers and every unknown alias falls back to top (layer 0).
+    let layers = LayerMap::standard(effective_layer_count.max(1));
+    let named_layer = |name: &str| layers.index_of(name).unwrap_or(0);
+    for trace in traces {
+        // Mirrors the emitted-soup leg construction used by DRC: a Via may need
+        // a source landing from the preceding Wire and carries its destination
+        // landing forward to the next Wire.
+        let mut previous_wire: Option<(f64, f64, f64, u32)> = None;
+        let mut pending_landing: Option<(f64, f64)> = None;
+        for point in &trace.route {
+            match point {
+                RoutePoint::Wire { x, y, width, layer } => {
+                    let center = (*x, *y);
+                    let radius = *width / 2.0;
+                    if !outline.trace_segment_with_radius_is_legal(center, center, radius) {
+                        return Ok(false);
+                    }
+                    let layer = named_layer(layer);
+                    if let Some(landing) = pending_landing.take() {
+                        if landing != center
+                            && !outline.trace_segment_with_radius_is_legal(landing, center, radius)
+                        {
+                            return Ok(false);
+                        }
+                    } else if let Some((px, py, previous_width, previous_layer)) = previous_wire {
+                        if previous_layer == layer
+                            && (px, py) != center
+                            && !outline.trace_segment_with_radius_is_legal(
+                                (px, py),
+                                center,
+                                previous_width.max(*width) / 2.0,
+                            )
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    previous_wire = Some((*x, *y, *width, layer));
+                }
+                RoutePoint::Via {
+                    x, y, from_layer, ..
+                } => {
+                    let center = (*x, *y);
+                    let via_radius = routed_via_pad_diameter_mm / 2.0;
+                    if !outline
+                        .disk_edge_gap(center, via_radius)
+                        .is_some_and(|gap| gap + GEOMETRY_EPS >= outline.edge_clearance_mm())
+                    {
+                        return Ok(false);
+                    }
+                    let from_layer = named_layer(from_layer);
+                    if let Some((px, py, width, previous_layer)) = previous_wire.take() {
+                        if previous_layer == from_layer
+                            && (px, py) != center
+                            && !outline.trace_segment_with_radius_is_legal(
+                                (px, py),
+                                center,
+                                width / 2.0,
+                            )
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    pending_landing = Some(center);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn normalized_vertices(points: &[OutlinePoint]) -> Result<Vec<Point>, BoardOutlineError> {
     if points.len() < 3 {
         return Err(BoardOutlineError::TooFewVertices);
@@ -493,10 +586,47 @@ fn normalized_vertices(points: &[OutlinePoint]) -> Result<Vec<Point>, BoardOutli
     if vertices.len() > 3 && points_equal(vertices[0], *vertices.last().unwrap()) {
         vertices.pop();
     }
+    remove_collinear_backtracking_spurs(&mut vertices);
     if vertices.len() < 3 {
         return Err(BoardOutlineError::TooFewVertices);
     }
     Ok(vertices)
+}
+
+/// Remove only a zero-area hairpin: `a -> b -> c` must be collinear and the two
+/// directed legs must reverse.  This is intentionally much narrower than generic
+/// polygon simplification; ordinary collinear boundary points remain byte-for-byte
+/// topology, while non-collinear bowties continue to fail validation.
+fn remove_collinear_backtracking_spurs(vertices: &mut Vec<Point>) {
+    loop {
+        let len = vertices.len();
+        if len < 3 {
+            return;
+        }
+        let removable = (0..len).find(|&index| {
+            let a = vertices[(index + len - 1) % len];
+            let b = vertices[index];
+            let c = vertices[(index + 1) % len];
+            let incoming = (b.0 - a.0, b.1 - a.1);
+            let outgoing = (c.0 - b.0, c.1 - b.1);
+            orientation(a, b, c) == 0.0 && incoming.0 * outgoing.0 + incoming.1 * outgoing.1 < 0.0
+        });
+        let Some(index) = removable else {
+            return;
+        };
+        vertices.remove(index);
+
+        // A closed `a -> b -> a` hairpin leaves two adjacent copies of `a`.
+        // Their equality is a direct consequence of the proven spur, so folding
+        // that duplicate is part of this same narrow normalization.
+        if vertices.len() >= 2 {
+            let previous = (index + vertices.len() - 1) % vertices.len();
+            let next = index % vertices.len();
+            if previous != next && points_equal(vertices[previous], vertices[next]) {
+                vertices.remove(next);
+            }
+        }
+    }
 }
 
 fn bounds_vertices(bounds: &Bounds) -> Result<Vec<Point>, BoardOutlineError> {
@@ -698,6 +828,67 @@ mod tests {
     }
 
     #[test]
+    fn non_collinear_bowtie_is_not_normalized() {
+        let points = [
+            OutlinePoint { x: 0.0, y: 0.0 },
+            OutlinePoint { x: 10.0, y: 10.0 },
+            OutlinePoint { x: 0.0, y: 10.0 },
+            OutlinePoint { x: 10.0, y: 0.0 },
+        ];
+        assert_eq!(normalized_vertices(&points).unwrap().len(), points.len());
+        let board = srj(serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": points
+        }));
+        assert!(BoardOutlineConstraint::from_srj(&board, 0.2, 0.4).is_err());
+    }
+
+    #[test]
+    fn bugreport55_collinear_backtracking_spur_is_normalized() {
+        const FIXTURE: &str =
+            include_str!("../../../benchmarks/corpus/bug-reports/bugreport55-b7c349.srj.json");
+        let board: SimpleRouteJson = serde_json::from_str(FIXTURE).unwrap();
+        let original_len = board.physical_rules.outline.len();
+        let outline = BoardOutlineConstraint::from_srj(&board, 0.15, 0.45)
+            .expect("zero-area spur is accepted")
+            .unwrap();
+        // The producer also repeats the closing vertex, so normalization drops
+        // that conventional duplicate plus the single backtracking turnaround.
+        assert_eq!(outline.vertices().len(), original_len - 2);
+        assert!(!outline.vertices().contains(&(-6.518, -40.25)));
+    }
+
+    #[test]
+    fn ordinary_collinear_boundary_vertices_are_preserved() {
+        let board = srj(serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 5.0, "y": 0.0},
+                {"x": 10.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+                {"x": 0.0, "y": 10.0}
+            ]
+        }));
+        let outline = BoardOutlineConstraint::from_srj(&board, 0.2, 0.4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outline.vertices().len(), 5);
+    }
+
+    #[test]
+    fn near_collinear_reversal_is_not_normalized() {
+        let points = [
+            OutlinePoint { x: 0.0, y: 0.0 },
+            OutlinePoint { x: -1.0, y: 1e-12 },
+            OutlinePoint { x: 5.0, y: 0.0 },
+            OutlinePoint { x: 5.0, y: 5.0 },
+            OutlinePoint { x: 0.0, y: 5.0 },
+        ];
+        assert_eq!(normalized_vertices(&points).unwrap().len(), points.len());
+    }
+
+    #[test]
     fn repeated_closing_vertex_is_normalized() {
         let board = srj(serde_json::json!({
             "layerCount": 1,
@@ -712,5 +903,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outline.vertices().len(), 4);
+    }
+
+    fn wire(x: f64, y: f64, width: f64) -> RoutePoint {
+        wire_on_layer(x, y, width, "top")
+    }
+
+    fn wire_on_layer(x: f64, y: f64, width: f64, layer: &str) -> RoutePoint {
+        RoutePoint::Wire {
+            x,
+            y,
+            width,
+            layer: layer.to_string(),
+        }
+    }
+
+    #[test]
+    fn final_soup_validator_checks_singleton_wire_segment_and_via_copper() {
+        let rectangular = srj(serde_json::json!({
+            "layerCount": 2,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0}
+        }));
+        let singleton = PcbTrace::new(vec![wire(0.25, 5.0, 0.2)]);
+        assert!(!solution_respects_board_outline(&rectangular, &[singleton], 0.4, 2).unwrap());
+
+        let crossing = PcbTrace::new(vec![
+            wire(-4.1066667, -4.7666667, 0.15),
+            wire(5.1266667, -4.7666667, 0.15),
+        ]);
+        assert!(!solution_respects_board_outline(&concave(), &[crossing], 0.45, 2).unwrap());
+        let unknown_aliases = PcbTrace::new(vec![
+            wire_on_layer(-4.1066667, -4.7666667, 0.15, "signal_a"),
+            wire_on_layer(5.1266667, -4.7666667, 0.15, "signal_b"),
+        ]);
+        assert!(
+            !solution_respects_board_outline(&concave(), &[unknown_aliases], 0.45, 2).unwrap(),
+            "unknown layer aliases both fall back to top, matching authoritative DRC"
+        );
+        let known_layer_transition = PcbTrace::new(vec![
+            wire_on_layer(-4.1066667, -4.7666667, 0.15, "top"),
+            wire_on_layer(5.1266667, -4.7666667, 0.15, "bottom"),
+        ]);
+        let mut declared_one_layer = concave();
+        declared_one_layer.layer_count = 1;
+        assert!(
+            solution_respects_board_outline(
+                &declared_one_layer,
+                &[known_layer_transition],
+                0.45,
+                2,
+            )
+            .unwrap(),
+            "the effective two-layer override keeps top and bottom distinct"
+        );
+
+        let via = PcbTrace::new(vec![RoutePoint::Via {
+            x: 0.3,
+            y: 5.0,
+            from_layer: "top".to_string(),
+            to_layer: "bottom".to_string(),
+        }]);
+        assert!(!solution_respects_board_outline(&rectangular, &[via], 0.4, 2).unwrap());
+
+        let legal = PcbTrace::new(vec![
+            wire(1.0, 1.0, 0.2),
+            wire(9.0, 1.0, 0.2),
+            RoutePoint::Via {
+                x: 9.0,
+                y: 1.0,
+                from_layer: "top".to_string(),
+                to_layer: "bottom".to_string(),
+            },
+            wire(9.0, 9.0, 0.2),
+        ]);
+        assert!(solution_respects_board_outline(&rectangular, &[legal], 0.4, 2).unwrap());
     }
 }

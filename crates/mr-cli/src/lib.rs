@@ -635,7 +635,64 @@ pub fn route_problem(
     router: RouterKind,
     layers: Option<u32>,
 ) -> Result<(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics)> {
-    route_problem_impl(srj, resolution, router, layers, true)
+    if !board_edge_contract_is_active(srj) {
+        return route_problem_impl(srj, resolution, router, layers, true);
+    }
+
+    let via_pad_mm = routed_via_pad_diameter_mm(srj);
+    let effective_layer_count = layers.unwrap_or(srj.layer_count).max(1);
+    // Validate the active contract before doing any expensive routing. An empty
+    // soup is sufficient to parse/normalize the polygon; malformed outlines fail
+    // closed rather than accidentally taking the legacy branch.
+    mr_srj::solution_respects_board_outline(srj, &[], via_pad_mm, effective_layer_count)
+        .context("invalid board-edge contract")?;
+
+    // Preserve the exact pre-outline product whenever its FINAL emitted soup is
+    // already safe. Clearing only the outline contract recreates the historical
+    // raster topology and runs the identical beautify/legalize/via-repair pipeline.
+    let mut legacy_srj = srj.clone();
+    legacy_srj.physical_rules.outline.clear();
+    legacy_srj.physical_rules.min_board_edge_clearance = None;
+    let legacy = route_problem_impl(&legacy_srj, resolution, router, layers, true)?;
+    if mr_srj::solution_respects_board_outline(srj, &legacy.0, via_pad_mm, effective_layer_count)
+        .context("failed to validate legacy route against board edge")?
+    {
+        return Ok(legacy);
+    }
+
+    // Only an edge-invalid legacy result pays for a constrained rerun. Validate
+    // after every postprocessor, then refuse both edge-unsafe output and a worse
+    // complete authoritative DRC profile. The unsafe legacy soup is not an
+    // eligible fallback: eliminating its board-edge findings may expose a smaller
+    // number of ordinary findings (bugreport49), which is still a net improvement.
+    let constrained = route_problem_impl(srj, resolution, router, layers, true)?;
+    anyhow::ensure!(
+        mr_srj::solution_respects_board_outline(
+            srj,
+            &constrained.0,
+            via_pad_mm,
+            effective_layer_count,
+        )
+        .context("failed to validate constrained route against board edge")?,
+        "constrained route violates the board-edge contract"
+    );
+    let legacy_drc = check_srj_solution(srj, &legacy.0, effective_layer_count);
+    let constrained_drc = check_srj_solution(srj, &constrained.0, effective_layer_count);
+    anyhow::ensure!(
+        drc_candidate_is_not_worse(&legacy_drc, &constrained_drc),
+        "constrained board-edge reroute regresses authoritative DRC"
+    );
+    Ok(constrained)
+}
+
+fn board_edge_contract_is_active(srj: &SimpleRouteJson) -> bool {
+    !srj.physical_rules.outline.is_empty() || srj.physical_rules.min_board_edge_clearance.is_some()
+}
+
+fn routed_via_pad_diameter_mm(srj: &SimpleRouteJson) -> f64 {
+    srj.uniform_physical_rules()
+        .map(|rules| rules.via_pad_diameter_mm)
+        .unwrap_or(VIA_PAD_MM)
 }
 
 /// Build and check the exact continuous board emitted for an SRJ route. Coherent
@@ -1755,6 +1812,20 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_edge_findings_are_ineligible_even_if_safe_route_has_ordinary_findings() {
+        let legacy: Vec<_> = (0..33)
+            .map(|index| clearance_violation(0.0, (&format!("n{index}"), "__board_edge__")))
+            .collect();
+        let constrained: Vec<_> = (0..4)
+            .map(|index| clearance_violation(0.1, (&format!("a{index}"), "foreign")))
+            .collect();
+        assert!(
+            drc_candidate_is_not_worse(&legacy, &constrained),
+            "33 unsafe edge findings to four ordinary findings is a full-profile improvement"
+        );
+    }
+
+    #[test]
     fn authoritative_drc_comparator_quantises_float_jitter() {
         let before = [clearance_violation(0.100_000_0, ("A", "B"))];
         let sub_nanometre_change = [clearance_violation(0.100_000_4, ("A", "B"))];
@@ -2320,6 +2391,185 @@ mod tests {
                 ) if al == bl => !(*ay < 2.0 && *by < 2.0 && *ax < -2.0 && *bx > 2.0),
                 _ => true,
             }));
+    }
+
+    fn bugreport(name: &str) -> SimpleRouteJson {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/corpus/bug-reports")
+            .join(name);
+        let bytes = std::fs::read(path).expect("read checked-in bugreport fixture");
+        parse_srj(&bytes).expect("parse bugreport fixture")
+    }
+
+    fn without_board_edge(mut srj: SimpleRouteJson) -> SimpleRouteJson {
+        srj.physical_rules.outline.clear();
+        srj.physical_rules.min_board_edge_clearance = None;
+        srj
+    }
+
+    #[test]
+    fn bugreport21_rejects_legacy_crossing_then_selects_clean_constrained_route() {
+        let srj = bugreport("bugreport21-board-outline.srj.json");
+        let legacy_srj = without_board_edge(srj.clone());
+        let (legacy_traces, _, _) =
+            route_problem_impl(&legacy_srj, None, RouterKind::Negotiated, None, true).unwrap();
+        assert!(
+            !mr_srj::solution_respects_board_outline(
+                &srj,
+                &legacy_traces,
+                VIA_PAD_MM,
+                srj.layer_count.max(1),
+            )
+            .unwrap(),
+            "the historical direct path must be rejected by exact final-soup validation"
+        );
+
+        let constrained =
+            route_problem_impl(&srj, None, RouterKind::Negotiated, None, true).unwrap();
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &constrained.0,
+            VIA_PAD_MM,
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+        let selected = route_problem(&srj, None, RouterKind::Negotiated, None).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&selected.0).unwrap(),
+            serde_json::to_vec(&constrained.0).unwrap(),
+            "edge-invalid legacy geometry must select the deterministic constrained rerun"
+        );
+        let legacy_drc = check_srj_solution(&srj, &legacy_traces, srj.layer_count);
+        let selected_drc = check_srj_solution(&srj, &selected.0, srj.layer_count);
+        assert!(drc_candidate_is_not_worse(&legacy_drc, &selected_drc));
+    }
+
+    #[test]
+    #[ignore = "affected real-board regression; run explicitly in release"]
+    fn bugreport49_accepts_the_safe_full_drc_improvement() {
+        let srj = bugreport("bugreport49-8536f4.srj.json");
+        let legacy_srj = without_board_edge(srj.clone());
+        let legacy =
+            route_problem_impl(&legacy_srj, None, RouterKind::Negotiated, None, true).unwrap();
+        assert!(!mr_srj::solution_respects_board_outline(
+            &srj,
+            &legacy.0,
+            routed_via_pad_diameter_mm(&srj),
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+
+        let selected = route_problem(&srj, None, RouterKind::Negotiated, None)
+            .expect("an unsafe legacy soup must not block a safer constrained improvement");
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &selected.0,
+            routed_via_pad_diameter_mm(&srj),
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+        let legacy_drc = check_srj_solution(&srj, &legacy.0, srj.layer_count);
+        let selected_drc = check_srj_solution(&srj, &selected.0, srj.layer_count);
+        assert!(drc_candidate_is_not_worse(&legacy_drc, &selected_drc));
+    }
+
+    fn assert_edge_clean_fixture_preserves_exact_legacy_route(name: &str) {
+        let srj = bugreport(name);
+        let legacy_srj = without_board_edge(srj.clone());
+        let legacy = route_problem_impl(&legacy_srj, None, RouterKind::Negotiated, None, true)
+            .expect("route legacy topology");
+        let via_pad = routed_via_pad_diameter_mm(&srj);
+        assert!(
+            mr_srj::solution_respects_board_outline(
+                &srj,
+                &legacy.0,
+                via_pad,
+                srj.layer_count.max(1),
+            )
+            .unwrap(),
+            "fixture precondition changed: {name} legacy output is no longer edge-clean"
+        );
+
+        let selected = route_problem(&srj, None, RouterKind::Negotiated, None)
+            .expect("route legacy-first portfolio");
+        assert_eq!(
+            serde_json::to_vec(&selected.0).unwrap(),
+            serde_json::to_vec(&legacy.0).unwrap(),
+            "{name} must preserve exact serialized legacy trace bytes"
+        );
+        assert_eq!(selected.1, legacy.1, "{name} summary changed");
+        assert_eq!(selected.2.congestion, legacy.2.congestion);
+        assert_eq!(selected.2.x_lines, legacy.2.x_lines);
+        assert_eq!(selected.2.y_lines, legacy.2.y_lines);
+    }
+
+    #[test]
+    #[ignore = "affected real-board byte-regression cohort; run explicitly in release"]
+    fn bugreports27_33_35_preserve_edge_clean_legacy_bytes() {
+        for name in [
+            "bugreport27-dd3734.srj.json",
+            "bugreport33-213d45.srj.json",
+            "bugreport35-191db9.srj.json",
+        ] {
+            assert_edge_clean_fixture_preserves_exact_legacy_route(name);
+        }
+    }
+
+    #[test]
+    #[ignore = "affected real-board regression; run explicitly in release"]
+    fn bugreport55_normalized_outline_routes_without_a_hard_error() {
+        let srj = bugreport("bugreport55-b7c349.srj.json");
+        let legacy_srj = without_board_edge(srj.clone());
+        let legacy = route_problem_impl(&legacy_srj, None, RouterKind::Negotiated, None, true)
+            .expect("route bugreport55 legacy topology");
+        let legacy_drc = check_srj_solution(&srj, &legacy.0, srj.layer_count);
+        let (traces, summary, _) = route_problem(&srj, None, RouterKind::Negotiated, None)
+            .expect("the proven collinear backtracking spur is normalized");
+        let selected_drc = check_srj_solution(&srj, &traces, srj.layer_count);
+        let edge_count = |findings: &[mr_drc::Violation]| {
+            findings
+                .iter()
+                .filter(|finding| {
+                    finding.nets.0 == "__board_edge__" || finding.nets.1 == "__board_edge__"
+                })
+                .count()
+        };
+        assert_eq!(
+            (legacy.1.routed, legacy.1.total, legacy.1.total_cost),
+            (10, 10, 1461)
+        );
+        assert_eq!((legacy_drc.len(), edge_count(&legacy_drc)), (23, 11));
+        assert_eq!(
+            (summary.routed, summary.total, summary.total_cost),
+            (8, 10, 833),
+            "board-edge safety deliberately costs two bug55 routes"
+        );
+        assert_eq!((selected_drc.len(), edge_count(&selected_drc)), (12, 0));
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &traces,
+            routed_via_pad_diameter_mm(&srj),
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+        assert!(edge_count(&legacy_drc) > 0);
+        assert_eq!(edge_count(&selected_drc), 0);
+        assert!(drc_candidate_is_not_worse(&legacy_drc, &selected_drc));
+    }
+
+    #[test]
+    fn route_problem_rejects_a_non_collinear_bowtie_before_routing() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+                {"x": 0.0, "y": 10.0}, {"x": 10.0, "y": 0.0}
+            ]
+        }))
+        .unwrap();
+        let error = route_problem(&srj, None, RouterKind::Negotiated, None).unwrap_err();
+        assert!(error.to_string().contains("invalid board-edge contract"));
     }
 
     /// Coarse bounds-derived fill spacing must not inflate the physical clearance

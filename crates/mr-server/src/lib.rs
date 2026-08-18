@@ -63,6 +63,9 @@ pub const MIN_RESOLUTION: f64 = 0.1;
 /// Default trace width emitted in the solution soup (continuous units).
 pub const DEFAULT_TRACE_WIDTH: f64 = 0.15;
 
+/// Default routed via copper diameter when no coherent typed profile supplies it.
+const DEFAULT_VIA_PAD_DIAMETER: f64 = 0.45;
+
 /// Default layer name for emitted (single-layer) traces.
 pub const DEFAULT_LAYER: &str = "top";
 
@@ -319,6 +322,37 @@ fn solution_from_board(prep: &Prepared, board: &mr_core::BoardRoute) -> Vec<PcbT
     )
 }
 
+fn board_edge_contract_is_active(srj: &SimpleRouteJson) -> bool {
+    !srj.physical_rules.outline.is_empty() || srj.physical_rules.min_board_edge_clearance.is_some()
+}
+
+fn routed_via_pad_diameter_mm(srj: &SimpleRouteJson, clearance_policy: Option<f64>) -> f64 {
+    clearance_policy
+        .is_none()
+        .then(|| srj.uniform_physical_rules())
+        .flatten()
+        .map(|rules| rules.via_pad_diameter_mm)
+        .unwrap_or(DEFAULT_VIA_PAD_DIAMETER)
+}
+
+fn without_board_edge_contract(srj: &SimpleRouteJson) -> SimpleRouteJson {
+    let mut legacy = srj.clone();
+    legacy.physical_rules.outline.clear();
+    legacy.physical_rules.min_board_edge_clearance = None;
+    legacy
+}
+
+fn route_once(
+    state: &AppState,
+    srj: &SimpleRouteJson,
+    resolution: Option<f64>,
+) -> Result<(Prepared, mr_core::BoardRoute), RouterError> {
+    let prep = prepare(srj, resolution, state.solve_layers, state.clearance_mm);
+    let router = (state.make_router)(prep.router.clone());
+    let board = router.route(&prep.problem.grid, &prep.problem.nets)?;
+    Ok((prep, board))
+}
+
 /// The ordered layer names of an effective stackup (`["top", "bottom", ...]`).
 fn layer_names(layers: &LayerMap) -> Vec<String> {
     (0..layers.len())
@@ -336,19 +370,63 @@ async fn solve(
         Err(rej) => return bad_request(format!("invalid request body: {rej}")),
     };
 
-    let prep = prepare(
-        &req.simple_route_json,
-        req.resolution,
-        state.solve_layers,
-        state.clearance_mm,
-    );
-    let router = (state.make_router)(prep.router.clone());
-    let board = match router.route(&prep.problem.grid, &prep.problem.nets) {
-        Ok(b) => b,
-        Err(e) => return router_error_response(e),
-    };
+    let srj = req.simple_route_json;
+    let via_pad_mm = routed_via_pad_diameter_mm(&srj, state.clearance_mm);
+    let effective_layer_count = srj.layer_count.max(state.solve_layers).max(1);
+    if let Err(error) =
+        mr_srj::solution_respects_board_outline(&srj, &[], via_pad_mm, effective_layer_count)
+    {
+        return bad_request(format!("invalid board-edge contract: {error}"));
+    }
 
-    let solution_soup = solution_from_board(&prep, &board);
+    let first_srj = if board_edge_contract_is_active(&srj) {
+        without_board_edge_contract(&srj)
+    } else {
+        srj.clone()
+    };
+    let (mut prep, mut board) = match route_once(&state, &first_srj, req.resolution) {
+        Ok(result) => result,
+        Err(error) => return router_error_response(error),
+    };
+    let mut solution_soup = solution_from_board(&prep, &board);
+
+    if board_edge_contract_is_active(&srj) {
+        let legacy_is_safe = match mr_srj::solution_respects_board_outline(
+            &srj,
+            &solution_soup,
+            via_pad_mm,
+            effective_layer_count,
+        ) {
+            Ok(safe) => safe,
+            Err(error) => {
+                return bad_request(format!("invalid board-edge contract: {error}"));
+            }
+        };
+        if !legacy_is_safe {
+            (prep, board) = match route_once(&state, &srj, req.resolution) {
+                Ok(result) => result,
+                Err(error) => return router_error_response(error),
+            };
+            solution_soup = solution_from_board(&prep, &board);
+            match mr_srj::solution_respects_board_outline(
+                &srj,
+                &solution_soup,
+                via_pad_mm,
+                effective_layer_count,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return internal_error(
+                        "constrained route violates the board-edge contract".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return bad_request(format!("invalid board-edge contract: {error}"));
+                }
+            }
+        }
+    }
+
     (StatusCode::OK, Json(SolveResponse { solution_soup })).into_response()
 }
 
@@ -510,6 +588,20 @@ struct TraceResponse {
     solution: Vec<PcbTrace>,
 }
 
+fn route_traced_once(
+    srj: &SimpleRouteJson,
+    resolution: Option<f64>,
+    solve_layers: u32,
+    clearance_policy: Option<f64>,
+) -> Result<(Prepared, mr_core::BoardRoute, RouteTrace), RouterError> {
+    let prep = prepare(srj, resolution, solve_layers, clearance_policy);
+    // The trace requires the concrete negotiated router; use the same configured
+    // geometry as `/solve`, including on the conditional constrained retry.
+    let router = configured_negotiated_router(prep.router.clone());
+    let (board, trace) = router.route_traced(&prep.problem.grid, &prep.problem.nets)?;
+    Ok((prep, board, trace))
+}
+
 /// `POST /api/trace` — route a board and return a step-by-step [`RouteTrace`].
 async fn trace(
     State(state): State<AppState>,
@@ -547,18 +639,62 @@ async fn trace(
         Some(c) => Some(c),
         None => state.clearance_mm,
     };
-    let prep = prepare(&srj, req.resolution, solve_layers, clearance_policy);
-
-    // The trace requires the concrete `NegotiatedRouter` (the generic `make_router`
-    // factory only yields the `Router` trait, which has no `route_traced`). Build one
-    // mirroring `main.rs`'s factory: clearance budget + the problem's Hanan coords.
-    let router = configured_negotiated_router(prep.router.clone());
-    let (board, trace) = match router.route_traced(&prep.problem.grid, &prep.problem.nets) {
-        Ok(bt) => bt,
-        Err(e) => return router_error_response(e),
+    let via_pad_mm = routed_via_pad_diameter_mm(&srj, clearance_policy);
+    let effective_layer_count = srj.layer_count.max(solve_layers).max(1);
+    if let Err(error) =
+        mr_srj::solution_respects_board_outline(&srj, &[], via_pad_mm, effective_layer_count)
+    {
+        return bad_request(format!("invalid board-edge contract: {error}"));
+    }
+    let active = board_edge_contract_is_active(&srj);
+    let first_srj = if active {
+        without_board_edge_contract(&srj)
+    } else {
+        srj.clone()
     };
-
-    let solution = solution_from_board(&prep, &board);
+    let (mut prep, mut board, mut trace) =
+        match route_traced_once(&first_srj, req.resolution, solve_layers, clearance_policy) {
+            Ok(result) => result,
+            Err(error) => return router_error_response(error),
+        };
+    let mut solution = solution_from_board(&prep, &board);
+    if active {
+        let legacy_is_safe = match mr_srj::solution_respects_board_outline(
+            &srj,
+            &solution,
+            via_pad_mm,
+            effective_layer_count,
+        ) {
+            Ok(safe) => safe,
+            Err(error) => {
+                return bad_request(format!("invalid board-edge contract: {error}"));
+            }
+        };
+        if !legacy_is_safe {
+            (prep, board, trace) =
+                match route_traced_once(&srj, req.resolution, solve_layers, clearance_policy) {
+                    Ok(result) => result,
+                    Err(error) => return router_error_response(error),
+                };
+            solution = solution_from_board(&prep, &board);
+            match mr_srj::solution_respects_board_outline(
+                &srj,
+                &solution,
+                via_pad_mm,
+                effective_layer_count,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return internal_error(
+                        "constrained route violates the board-edge contract".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return bad_request(format!("invalid board-edge contract: {error}"));
+                }
+            }
+        }
+    }
     let resp = TraceResponse {
         trace,
         coords: CoordsDto {
@@ -707,6 +843,13 @@ mod tests {
         Arc::new(|config| Box::new(configured_negotiated_router(config)))
     }
 
+    fn counted_factory(calls: Arc<std::sync::atomic::AtomicUsize>) -> ConfiguredRouterFactory {
+        Arc::new(move |config| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(configured_negotiated_router(config))
+        })
+    }
+
     /// App wired to the test router at the default solve-layer budget, clearance
     /// off (fast + deterministic for the shape assertions below). The corpus / web
     /// dirs are placeholders the `/solve` + `/health` tests never touch.
@@ -762,6 +905,12 @@ mod tests {
     #[test]
     fn prepare_projects_coherent_typed_router_geometry_and_preserves_override() {
         let srj = typed_profile();
+        assert_eq!(routed_via_pad_diameter_mm(&srj, None), 0.4);
+        assert_eq!(
+            routed_via_pad_diameter_mm(&srj, Some(0.0)),
+            DEFAULT_VIA_PAD_DIAMETER,
+            "a server override opts out of typed via geometry for routing and validation"
+        );
         let typed = prepare(&srj, Some(0.5), 2, None);
         assert_eq!(typed.trace_width, 0.1);
         assert!((typed.router.clearance_mm - 0.14).abs() < 1e-12);
@@ -852,6 +1001,192 @@ mod tests {
             );
             assert!(trace.get("route").is_some(), "trace must carry a route");
         }
+    }
+
+    #[tokio::test]
+    async fn configured_solve_keeps_edge_clean_legacy_route_without_retry() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = app_configured(
+            counted_factory(Arc::clone(&calls)),
+            2,
+            Some(0.0),
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        );
+        let srj = serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.15,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+                {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+            ],
+            "connections": [{
+                "name": "n",
+                "pointsToConnect": [
+                    {"x": 2.0, "y": 5.0, "layer": "top"},
+                    {"x": 8.0, "y": 5.0, "layer": "top"}
+                ]
+            }]
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "simple_route_json": srj,
+                    "resolution": 1.0
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_solve_retries_bugreport21_only_after_legacy_edge_failure() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        let srj: SimpleRouteJson = serde_json::from_value(raw.clone()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = app_configured(
+            counted_factory(Arc::clone(&calls)),
+            2,
+            Some(0.0),
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "simple_route_json": raw
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let json = body_json(response).await;
+        let solution: Vec<PcbTrace> =
+            serde_json::from_value(json["solution_soup"].clone()).unwrap();
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &solution,
+            DEFAULT_VIA_PAD_DIAMETER,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn active_outline_trace_returns_safe_solution_aligned_to_selected_grid() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        let srj: SimpleRouteJson = serde_json::from_value(raw.clone()).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "simple_route_json": raw
+        }))
+        .unwrap();
+        let app = test_app();
+        let solve_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let solve_response = app.clone().oneshot(solve_request).await.unwrap();
+        assert_eq!(solve_response.status(), StatusCode::OK);
+        let solve_json = body_json(solve_response).await;
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/trace")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["solution"], solve_json["solution_soup"],
+            "configured /solve and /api/trace must select byte-identical active-outline soup"
+        );
+        let solution: Vec<PcbTrace> = serde_json::from_value(json["solution"].clone()).unwrap();
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &solution,
+            DEFAULT_VIA_PAD_DIAMETER,
+            2,
+        )
+        .unwrap());
+
+        let route_trace: RouteTrace = serde_json::from_value(json["trace"].clone()).unwrap();
+        assert_eq!(
+            route_trace.dims.w as usize,
+            json["coords"]["x_lines"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            route_trace.dims.h as usize,
+            json["coords"]["y_lines"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            route_trace.dims.layers as usize,
+            json["layers"].as_array().unwrap().len()
+        );
+        let committed = &route_trace.legalization.as_ref().unwrap().committed;
+        assert_eq!(
+            committed.iter().filter(|path| path.is_some()).count(),
+            solution.len()
+        );
+        assert!(committed
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|&cell| (cell as usize) < route_trace.dims.len()));
+    }
+
+    #[tokio::test]
+    async fn configured_solve_rejects_bowtie_before_building_a_router() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = app_configured(
+            counted_factory(Arc::clone(&calls)),
+            2,
+            Some(0.0),
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "simple_route_json": {
+                        "layerCount": 1,
+                        "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+                        "outline": [
+                            {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+                            {"x": 0.0, "y": 10.0}, {"x": 10.0, "y": 0.0}
+                        ]
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

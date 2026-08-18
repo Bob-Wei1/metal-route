@@ -56,7 +56,8 @@ mod board_outline;
 mod smooth;
 
 pub use board_outline::{
-    BoardOutlineConstraint, BoardOutlineError, DEFAULT_MIN_BOARD_EDGE_CLEARANCE_MM,
+    solution_respects_board_outline, BoardOutlineConstraint, BoardOutlineError,
+    DEFAULT_MIN_BOARD_EDGE_CLEARANCE_MM,
 };
 pub use smooth::{beautify_traces, legalize_clearance};
 
@@ -874,18 +875,6 @@ fn build_grid_lines(
         xs.push(obs.center.x + obs.width / 2.0);
         ys.push(obs.center.y - obs.height / 2.0);
         ys.push(obs.center.y + obs.height / 2.0);
-    }
-
-    // Board vertices are topology features too. Exact edge masks below carry the
-    // correctness invariant; adding these coordinates keeps non-convex turns from
-    // being hidden inside one long Hanan edge and gives the router lanes on both
-    // sides of every concavity. Malformed/non-finite outlines fail closed later and
-    // must not poison the sorted line arrays here.
-    for point in &srj.physical_rules.outline {
-        if point.x.is_finite() && point.y.is_finite() {
-            xs.push(point.x);
-            ys.push(point.y);
-        }
     }
 
     // `xs` / `ys` are now the *feature* lines (pads, obstacle edges, bounds): these
@@ -5481,9 +5470,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(problem.grid.has_board_constraints());
-        assert!(problem.mapping.x_lines.contains(&-2.0));
-        assert!(problem.mapping.x_lines.contains(&2.0));
-        assert!(problem.mapping.y_lines.contains(&2.0));
+        // Outline vertices are not Hanan features: the exact continuous node and
+        // edge masks below carry the complete concave-boundary constraint.
+        assert!(!problem.mapping.x_lines.contains(&-2.0));
+        assert!(!problem.mapping.x_lines.contains(&2.0));
+        assert!(!problem.mapping.y_lines.contains(&2.0));
 
         let dims = problem.mapping.dims;
         for layer in 0..dims.layers {
