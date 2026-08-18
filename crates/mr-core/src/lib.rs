@@ -484,8 +484,18 @@ impl BoardRoute {
     pub fn congestion_from(dims: Dims, results: &[RouteResult]) -> Vec<u32> {
         let mut c = vec![0u32; dims.len()];
         for r in results {
+            // Congestion is route occupancy, not visit frequency. Router-produced
+            // shortest paths are normally simple, but the contract also accepts
+            // hand-built/deserialised results; a loop in one such path must not make
+            // that single route look like multiple nets at the repeated cell. Keep
+            // the defensive set proportional to this path, not to the whole board:
+            // production grids can contain millions of cells.
+            let mut seen = std::collections::HashSet::with_capacity(r.path.len());
             for &cell in &r.path {
-                c[cell as usize] += 1;
+                let cell = cell as usize;
+                if seen.insert(cell) {
+                    c[cell] += 1;
+                }
             }
         }
         c
@@ -767,5 +777,154 @@ mod tests {
             },
         ];
         assert_eq!(BoardRoute::congestion_from(d, &results), vec![1, 2, 1]);
+    }
+
+    /// `congestion` counts occupying routes, not the number of times a malformed
+    /// or deliberately loopy path happens to visit a cell.
+    #[test]
+    fn congestion_counts_each_route_once_per_cell() {
+        let d = Dims::new(4, 1);
+        let results = vec![
+            RouteResult {
+                net: "loopy".into(),
+                path: vec![0, 1, 2, 1, 0, 1],
+                cost: 5,
+            },
+            RouteResult {
+                net: "other".into(),
+                path: vec![1, 2, 3, 2],
+                cost: 3,
+            },
+        ];
+        assert_eq!(BoardRoute::congestion_from(d, &results), vec![1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn small_multilayer_mappings_and_neighbours_match_reference() {
+        for layers in 1..=4 {
+            for h in 1..=5 {
+                for w in 1..=5 {
+                    let d = Dims::with_layers(w, h, layers);
+                    for l in 0..layers {
+                        for y in 0..h {
+                            for x in 0..w {
+                                let i = d.idx3(x, y, l);
+                                assert_eq!(d.xyz(i), (x, y, l));
+                                assert_eq!(d.xy(i), (x, y));
+                                assert_eq!(d.layer_of(i), l);
+                                assert!(d.contains(i));
+
+                                let mut expected_planar = Vec::new();
+                                if x > 0 {
+                                    expected_planar.push(d.idx3(x - 1, y, l));
+                                }
+                                if x + 1 < w {
+                                    expected_planar.push(d.idx3(x + 1, y, l));
+                                }
+                                if y > 0 {
+                                    expected_planar.push(d.idx3(x, y - 1, l));
+                                }
+                                if y + 1 < h {
+                                    expected_planar.push(d.idx3(x, y + 1, l));
+                                }
+                                expected_planar.sort_unstable();
+                                let actual_planar = d.neighbors4(i);
+                                assert_eq!(
+                                    actual_planar, expected_planar,
+                                    "at ({x},{y},{l}) in {d:?}"
+                                );
+                                assert!(actual_planar.windows(2).all(|pair| pair[0] < pair[1]));
+
+                                let mut expected_vias = Vec::new();
+                                if l > 0 {
+                                    expected_vias.push(d.idx3(x, y, l - 1));
+                                }
+                                if l + 1 < layers {
+                                    expected_vias.push(d.idx3(x, y, l + 1));
+                                }
+                                assert_eq!(d.via_neighbors(i), expected_vias);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gridcoords_uniform_metric_is_symmetric_and_layer_invariant() {
+        let d = Dims::with_layers(6, 4, 3);
+        let coords = GridCoords::uniform(d);
+        assert_eq!(coords.x_lines.len(), d.w as usize);
+        assert_eq!(coords.y_lines.len(), d.h as usize);
+        for a in 0..d.plane() as u32 {
+            for b in 0..d.plane() as u32 {
+                let ab = coords.manhattan_len(d, a, b);
+                let ba = coords.manhattan_len(d, b, a);
+                assert_eq!(ab, ba);
+                let (ax, ay) = d.xy(a);
+                let (bx, by) = d.xy(b);
+                assert_eq!(ab, ax.abs_diff(bx) as f64 + ay.abs_diff(by) as f64);
+                assert_eq!(
+                    ab,
+                    coords.manhattan_len(d, d.idx3(ax, ay, 2), d.idx3(bx, by, 1)),
+                    "the planar metric must ignore layer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serde_defaults_new_collection_fields() {
+        let net: NetEndpoints = serde_json::from_str(r#"{"net":"n","src":1,"dst":2}"#).unwrap();
+        assert!(net.passable_pads.is_empty());
+
+        let board: BoardRoute =
+            serde_json::from_str(r#"{"results":[],"unrouted":[],"congestion":[0,0]}"#).unwrap();
+        assert!(board.groups.is_empty());
+    }
+
+    #[test]
+    fn total_cost_accumulates_wider_than_cost() {
+        let board = BoardRoute {
+            results: vec![
+                RouteResult {
+                    net: "a".into(),
+                    path: vec![],
+                    cost: u32::MAX,
+                },
+                RouteResult {
+                    net: "b".into(),
+                    path: vec![],
+                    cost: u32::MAX,
+                },
+            ],
+            unrouted: vec![],
+            congestion: vec![],
+            groups: vec![],
+        };
+        assert_eq!(board.total_cost(), 2 * u32::MAX as u64);
+    }
+
+    #[test]
+    fn layermap_empty_input_and_zero_standard_are_canonical_single_layer() {
+        for map in [LayerMap::from_names(vec![]), LayerMap::standard(0)] {
+            assert_eq!(map.len(), 1);
+            assert!(!map.is_empty());
+            assert_eq!(map.name(0), "top");
+            assert_eq!(map.index_of("top"), Some(0));
+        }
+    }
+
+    #[test]
+    fn viamodel_legality_is_symmetric_and_adjacent_only() {
+        let model = ViaModel::with_allowed_steps(5, 17, vec![(0, 1), (2, 3)]);
+        for a in 0..=5 {
+            for b in 0..=5 {
+                assert_eq!(model.is_step_legal(a, b), model.is_step_legal(b, a));
+                let expected = matches!((a.min(b), a.max(b)), (0, 1) | (2, 3)) && a < 5 && b < 5;
+                assert_eq!(model.is_step_legal(a, b), expected, "step {a}->{b}");
+            }
+        }
     }
 }

@@ -8,8 +8,13 @@
 //! The MSL source is embedded as a Rust string and compiled at runtime via
 //! `device.new_library_with_source`.
 
+use std::sync::OnceLock;
+
 use metal::objc::rc::autoreleasepool;
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device, MTLCommandBufferStatus,
+    MTLResourceOptions, MTLSize,
+};
 
 use mr_core::{CellIdx, Cost, Grid, RouterError};
 
@@ -25,8 +30,16 @@ inline uint sat_add(uint a, uint b) {
     return (s < a) ? COST_MAX : s; // overflow -> clamp to MAX
 }
 
-// Grid dimensions passed as a small constant buffer.
-struct Dims { uint w; uint h; };
+// Grid dimensions passed as a small constant buffer. `batch` independent
+// distance fields are packed consecutively, each with `w*h*layers` cells.
+struct Dims {
+    uint w;
+    uint h;
+    uint layers;
+    uint batch;
+    uint cost_stride;
+    uint track_hops;
+};
 
 // ---------------------------------------------------------------------------
 // M3: naive atomic-free wavefront relaxation.
@@ -41,18 +54,23 @@ kernel void wavefront(
     device       atomic_uint* changed [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint n = dims.w * dims.h;
-    if (gid >= n) return;
+    uint plane = dims.w * dims.h;
+    uint n = plane * dims.layers;
+    uint total = n * dims.batch;
+    if (gid >= total) return;
 
-    uint c = cost[gid];
+    uint field = gid / n;
+    uint field_cell = gid - field * n;
+    uint c = cost[(dims.cost_stride == 0u) ? field_cell : gid];
     if (c == COST_MAX) {            // obstacle: stays MAX
         new_dist[gid] = COST_MAX;
         return;
     }
 
     uint best = old_dist[gid];
-    uint x = gid % dims.w;
-    uint y = gid / dims.w;
+    uint local = gid % plane;
+    uint x = local % dims.w;
+    uint y = local / dims.w;
 
     // 4-neighbours; relaxation adds cost(gid) (cost of stepping ONTO this cell).
     if (y > 0)            best = min(best, sat_add(old_dist[gid - dims.w], c));
@@ -72,46 +90,80 @@ kernel void wavefront(
 // M4: separable prefix-min sweeps.
 //   Row kernel: one thread per row, serial L->R then R->L prefix-min.
 //   Col kernel: one thread per column, serial U->D then D->U.
-// Each relaxation lowers dist[cur] toward dist[prev] + cost(cur). A per-cell
-// lowest-index parent is carried INTO the field under the same (dist, idx)
-// ordering so paths agree (the M0 finding). We never store across obstacles.
+// Each relaxation lowers distance at cur toward distance(prev) + cost(cur).
+// Weighted/zero-cost routing also carries the corresponding minimum-hop label;
+// distance-only and unit-cost calls skip all full hop-buffer traffic. We never
+// store across obstacles.
 // ---------------------------------------------------------------------------
 kernel void sweep_rows(
     device       uint*  dist   [[buffer(0)]],
     device const uint*  cost   [[buffer(1)]],
     constant     Dims&  dims   [[buffer(2)]],
     device       atomic_uint* changed [[buffer(3)]],
-    uint row [[thread_position_in_grid]])
+    device       uint*  hops   [[buffer(4)]],
+    uint row_gid [[thread_position_in_grid]])
 {
-    if (row >= dims.h) return;
-    uint base = row * dims.w;
+    uint n = dims.w * dims.h * dims.layers;
+    uint rows_per_field = dims.h * dims.layers;
+    if (row_gid >= rows_per_field * dims.batch) return;
+    uint field = row_gid / rows_per_field;
+    uint row = row_gid % rows_per_field;
+    uint base = field * n + row * dims.w;
+    bool line_changed = false;
 
     // left -> right
     for (uint x = 1u; x < dims.w; ++x) {
         uint cur = base + x;
-        uint c = cost[cur];
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
         if (c == COST_MAX) continue;          // obstacle: skip
-        uint prev = dist[base + x - 1u];
+        uint prev_idx = base + x - 1u;
+        uint prev = dist[prev_idx];
         if (prev == COST_MAX) continue;
         uint cand = sat_add(prev, c);
-        if (cand < dist[cur]) {
-            dist[cur] = cand;
-            atomic_store_explicit(changed, 1u, memory_order_relaxed);
+        if (cand != COST_MAX) {
+            if (dims.track_hops == 0u) {
+                if (cand < dist[cur]) {
+                    dist[cur] = cand;
+                    line_changed = true;
+                }
+            } else {
+                uint cand_hops = sat_add(hops[prev_idx], 1u);
+                if (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur])) {
+                    dist[cur] = cand;
+                    hops[cur] = cand_hops;
+                    line_changed = true;
+                }
+            }
         }
     }
     // right -> left
     for (uint xi = dims.w; xi >= 2u; --xi) {
         uint x = xi - 2u;                       // iterate x = w-2 .. 0
         uint cur = base + x;
-        uint c = cost[cur];
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
         if (c == COST_MAX) continue;
-        uint prev = dist[base + x + 1u];
+        uint prev_idx = base + x + 1u;
+        uint prev = dist[prev_idx];
         if (prev == COST_MAX) continue;
         uint cand = sat_add(prev, c);
-        if (cand < dist[cur]) {
-            dist[cur] = cand;
-            atomic_store_explicit(changed, 1u, memory_order_relaxed);
+        if (cand != COST_MAX) {
+            if (dims.track_hops == 0u) {
+                if (cand < dist[cur]) {
+                    dist[cur] = cand;
+                    line_changed = true;
+                }
+            } else {
+                uint cand_hops = sat_add(hops[prev_idx], 1u);
+                if (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur])) {
+                    dist[cur] = cand;
+                    hops[cur] = cand_hops;
+                    line_changed = true;
+                }
+            }
         }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
     }
 }
 
@@ -120,46 +172,277 @@ kernel void sweep_cols(
     device const uint*  cost   [[buffer(1)]],
     constant     Dims&  dims   [[buffer(2)]],
     device       atomic_uint* changed [[buffer(3)]],
-    uint col [[thread_position_in_grid]])
+    device       uint*  hops   [[buffer(4)]],
+    uint col_gid [[thread_position_in_grid]])
 {
-    if (col >= dims.w) return;
+    uint plane = dims.w * dims.h;
+    uint n = plane * dims.layers;
+    uint cols_per_field = dims.w * dims.layers;
+    if (col_gid >= cols_per_field * dims.batch) return;
+    uint field = col_gid / cols_per_field;
+    uint layer_col = col_gid % cols_per_field;
+    uint layer = layer_col / dims.w;
+    uint col = layer_col % dims.w;
+    uint base = field * n + layer * plane;
+    bool line_changed = false;
 
     // up -> down
     for (uint y = 1u; y < dims.h; ++y) {
-        uint cur = y * dims.w + col;
-        uint c = cost[cur];
+        uint cur = base + y * dims.w + col;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
         if (c == COST_MAX) continue;
-        uint prev = dist[(y - 1u) * dims.w + col];
+        uint prev_idx = base + (y - 1u) * dims.w + col;
+        uint prev = dist[prev_idx];
         if (prev == COST_MAX) continue;
         uint cand = sat_add(prev, c);
-        if (cand < dist[cur]) {
-            dist[cur] = cand;
-            atomic_store_explicit(changed, 1u, memory_order_relaxed);
+        if (cand != COST_MAX) {
+            if (dims.track_hops == 0u) {
+                if (cand < dist[cur]) {
+                    dist[cur] = cand;
+                    line_changed = true;
+                }
+            } else {
+                uint cand_hops = sat_add(hops[prev_idx], 1u);
+                if (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur])) {
+                    dist[cur] = cand;
+                    hops[cur] = cand_hops;
+                    line_changed = true;
+                }
+            }
         }
     }
     // down -> up
     for (uint yi = dims.h; yi >= 2u; --yi) {
         uint y = yi - 2u;                       // iterate y = h-2 .. 0
-        uint cur = y * dims.w + col;
-        uint c = cost[cur];
+        uint cur = base + y * dims.w + col;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
         if (c == COST_MAX) continue;
-        uint prev = dist[(y + 1u) * dims.w + col];
+        uint prev_idx = base + (y + 1u) * dims.w + col;
+        uint prev = dist[prev_idx];
         if (prev == COST_MAX) continue;
         uint cand = sat_add(prev, c);
-        if (cand < dist[cur]) {
-            dist[cur] = cand;
-            atomic_store_explicit(changed, 1u, memory_order_relaxed);
+        if (cand != COST_MAX) {
+            if (dims.track_hops == 0u) {
+                if (cand < dist[cur]) {
+                    dist[cur] = cand;
+                    line_changed = true;
+                }
+            } else {
+                uint cand_hops = sat_add(hops[prev_idx], 1u);
+                if (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur])) {
+                    dist[cur] = cand;
+                    hops[cur] = cand_hops;
+                    line_changed = true;
+                }
+            }
         }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge-aware M4 for NegotiatedRouter's independent/alone-path phase.
+//
+// Planar and via edge prices are supplied already rounded into the CPU router's
+// fixed-point Cost domain.  A move u -> v costs
+// min(edge_price(u,v) * enter_weight(v), COST_MAX - 1), exactly matching
+// negotiated.rs::passable_search_cost.  COST_MAX itself remains reserved for
+// obstacles/unreachable labels.  Every edge-aware solve carries hop labels.
+// ---------------------------------------------------------------------------
+inline uint passable_mul(uint edge_price, uint enter_weight) {
+    ulong product = ulong(edge_price) * ulong(enter_weight);
+    return uint(min(product, ulong(COST_MAX - 1u)));
+}
+
+kernel void sweep_rows_edges(
+    device       uint*  dist       [[buffer(0)]],
+    device const uint*  cost       [[buffer(1)]],
+    device const uint*  x_edges    [[buffer(2)]],
+    constant     Dims&  dims       [[buffer(3)]],
+    device       atomic_uint* changed [[buffer(4)]],
+    device       uint*  hops       [[buffer(5)]],
+    uint row_gid [[thread_position_in_grid]])
+{
+    uint n = dims.w * dims.h * dims.layers;
+    uint rows_per_field = dims.h * dims.layers;
+    if (row_gid >= rows_per_field * dims.batch) return;
+    uint field = row_gid / rows_per_field;
+    uint row = row_gid % rows_per_field;
+    uint base = field * n + row * dims.w;
+    bool line_changed = false;
+
+    for (uint x = 1u; x < dims.w; ++x) {
+        uint cur = base + x;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur - 1u;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(x_edges[x - 1u], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    for (uint xi = dims.w; xi >= 2u; --xi) {
+        uint x = xi - 2u;
+        uint cur = base + x;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur + 1u;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(x_edges[x], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+kernel void sweep_cols_edges(
+    device       uint*  dist       [[buffer(0)]],
+    device const uint*  cost       [[buffer(1)]],
+    device const uint*  y_edges    [[buffer(2)]],
+    constant     Dims&  dims       [[buffer(3)]],
+    device       atomic_uint* changed [[buffer(4)]],
+    device       uint*  hops       [[buffer(5)]],
+    uint col_gid [[thread_position_in_grid]])
+{
+    uint plane = dims.w * dims.h;
+    uint n = plane * dims.layers;
+    uint cols_per_field = dims.w * dims.layers;
+    if (col_gid >= cols_per_field * dims.batch) return;
+    uint field = col_gid / cols_per_field;
+    uint layer_col = col_gid % cols_per_field;
+    uint layer = layer_col / dims.w;
+    uint col = layer_col % dims.w;
+    uint base = field * n + layer * plane;
+    bool line_changed = false;
+
+    for (uint y = 1u; y < dims.h; ++y) {
+        uint cur = base + y * dims.w + col;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur - dims.w;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(y_edges[y - 1u], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    for (uint yi = dims.h; yi >= 2u; --yi) {
+        uint y = yi - 2u;
+        uint cur = base + y * dims.w + col;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur + dims.w;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(y_edges[y], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+// One thread owns one (field, x, y) layer column.  `via_allowed[k]` gates the
+// adjacent transition k <-> k+1 independently from its (possibly MAX/zero) cost.
+kernel void sweep_vias_edges(
+    device       uint*  dist       [[buffer(0)]],
+    device const uint*  cost       [[buffer(1)]],
+    device const uint*  via_edges  [[buffer(2)]],
+    device const uint*  via_allowed [[buffer(3)]],
+    constant     Dims&  dims       [[buffer(4)]],
+    device       atomic_uint* changed [[buffer(5)]],
+    device       uint*  hops       [[buffer(6)]],
+    uint via_gid [[thread_position_in_grid]])
+{
+    uint plane = dims.w * dims.h;
+    if (via_gid >= plane * dims.batch) return;
+    uint field = via_gid / plane;
+    uint xy = via_gid % plane;
+    uint n = plane * dims.layers;
+    uint base = field * n + xy;
+    bool line_changed = false;
+
+    for (uint layer = 1u; layer < dims.layers; ++layer) {
+        if (via_allowed[layer - 1u] == 0u) continue;
+        uint cur = base + layer * plane;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur - plane;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(via_edges[layer - 1u], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    for (uint li = dims.layers; li >= 2u; --li) {
+        uint layer = li - 2u;
+        if (via_allowed[layer] == 0u) continue;
+        uint cur = base + layer * plane;
+        uint c = cost[(dims.cost_stride == 0u) ? (cur - field * n) : cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur + plane;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(via_edges[layer], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
     }
 }
 "#;
 
-/// Dims as laid out for the MSL `Dims` struct (two `u32`s).
+/// Dims as laid out for the MSL `Dims` struct (six `u32`s).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GpuDims {
     w: u32,
     h: u32,
+    layers: u32,
+    batch: u32,
+    /// Zero means every field shares one `n`-cell cost grid; `n` means costs
+    /// are packed field-by-field (needed for per-net passable pads).
+    cost_stride: u32,
+    /// Zero runs the distance-only fast path; one carries minimum hop counts.
+    track_hops: u32,
 }
 
 /// A cached Metal context (device + queue + compiled pipelines).
@@ -169,6 +452,9 @@ struct MetalCtx {
     wavefront: ComputePipelineState,
     sweep_rows: ComputePipelineState,
     sweep_cols: ComputePipelineState,
+    sweep_rows_edges: ComputePipelineState,
+    sweep_cols_edges: ComputePipelineState,
+    sweep_vias_edges: ComputePipelineState,
 }
 
 impl MetalCtx {
@@ -196,10 +482,28 @@ impl MetalCtx {
             wavefront: pipeline("wavefront")?,
             sweep_rows: pipeline("sweep_rows")?,
             sweep_cols: pipeline("sweep_cols")?,
+            sweep_rows_edges: pipeline("sweep_rows_edges")?,
+            sweep_cols_edges: pipeline("sweep_cols_edges")?,
+            sweep_vias_edges: pipeline("sweep_vias_edges")?,
             device,
             queue,
         })
     }
+}
+
+/// Compiling MSL and creating pipelines is process setup, not per-board routing
+/// work. metal-rs retains these objects and marks them thread-safe, so every
+/// server worker can share one device, queue, and set of compiled pipelines.
+static METAL_CONTEXT: OnceLock<Result<MetalCtx, String>> = OnceLock::new();
+
+fn with_metal_ctx<T>(
+    f: impl FnOnce(&MetalCtx) -> Result<T, RouterError>,
+) -> Result<T, RouterError> {
+    let cached = METAL_CONTEXT.get_or_init(|| MetalCtx::new().map_err(|error| error.to_string()));
+    let ctx = cached
+        .as_ref()
+        .map_err(|message| RouterError::BackendUnavailable(message.clone()))?;
+    f(ctx)
 }
 
 fn new_u32_buffer(device: &Device, data: &[u32]) -> Buffer {
@@ -217,6 +521,142 @@ fn read_u32_buffer(buf: &Buffer, len: usize) -> Vec<u32> {
     unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
 }
 
+fn reset_u32_buffer(buf: &Buffer) {
+    // SAFETY: `buf` is a shared-storage buffer allocated from one `u32` below,
+    // and every previous command buffer using it has completed before reset.
+    unsafe {
+        *(buf.contents() as *mut u32) = 0;
+    }
+}
+
+fn command_status_result(status: MTLCommandBufferStatus) -> Result<(), RouterError> {
+    if status == MTLCommandBufferStatus::Completed {
+        Ok(())
+    } else {
+        Err(RouterError::BackendUnavailable(format!(
+            "Metal command buffer did not complete successfully: {status:?}"
+        )))
+    }
+}
+
+/// Commit one encoded command buffer and surface asynchronous Metal failures.
+/// `waitUntilCompleted` only blocks; runtime timeout/OOM/device failures are
+/// reported through the final status and must become a backend error before any
+/// shared-buffer contents are interpreted as a valid routing result.
+fn run_command_buffer(cmd: &CommandBufferRef) -> Result<(), RouterError> {
+    cmd.commit();
+    cmd.wait_until_completed();
+    command_status_result(cmd.status())
+}
+
+fn validate_buffer_len(device: &Device, elements: usize, label: &str) -> Result<(), RouterError> {
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| RouterError::BackendUnavailable(format!("{label} buffer is too large")))?;
+    let max = device.max_buffer_length() as usize;
+    if bytes > max {
+        return Err(RouterError::BackendUnavailable(format!(
+            "{label} buffer needs {bytes} bytes; Metal device limit is {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_edge_array_lengths(
+    grid: &Grid,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+    via_allowed_elements: usize,
+) -> Result<(), RouterError> {
+    let dims = grid.dims;
+    let expected_x = (dims.w as usize).saturating_sub(1);
+    let expected_y = (dims.h as usize).saturating_sub(1);
+    let expected_vias = (dims.layers as usize).saturating_sub(1);
+    if x_elements != expected_x
+        || y_elements != expected_y
+        || via_elements != expected_vias
+        || via_allowed_elements != expected_vias
+    {
+        return Err(RouterError::BackendUnavailable(
+            "edge-cost array lengths do not match grid dimensions".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_edge_batch_buffers(
+    device: &Device,
+    total: usize,
+    cost_elements: usize,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+    via_allowed_elements: usize,
+) -> Result<(), RouterError> {
+    validate_buffer_len(device, total, "edge-aware distance")?;
+    validate_buffer_len(device, total, "edge-aware hop count")?;
+    validate_buffer_len(device, cost_elements, "edge-aware enter weights")?;
+    // Empty edge arrays are represented by one-word dummy buffers.
+    validate_buffer_len(device, x_elements.max(1), "edge-aware x edges")?;
+    validate_buffer_len(device, y_elements.max(1), "edge-aware y edges")?;
+    validate_buffer_len(device, via_elements.max(1), "edge-aware via edges")?;
+    validate_buffer_len(
+        device,
+        via_allowed_elements.max(1),
+        "edge-aware via permissions",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn checked_batch_cells(
+    cells_per_field: usize,
+    fields: usize,
+) -> Result<usize, RouterError> {
+    let total = cells_per_field
+        .checked_mul(fields)
+        .ok_or_else(|| RouterError::BackendUnavailable("Metal batch is too large".into()))?;
+    if total > u32::MAX as usize {
+        return Err(RouterError::BackendUnavailable(
+            "Metal batch exceeds 32-bit shader indexing".into(),
+        ));
+    }
+    Ok(total)
+}
+
+/// Validate a packed edge-aware batch before its full host-side cost planes are
+/// allocated. Returns the exact packed element count for `Vec::with_capacity`.
+pub(crate) fn preflight_packed_edge_batch(
+    grid: &Grid,
+    fields: usize,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+) -> Result<usize, RouterError> {
+    if !grid.is_well_formed() {
+        return Err(RouterError::MalformedGrid);
+    }
+    validate_edge_array_lengths(grid, x_elements, y_elements, via_elements, via_elements)?;
+    let total = checked_batch_cells(grid.dims.len(), fields)?;
+    if fields == 0 || total == 0 {
+        return Ok(total);
+    }
+    autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            validate_edge_batch_buffers(
+                &ctx.device,
+                total,
+                total,
+                x_elements,
+                y_elements,
+                via_elements,
+                via_elements,
+            )?;
+            Ok(total)
+        })
+    })
+}
+
 /// Validate the grid and return `(dims, n, cost_u32, init_dist)`, or an early
 /// `dist` field when the source is an obstacle / grid empty.
 fn prepare(grid: &Grid, src: CellIdx) -> Result<PrepResult, RouterError> {
@@ -226,7 +666,7 @@ fn prepare(grid: &Grid, src: CellIdx) -> Result<PrepResult, RouterError> {
     let dims = grid.dims;
     let n = dims.len();
     let mut init = vec![Cost::MAX; n];
-    if dims.is_empty() || grid.is_obstacle(src) {
+    if dims.is_empty() || !dims.contains(src) || grid.is_obstacle(src) {
         return Ok(PrepResult::Trivial(init));
     }
     init[src as usize] = 0;
@@ -234,6 +674,10 @@ fn prepare(grid: &Grid, src: CellIdx) -> Result<PrepResult, RouterError> {
         gdims: GpuDims {
             w: dims.w,
             h: dims.h,
+            layers: dims.layers,
+            batch: 1,
+            cost_stride: 0,
+            track_hops: 0,
         },
         n,
         cost: grid.cost.clone(),
@@ -264,126 +708,429 @@ pub fn wavefront_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterErr
         } => (gdims, n, cost, init),
     };
 
-    let result = autoreleasepool(|| -> Result<Vec<Cost>, RouterError> {
-        let ctx = MetalCtx::new()?;
-        let dev = &ctx.device;
+    let result = autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            let dev = &ctx.device;
+            validate_buffer_len(dev, n, "wavefront distance")?;
+            validate_buffer_len(dev, cost.len(), "wavefront cost")?;
 
-        let mut buf_a = new_u32_buffer(dev, &init);
-        let mut buf_b = new_u32_buffer(dev, &init);
-        let cost_buf = new_u32_buffer(dev, &cost);
-        let dims_buf = dev.new_buffer_with_data(
-            &gdims as *const GpuDims as *const _,
-            std::mem::size_of::<GpuDims>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+            let mut buf_a = new_u32_buffer(dev, &init);
+            let mut buf_b = new_u32_buffer(dev, &init);
+            let cost_buf = new_u32_buffer(dev, &cost);
+            let dims_buf = dev.new_buffer_with_data(
+                &gdims as *const GpuDims as *const _,
+                std::mem::size_of::<GpuDims>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
 
-        // Bound: at most n iterations are ever needed for a monotone field.
-        let max_iters = n.max(1);
-        let tg = MTLSize::new(64, 1, 1);
-        let grid_size = MTLSize::new(n as u64, 1, 1);
+            // Bound: at most n iterations are ever needed for a monotone field.
+            let max_iters = n.max(1);
+            let tg = MTLSize::new(64, 1, 1);
+            let grid_size = MTLSize::new(n as u64, 1, 1);
 
-        for _ in 0..max_iters {
             let flag_buf = new_u32_buffer(dev, &[0u32]);
-            let cmd = ctx.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&ctx.wavefront);
-            enc.set_buffer(0, Some(&buf_a), 0);
-            enc.set_buffer(1, Some(&buf_b), 0);
-            enc.set_buffer(2, Some(&cost_buf), 0);
-            enc.set_buffer(3, Some(&dims_buf), 0);
-            enc.set_buffer(4, Some(&flag_buf), 0);
-            enc.dispatch_threads(grid_size, tg);
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+            for _ in 0..max_iters {
+                reset_u32_buffer(&flag_buf);
+                let cmd = ctx.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&ctx.wavefront);
+                enc.set_buffer(0, Some(&buf_a), 0);
+                enc.set_buffer(1, Some(&buf_b), 0);
+                enc.set_buffer(2, Some(&cost_buf), 0);
+                enc.set_buffer(3, Some(&dims_buf), 0);
+                enc.set_buffer(4, Some(&flag_buf), 0);
+                enc.dispatch_threads(grid_size, tg);
+                enc.end_encoding();
+                run_command_buffer(cmd)?;
 
-            // new (buf_b) becomes the current field; ping-pong.
-            std::mem::swap(&mut buf_a, &mut buf_b);
+                // new (buf_b) becomes the current field; ping-pong.
+                std::mem::swap(&mut buf_a, &mut buf_b);
 
-            let changed = read_u32_buffer(&flag_buf, 1)[0];
-            if changed == 0 {
-                break;
+                let changed = read_u32_buffer(&flag_buf, 1)[0];
+                if changed == 0 {
+                    break;
+                }
             }
-        }
 
-        Ok(read_u32_buffer(&buf_a, n))
+            Ok(read_u32_buffer(&buf_a, n))
+        })
     })?;
 
     Ok(result)
 }
 
-/// M4: separable H/V prefix-min sweep field on the GPU.
-pub fn sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
-    let prep = prepare(grid, src)?;
-    let (gdims, n, cost, init) = match prep {
-        PrepResult::Trivial(d) => return Ok(d),
-        PrepResult::Run {
-            gdims,
-            n,
-            cost,
-            init,
-        } => (gdims, n, cost, init),
+/// Flat M4 output. Keeping fields contiguous avoids a second full-buffer copy in
+/// `MetalRouter`; public nested-vector entry points split only at their boundary.
+pub(crate) struct FlatSweep {
+    pub(crate) dist: Vec<Cost>,
+    pub(crate) hops: Option<Vec<u32>>,
+}
+
+/// Solve several independent fields in one Metal submission stream.
+///
+/// `costs` is either one shared `n`-cell grid or `sources.len()` packed grids.
+/// When `track_hops` is false, the shader performs distance-only relaxation and
+/// binds only a one-word dummy hop buffer. This is the public field-computation
+/// path and the unit-cost router fast path. Weighted/zero-cost routing sets it to
+/// true to carry the canonical minimum-hop label alongside distance.
+pub(crate) fn sweep_fields_flat(
+    grid: &Grid,
+    sources: &[CellIdx],
+    costs: &[Cost],
+    track_hops: bool,
+) -> Result<FlatSweep, RouterError> {
+    if !grid.is_well_formed() {
+        return Err(RouterError::MalformedGrid);
+    }
+    if sources.is_empty() {
+        return Ok(FlatSweep {
+            dist: Vec::new(),
+            hops: track_hops.then(Vec::new),
+        });
+    }
+
+    let dims = grid.dims;
+    let n = dims.len();
+    let total = checked_batch_cells(n, sources.len())?;
+    if costs.len() != n && costs.len() != total {
+        return Err(RouterError::MalformedGrid);
+    }
+    if n == 0 {
+        return Ok(FlatSweep {
+            dist: Vec::new(),
+            hops: track_hops.then(Vec::new),
+        });
+    }
+
+    let batch = u32::try_from(sources.len())
+        .map_err(|_| RouterError::BackendUnavailable("Metal batch is too large".into()))?;
+    let gdims = GpuDims {
+        w: dims.w,
+        h: dims.h,
+        layers: dims.layers,
+        batch,
+        cost_stride: if costs.len() == n { 0 } else { n as u32 },
+        track_hops: u32::from(track_hops),
     };
 
-    let result = autoreleasepool(|| -> Result<Vec<Cost>, RouterError> {
-        let ctx = MetalCtx::new()?;
-        let dev = &ctx.device;
+    autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            // Validate device limits before allocating/filling any total-sized host
+            // vectors. Public callers are chunked too, but this internal guard keeps
+            // direct uses from attempting multi-gigabyte allocations first.
+            let dev = &ctx.device;
+            validate_buffer_len(dev, total, "batched distance")?;
+            if track_hops {
+                validate_buffer_len(dev, total, "batched hop count")?;
+            }
+            validate_buffer_len(dev, costs.len(), "batched cost")?;
 
-        // Single in-place dist buffer (sweeps mutate it serially per line).
-        let dist_buf = new_u32_buffer(dev, &init);
-        let cost_buf = new_u32_buffer(dev, &cost);
-        let dims_buf = dev.new_buffer_with_data(
-            &gdims as *const GpuDims as *const _,
-            std::mem::size_of::<GpuDims>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+            let mut init = vec![Cost::MAX; total];
+            let mut hop_init = track_hops.then(|| vec![u32::MAX; total]);
+            let mut any_runnable = false;
+            for (field, &src) in sources.iter().enumerate() {
+                let cost_offset = if costs.len() == n { 0 } else { field * n };
+                if dims.contains(src) && costs[cost_offset + src as usize] != Cost::MAX {
+                    init[field * n + src as usize] = 0;
+                    if let Some(hops) = hop_init.as_mut() {
+                        hops[field * n + src as usize] = 0;
+                    }
+                    any_runnable = true;
+                }
+            }
+            if !any_runnable {
+                return Ok(FlatSweep {
+                    dist: init,
+                    hops: hop_init,
+                });
+            }
 
-        let tg = MTLSize::new(64, 1, 1);
-        let rows = MTLSize::new(gdims.h as u64, 1, 1);
-        let cols = MTLSize::new(gdims.w as u64, 1, 1);
-
-        // A full round = one row sweep then one column sweep. Bound iterations.
-        let max_rounds = n.max(1);
-        for _ in 0..max_rounds {
+            let dist_buf = new_u32_buffer(dev, &init);
+            let dummy_hops = [u32::MAX];
+            let hop_buf = new_u32_buffer(dev, hop_init.as_deref().unwrap_or(&dummy_hops));
+            let cost_buf = new_u32_buffer(dev, costs);
+            let dims_buf = dev.new_buffer_with_data(
+                &gdims as *const GpuDims as *const _,
+                std::mem::size_of::<GpuDims>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
             let flag_buf = new_u32_buffer(dev, &[0u32]);
 
-            // Row pass.
-            {
+            let tg = MTLSize::new(64, 1, 1);
+            let rows = MTLSize::new((gdims.h * gdims.layers * gdims.batch) as u64, 1, 1);
+            let cols = MTLSize::new((gdims.w * gdims.layers * gdims.batch) as u64, 1, 1);
+
+            // A full round = one row sweep then one column sweep. Both encoders live
+            // in one command buffer, so Metal preserves the dependency without a
+            // CPU round-trip between passes. A single global flag is sufficient:
+            // convergence means no field changed.
+            for _ in 0..n.max(1) {
+                reset_u32_buffer(&flag_buf);
                 let cmd = ctx.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&ctx.sweep_rows);
-                enc.set_buffer(0, Some(&dist_buf), 0);
-                enc.set_buffer(1, Some(&cost_buf), 0);
-                enc.set_buffer(2, Some(&dims_buf), 0);
-                enc.set_buffer(3, Some(&flag_buf), 0);
-                enc.dispatch_threads(rows, tg);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-            }
-            // Column pass.
-            {
-                let cmd = ctx.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&ctx.sweep_cols);
-                enc.set_buffer(0, Some(&dist_buf), 0);
-                enc.set_buffer(1, Some(&cost_buf), 0);
-                enc.set_buffer(2, Some(&dims_buf), 0);
-                enc.set_buffer(3, Some(&flag_buf), 0);
-                enc.dispatch_threads(cols, tg);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_rows);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&dims_buf), 0);
+                    enc.set_buffer(3, Some(&flag_buf), 0);
+                    enc.set_buffer(4, Some(&hop_buf), 0);
+                    enc.dispatch_threads(rows, tg);
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_cols);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&dims_buf), 0);
+                    enc.set_buffer(3, Some(&flag_buf), 0);
+                    enc.set_buffer(4, Some(&hop_buf), 0);
+                    enc.dispatch_threads(cols, tg);
+                    enc.end_encoding();
+                }
+                run_command_buffer(cmd)?;
+                if read_u32_buffer(&flag_buf, 1)[0] == 0 {
+                    break;
+                }
             }
 
-            let changed = read_u32_buffer(&flag_buf, 1)[0];
-            if changed == 0 {
-                break;
+            Ok(FlatSweep {
+                dist: read_u32_buffer(&dist_buf, total),
+                hops: track_hops.then(|| read_u32_buffer(&hop_buf, total)),
+            })
+        })
+    })
+}
+
+/// Edge-aware batched M4 used by the negotiated router's independent-path seam.
+///
+/// `costs` contains destination enter weights (one shared plane or one packed plane
+/// per field). `x_edges`, `y_edges`, and `via_edges` are already rounded into the
+/// caller's fixed-point domain. `via_allowed[k]` independently gates layer step
+/// `k <-> k+1`, so a legal zero/MAX-priced via remains distinguishable from a
+/// forbidden transition. Both distance and minimum-hop fields are always returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_fields_flat_edges(
+    grid: &Grid,
+    sources: &[CellIdx],
+    costs: &[Cost],
+    x_edges: &[Cost],
+    y_edges: &[Cost],
+    via_edges: &[Cost],
+    via_allowed: &[u32],
+) -> Result<FlatSweep, RouterError> {
+    if !grid.is_well_formed() {
+        return Err(RouterError::MalformedGrid);
+    }
+    let dims = grid.dims;
+    validate_edge_array_lengths(
+        grid,
+        x_edges.len(),
+        y_edges.len(),
+        via_edges.len(),
+        via_allowed.len(),
+    )?;
+    if sources.is_empty() {
+        return Ok(FlatSweep {
+            dist: Vec::new(),
+            hops: Some(Vec::new()),
+        });
+    }
+
+    let n = dims.len();
+    let total = checked_batch_cells(n, sources.len())?;
+    if costs.len() != n && costs.len() != total {
+        return Err(RouterError::MalformedGrid);
+    }
+    if n == 0 {
+        return Ok(FlatSweep {
+            dist: Vec::new(),
+            hops: Some(Vec::new()),
+        });
+    }
+
+    let batch = u32::try_from(sources.len())
+        .map_err(|_| RouterError::BackendUnavailable("Metal batch is too large".into()))?;
+    let gdims = GpuDims {
+        w: dims.w,
+        h: dims.h,
+        layers: dims.layers,
+        batch,
+        cost_stride: if costs.len() == n { 0 } else { n as u32 },
+        track_hops: 1,
+    };
+
+    autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            let dev = &ctx.device;
+            validate_edge_batch_buffers(
+                dev,
+                total,
+                costs.len(),
+                x_edges.len(),
+                y_edges.len(),
+                via_edges.len(),
+                via_allowed.len(),
+            )?;
+
+            let mut init = vec![Cost::MAX; total];
+            let mut hop_init = vec![u32::MAX; total];
+            let mut any_runnable = false;
+            for (field, &src) in sources.iter().enumerate() {
+                let cost_offset = if costs.len() == n { 0 } else { field * n };
+                if dims.contains(src) && costs[cost_offset + src as usize] != Cost::MAX {
+                    init[field * n + src as usize] = 0;
+                    hop_init[field * n + src as usize] = 0;
+                    any_runnable = true;
+                }
             }
+            if !any_runnable {
+                return Ok(FlatSweep {
+                    dist: init,
+                    hops: Some(hop_init),
+                });
+            }
+
+            let zero = [0u32];
+            let dist_buf = new_u32_buffer(dev, &init);
+            let hop_buf = new_u32_buffer(dev, &hop_init);
+            let cost_buf = new_u32_buffer(dev, costs);
+            let x_buf = new_u32_buffer(dev, if x_edges.is_empty() { &zero } else { x_edges });
+            let y_buf = new_u32_buffer(dev, if y_edges.is_empty() { &zero } else { y_edges });
+            let via_buf = new_u32_buffer(
+                dev,
+                if via_edges.is_empty() {
+                    &zero
+                } else {
+                    via_edges
+                },
+            );
+            let via_allowed_buf = new_u32_buffer(
+                dev,
+                if via_allowed.is_empty() {
+                    &zero
+                } else {
+                    via_allowed
+                },
+            );
+            let dims_buf = dev.new_buffer_with_data(
+                &gdims as *const GpuDims as *const _,
+                std::mem::size_of::<GpuDims>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let flag_buf = new_u32_buffer(dev, &[0u32]);
+
+            let tg = MTLSize::new(64, 1, 1);
+            let rows = MTLSize::new((gdims.h * gdims.layers * gdims.batch) as u64, 1, 1);
+            let cols = MTLSize::new((gdims.w * gdims.layers * gdims.batch) as u64, 1, 1);
+            let vias = MTLSize::new((gdims.w * gdims.h * gdims.batch) as u64, 1, 1);
+
+            for _ in 0..n.max(1) {
+                reset_u32_buffer(&flag_buf);
+                let cmd = ctx.queue.new_command_buffer();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_rows_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&x_buf), 0);
+                    enc.set_buffer(3, Some(&dims_buf), 0);
+                    enc.set_buffer(4, Some(&flag_buf), 0);
+                    enc.set_buffer(5, Some(&hop_buf), 0);
+                    enc.dispatch_threads(rows, tg);
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_cols_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&y_buf), 0);
+                    enc.set_buffer(3, Some(&dims_buf), 0);
+                    enc.set_buffer(4, Some(&flag_buf), 0);
+                    enc.set_buffer(5, Some(&hop_buf), 0);
+                    enc.dispatch_threads(cols, tg);
+                    enc.end_encoding();
+                }
+                if gdims.layers > 1 {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_vias_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&via_buf), 0);
+                    enc.set_buffer(3, Some(&via_allowed_buf), 0);
+                    enc.set_buffer(4, Some(&dims_buf), 0);
+                    enc.set_buffer(5, Some(&flag_buf), 0);
+                    enc.set_buffer(6, Some(&hop_buf), 0);
+                    enc.dispatch_threads(vias, tg);
+                    enc.end_encoding();
+                }
+                run_command_buffer(cmd)?;
+                if read_u32_buffer(&flag_buf, 1)[0] == 0 {
+                    break;
+                }
+            }
+
+            Ok(FlatSweep {
+                dist: read_u32_buffer(&dist_buf, total),
+                hops: Some(read_u32_buffer(&hop_buf, total)),
+            })
+        })
+    })
+}
+
+/// M4 single-field compatibility wrapper.
+pub fn sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
+    Ok(sweep_fields_flat(grid, &[src], &grid.cost, false)?.dist)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_status_requires_successful_completion() {
+        assert!(command_status_result(MTLCommandBufferStatus::Completed).is_ok());
+        for status in [
+            MTLCommandBufferStatus::NotEnqueued,
+            MTLCommandBufferStatus::Enqueued,
+            MTLCommandBufferStatus::Committed,
+            MTLCommandBufferStatus::Scheduled,
+            MTLCommandBufferStatus::Error,
+        ] {
+            assert!(matches!(
+                command_status_result(status),
+                Err(RouterError::BackendUnavailable(_))
+            ));
         }
+    }
 
-        Ok(read_u32_buffer(&dist_buf, n))
-    })?;
+    #[test]
+    fn edge_batch_preflight_checks_every_distinct_buffer_size() {
+        autoreleasepool(|| {
+            with_metal_ctx(|ctx| {
+                let too_many = (ctx.device.max_buffer_length() as usize / 4).saturating_add(1);
+                let error_for = |cost, x, y, via, allowed| {
+                    validate_edge_batch_buffers(&ctx.device, 1, cost, x, y, via, allowed)
+                        .unwrap_err()
+                        .to_string()
+                };
 
-    Ok(result)
+                assert!(
+                    validate_edge_batch_buffers(&ctx.device, too_many, 1, 1, 1, 1, 1)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("distance")
+                );
+                assert!(error_for(too_many, 1, 1, 1, 1).contains("enter weights"));
+                assert!(error_for(1, too_many, 1, 1, 1).contains("x edges"));
+                assert!(error_for(1, 1, too_many, 1, 1).contains("y edges"));
+                assert!(error_for(1, 1, 1, too_many, 1).contains("via edges"));
+                assert!(error_for(1, 1, 1, 1, too_many).contains("via permissions"));
+                Ok(())
+            })
+        })
+        .unwrap();
+    }
 }

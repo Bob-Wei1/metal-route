@@ -176,7 +176,7 @@ impl DrcBoard {
         self.check_clearance(&mut out);
         self.check_via_through_plane(&mut out);
         self.check_annular_ring(&mut out);
-        out.sort_by_key(violation_key);
+        out.sort_by(violation_cmp);
         out
     }
 
@@ -262,6 +262,41 @@ impl DrcBoard {
         if !nets_conflict(&a.net, &b.net) {
             return;
         }
+
+        // The centroid grid deliberately over-approximates candidate pairs. Reject
+        // pairs whose copper AABBs are already separated by at least the violating
+        // threshold before running the more expensive exact shape-distance code.
+        // This is only enabled for a positive threshold: an overlapping capsule can
+        // have a negative exact gap while its (overlapping) AABBs have zero gap.
+        let violation_threshold = self.rules.clearance - EPS;
+        if aabbs_separated_by_at_least(a, b, violation_threshold) {
+            return;
+        }
+
+        self.report_clearance_pair(layer, a, b, out);
+    }
+
+    #[cfg(test)]
+    fn test_clearance_pair_exact(
+        &self,
+        layer: u32,
+        a: &Feature,
+        b: &Feature,
+        out: &mut Vec<Violation>,
+    ) {
+        if !nets_conflict(&a.net, &b.net) {
+            return;
+        }
+        self.report_clearance_pair(layer, a, b, out);
+    }
+
+    fn report_clearance_pair(
+        &self,
+        layer: u32,
+        a: &Feature,
+        b: &Feature,
+        out: &mut Vec<Violation>,
+    ) {
         let gap = feature_gap(a, b);
         if gap < self.rules.clearance - EPS {
             let (ax, ay) = a.centroid();
@@ -419,6 +454,59 @@ impl Feature {
             Shape::Rect { w, h, .. } => (w.max(*h)) / 2.0,
         }
     }
+
+    /// Conservative copper bounds for broad-phase rejection. Invalid or
+    /// non-finite geometry returns `None`, preserving the exact path's behavior.
+    fn copper_aabb(&self) -> Option<(f64, f64, f64, f64)> {
+        if !self.inflate.is_finite() || self.inflate < 0.0 {
+            return None;
+        }
+        let bounds = match &self.shape {
+            Shape::Segment { a, b } => (
+                a.0.min(b.0) - self.inflate,
+                a.1.min(b.1) - self.inflate,
+                a.0.max(b.0) + self.inflate,
+                a.1.max(b.1) + self.inflate,
+            ),
+            Shape::Point { c } => (
+                c.0 - self.inflate,
+                c.1 - self.inflate,
+                c.0 + self.inflate,
+                c.1 + self.inflate,
+            ),
+            Shape::Rect { c, w, h } => {
+                if !w.is_finite() || !h.is_finite() || *w < 0.0 || *h < 0.0 {
+                    return None;
+                }
+                (c.0 - w / 2.0, c.1 - h / 2.0, c.0 + w / 2.0, c.1 + h / 2.0)
+            }
+        };
+        if [bounds.0, bounds.1, bounds.2, bounds.3]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            Some(bounds)
+        } else {
+            None
+        }
+    }
+}
+
+/// True only when one axis alone proves the exact copper gap cannot violate the
+/// rule. AABBs enclose their features, so their axis separation is a lower bound
+/// on the exact Euclidean gap. Returning false merely falls back to the exact test.
+fn aabbs_separated_by_at_least(a: &Feature, b: &Feature, threshold: f64) -> bool {
+    if !threshold.is_finite() || threshold <= 0.0 {
+        return false;
+    }
+    let (Some((a_min_x, a_min_y, a_max_x, a_max_y)), Some((b_min_x, b_min_y, b_max_x, b_max_y))) =
+        (a.copper_aabb(), b.copper_aabb())
+    else {
+        return false;
+    };
+    let x_separation = (a_min_x - b_max_x).max(b_min_x - a_max_x);
+    let y_separation = (a_min_y - b_max_y).max(b_min_y - a_max_y);
+    x_separation >= threshold || y_separation >= threshold
 }
 
 /// Copper-to-copper gap between two features (negative if they overlap). For the
@@ -597,17 +685,21 @@ fn quantise(x: f64) -> i64 {
     (x / 1e-6).round() as i64
 }
 
-/// Total, stable ordering key for a violation: class, layer, quantised location,
-/// then nets. Coordinates are quantised to 1e-6 to avoid float-ordering hazards.
-fn violation_key(v: &Violation) -> (u8, u32, i64, i64, String, String) {
-    (
-        class_order(v.class),
-        v.layer,
-        quantise(v.location.0),
-        quantise(v.location.1),
-        v.nets.0.clone(),
-        v.nets.1.clone(),
-    )
+/// Total, stable violation ordering: the published class/layer/quantised-location/
+/// nets order first, followed by exact geometry and measurement tie-breaks. The
+/// latter matter when distinct violations land in the same 1e-6 location bucket;
+/// without them stable sort merely preserves HashMap/input discovery order.
+fn violation_cmp(a: &Violation, b: &Violation) -> std::cmp::Ordering {
+    class_order(a.class)
+        .cmp(&class_order(b.class))
+        .then_with(|| a.layer.cmp(&b.layer))
+        .then_with(|| quantise(a.location.0).cmp(&quantise(b.location.0)))
+        .then_with(|| quantise(a.location.1).cmp(&quantise(b.location.1)))
+        .then_with(|| a.nets.cmp(&b.nets))
+        .then_with(|| a.location.0.total_cmp(&b.location.0))
+        .then_with(|| a.location.1.total_cmp(&b.location.1))
+        .then_with(|| a.measured.total_cmp(&b.measured))
+        .then_with(|| a.required.total_cmp(&b.required))
 }
 
 #[cfg(test)]
@@ -1046,5 +1138,315 @@ mod tests {
         assert!((point_rect_gap((1.5, 0.0), (0.0, 0.0), 1.0, 1.0) - 1.0).abs() < 1e-12);
         // Point inside → 0.
         assert!(point_rect_gap((0.0, 0.0), (0.0, 0.0), 1.0, 1.0) < 1e-12);
+    }
+
+    #[test]
+    fn colliding_sort_keys_are_stable_under_input_permutation() {
+        // Every A/B pair has the same published sort fields (class, layer,
+        // location, nets), but differing widths give differing measured gaps.
+        // The remaining fields must provide a deterministic total tie-break.
+        let segs = vec![
+            seg("A", 0, (0.0, 0.0), (10.0, 0.0), 0.1),
+            seg("B", 0, (0.0, 0.0), (10.0, 0.0), 0.1),
+            seg("A", 0, (0.0, 0.0), (10.0, 0.0), 0.2),
+            seg("B", 0, (0.0, 0.0), (10.0, 0.0), 0.3),
+        ];
+        let board = |segments| DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments,
+            pads: vec![],
+            vias: vec![],
+            rules: rules(),
+        };
+        let expected = board(segs.clone()).check();
+        let mut reversed = segs;
+        reversed.reverse();
+        assert_eq!(expected, board(reversed).check());
+    }
+
+    fn clearance_only_bruteforce(board: &DrcBoard) -> Vec<Violation> {
+        let mut by_layer: std::collections::BTreeMap<u32, Vec<Feature>> =
+            std::collections::BTreeMap::new();
+        for segment in &board.segments {
+            by_layer
+                .entry(segment.layer)
+                .or_default()
+                .push(Feature::segment(segment));
+        }
+        for pad in &board.pads {
+            by_layer
+                .entry(pad.layer)
+                .or_default()
+                .push(Feature::pad(pad));
+        }
+        let layer_count = board.layers.len() as u32;
+        for via in &board.vias {
+            let lo = via.from_layer.min(via.to_layer);
+            let hi = via.from_layer.max(via.to_layer);
+            for layer in lo..=hi {
+                if layer_count == 0 || layer < layer_count {
+                    by_layer.entry(layer).or_default().push(Feature::via(via));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (layer, features) in by_layer {
+            for i in 0..features.len() {
+                for j in i + 1..features.len() {
+                    board.test_clearance_pair_exact(layer, &features[i], &features[j], &mut out);
+                }
+            }
+        }
+        out.sort_by(violation_cmp);
+        out
+    }
+
+    #[test]
+    fn spatial_index_matches_naive_all_pairs_reference() {
+        // Fixed-seed pseudo-random geometry: deterministic and broad enough to
+        // exercise negative bins, long segments, all feature kinds, and layers.
+        let mut state = 0x7a5b_9d31_42c6_e817u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 32) as u32) as f64 / u32::MAX as f64
+        };
+        let coord = |v: f64| v * 30.0 - 15.0;
+        let mut segments = Vec::new();
+        let mut pads = Vec::new();
+        let mut vias = Vec::new();
+        for i in 0..48 {
+            let net = format!("N{}", i % 7);
+            let layer = (i % 3) as u32;
+            let (x, y) = (coord(next()), coord(next()));
+            match i % 3 {
+                0 => segments.push(seg(
+                    &net,
+                    layer,
+                    (x, y),
+                    (x + coord(next()) * 0.35, y + coord(next()) * 0.35),
+                    0.05 + next() * 0.8,
+                )),
+                1 => pads.push(Pad {
+                    net: Some(net),
+                    layer,
+                    center: (x, y),
+                    width: 0.05 + next() * 1.5,
+                    height: 0.05 + next() * 1.5,
+                }),
+                _ => vias.push(Via {
+                    net,
+                    center: (x, y),
+                    pad_diameter: 0.4 + next() * 0.5,
+                    drill_diameter: 0.2,
+                    from_layer: layer,
+                    to_layer: layer,
+                    antipad_radius: None,
+                }),
+            }
+        }
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal; 3],
+            segments,
+            pads,
+            vias,
+            rules: DrcRules {
+                clearance: 0.3,
+                plane_antipad: 0.1,
+                min_annular_ring: 0.0,
+            },
+        };
+        let indexed: Vec<_> = board
+            .check()
+            .into_iter()
+            .filter(|v| v.class == ViolationClass::Clearance)
+            .collect();
+        assert_eq!(indexed, clearance_only_bruteforce(&board));
+    }
+
+    #[test]
+    fn every_copper_feature_pairing_is_checked() {
+        fn via(net: &str) -> Via {
+            Via {
+                net: net.into(),
+                center: (0.0, 0.0),
+                pad_diameter: 0.6,
+                drill_diameter: 0.3,
+                from_layer: 0,
+                to_layer: 0,
+                antipad_radius: None,
+            }
+        }
+        let segment = |net: &str| seg(net, 0, (-1.0, 0.0), (1.0, 0.0), 0.2);
+        let pad = |net: &str| Pad {
+            net: Some(net.into()),
+            layer: 0,
+            center: (0.0, 0.0),
+            width: 0.5,
+            height: 0.5,
+        };
+        let cases = [
+            (vec![segment("A"), segment("B")], vec![], vec![]),
+            (vec![segment("A")], vec![pad("B")], vec![]),
+            (vec![segment("A")], vec![], vec![via("B")]),
+            (vec![], vec![pad("A"), pad("B")], vec![]),
+            (vec![], vec![pad("A")], vec![via("B")]),
+            (vec![], vec![], vec![via("A"), via("B")]),
+        ];
+        for (segments, pads, vias) in cases {
+            let board = DrcBoard {
+                layers: vec![LayerKind::Signal],
+                segments,
+                pads,
+                vias,
+                rules: rules(),
+            };
+            assert_eq!(
+                classes(&board.check(), ViolationClass::Clearance),
+                1,
+                "pairing should produce exactly one clearance violation: {board:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aabb_rejection_matches_exact_for_all_shape_pairs_at_epsilon_boundary() {
+        let make_segment = |net: &str, x: f64| Feature {
+            net: Some(net.into()),
+            shape: Shape::Segment {
+                a: (x, -0.5),
+                b: (x, 0.5),
+            },
+            inflate: 0.05,
+        };
+        let make_point = |net: &str, x: f64| Feature {
+            net: Some(net.into()),
+            shape: Shape::Point { c: (x, 0.0) },
+            inflate: 0.05,
+        };
+        let make_rect = |net: &str, x: f64| Feature {
+            net: Some(net.into()),
+            shape: Shape::Rect {
+                c: (x, 0.0),
+                w: 0.1,
+                h: 1.0,
+            },
+            inflate: 0.0,
+        };
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![],
+            rules: rules(),
+        };
+
+        for delta in [-2.0 * EPS, -EPS, -0.5 * EPS, 0.0, EPS, 2.0 * EPS] {
+            // Every shape has a 0.05 right/left copper reach. Placing the second
+            // centroid at 0.1 + clearance + delta makes the exact x gap equal to
+            // clearance + delta, exercising both sides of the EPS threshold.
+            let x = 0.1 + board.rules.clearance + delta;
+            let pairs = [
+                (make_segment("A", 0.0), make_segment("B", x)),
+                (make_segment("A", 0.0), make_point("B", x)),
+                (make_point("A", 0.0), make_point("B", x)),
+                (make_rect("A", 0.0), make_point("B", x)),
+                (make_rect("A", 0.0), make_segment("B", x)),
+                (make_rect("A", 0.0), make_rect("B", x)),
+            ];
+            for (a, b) in pairs {
+                let mut filtered = Vec::new();
+                board.test_clearance_pair(0, &a, &b, &mut filtered);
+                let mut exact = Vec::new();
+                board.test_clearance_pair_exact(0, &a, &b, &mut exact);
+                assert_eq!(filtered, exact, "delta={delta}, a={a:?}, b={b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn aabb_rejection_preserves_negative_gap_when_clearance_is_off() {
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![],
+            rules: DrcRules {
+                clearance: 0.0,
+                ..rules()
+            },
+        };
+        let a = Feature {
+            net: Some("A".into()),
+            shape: Shape::Point { c: (0.0, 0.0) },
+            inflate: 0.5,
+        };
+        let b = Feature {
+            net: Some("B".into()),
+            shape: Shape::Point { c: (0.0, 0.0) },
+            inflate: 0.5,
+        };
+        let mut filtered = Vec::new();
+        board.test_clearance_pair(0, &a, &b, &mut filtered);
+        let mut exact = Vec::new();
+        board.test_clearance_pair_exact(0, &a, &b, &mut exact);
+        assert_eq!(filtered, exact);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].measured, -1.0);
+    }
+
+    #[test]
+    fn geometry_distances_are_symmetric_under_reversal_and_translation() {
+        let p = ((-2.0, 1.5), (4.0, -0.5));
+        let q = ((-1.0, -3.0), (3.5, 2.0));
+        let expected = seg_seg_dist(p.0, p.1, q.0, q.1);
+        for (a0, a1) in [(p.0, p.1), (p.1, p.0)] {
+            for (b0, b1) in [(q.0, q.1), (q.1, q.0)] {
+                assert!((seg_seg_dist(a0, a1, b0, b1) - expected).abs() < 1e-12);
+                assert!((seg_seg_dist(b0, b1, a0, a1) - expected).abs() < 1e-12);
+            }
+        }
+        let shift = |v: (f64, f64)| (v.0 + 100.0, v.1 - 70.0);
+        assert!(
+            (seg_seg_dist(shift(p.0), shift(p.1), shift(q.0), shift(q.1)) - expected).abs() < 1e-12
+        );
+        assert_eq!(point_seg_dist(p.0, q.0, q.0), dist(p.0, q.0));
+    }
+
+    #[test]
+    fn drc_summary_tallies_all_classes() {
+        let violations = vec![
+            Violation {
+                class: ViolationClass::Clearance,
+                layer: 0,
+                location: (0.0, 0.0),
+                nets: ("a".into(), "b".into()),
+                measured: 0.0,
+                required: 1.0,
+            },
+            Violation {
+                class: ViolationClass::ViaThroughPlane,
+                layer: 1,
+                location: (0.0, 0.0),
+                nets: ("a".into(), "gnd".into()),
+                measured: 0.0,
+                required: 1.0,
+            },
+            Violation {
+                class: ViolationClass::AnnularRing,
+                layer: 0,
+                location: (0.0, 0.0),
+                nets: ("a".into(), String::new()),
+                measured: 0.0,
+                required: 1.0,
+            },
+        ];
+        let summary = DrcSummary::of(&violations);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.clearance, 1);
+        assert_eq!(summary.via_through_plane, 1);
+        assert_eq!(summary.annular_ring, 1);
+        assert!(!summary.is_clean());
+        assert!(DrcSummary::of(&[]).is_clean());
     }
 }

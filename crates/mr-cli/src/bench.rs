@@ -18,6 +18,9 @@ use serde_json::json;
 use crate::{project, route_problem, Projection, RouterKind};
 use mr_srj::SimpleRouteJson;
 
+const BENCH_ROUTER: RouterKind = RouterKind::Negotiated;
+const BENCH_ROUTER_NAME: &str = "negotiated";
+
 /// Arguments for the `bench` subcommand.
 #[derive(Debug, clap::Parser)]
 pub struct BenchArgs {
@@ -184,8 +187,7 @@ pub fn run_suite(args: &BenchArgs) -> Result<BenchReport> {
         let srj = generate_problem(seed, args.size, args.obstacles, args.nets);
 
         let t0 = Instant::now();
-        let (_traces, summary, _diag) =
-            route_problem(&srj, args.resolution, RouterKind::Negotiated, None)?;
+        let (_traces, summary, _diag) = route_problem(&srj, args.resolution, BENCH_ROUTER, None)?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         nets_total += summary.total;
@@ -217,7 +219,7 @@ pub fn run_suite(args: &BenchArgs) -> Result<BenchReport> {
     };
 
     Ok(BenchReport {
-        router: "ripup-cpu".into(),
+        router: BENCH_ROUTER_NAME.into(),
         boards: per_board.len(),
         nets_total,
         nets_routed,
@@ -282,6 +284,7 @@ mod tests {
             out: None,
         };
         let r = run_suite(&args).unwrap();
+        assert_eq!(r.router, BENCH_ROUTER_NAME);
         assert_eq!(r.boards, 4);
         assert_eq!(r.nets_total, 24);
         assert!(

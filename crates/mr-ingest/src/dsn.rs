@@ -162,6 +162,12 @@ fn parse_sexpr(src: &str) -> Result<Sexpr> {
     let tokens = tokenize(src);
     let mut pos = 0;
     let node = parse_node(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        bail!(
+            "trailing token '{}' after complete DSN document",
+            tokens[pos]
+        );
+    }
     Ok(node)
 }
 
@@ -205,6 +211,8 @@ struct ImagePin {
     off_x: f64,
     off_y: f64,
     padstack: String,
+    /// Pin-local pad rotation from `(pin ... (rotate N) ...)`, in degrees.
+    rotation: f64,
 }
 
 /// A footprint image (library entry): its pins keyed for lookup by pin id.
@@ -224,6 +232,16 @@ struct Placement {
     back: bool,
     /// Rotation in CCW degrees.
     rot: f64,
+}
+
+/// A library pin transformed into board coordinates, retaining its composed pad
+/// orientation so asymmetric pad geometry can be emitted correctly.
+#[derive(Debug, Clone)]
+struct PlacedPin {
+    x: f64,
+    y: f64,
+    padstack: String,
+    rotation: f64,
 }
 
 /// A representative pad geometry for a padstack: a size (mm) plus the copper
@@ -386,8 +404,8 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         .and_then(|n| n.as_atom())
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("malformed (resolution ...): missing/invalid divisor"))?;
-    if divisor == 0.0 {
-        bail!("DSN resolution divisor is zero");
+    if !divisor.is_finite() || divisor <= 0.0 {
+        bail!("DSN resolution divisor must be positive and finite, got {divisor}");
     }
     let mm_per_raw = unit_to_mm(unit)? / divisor;
     let to_mm = |raw: f64| raw * mm_per_raw;
@@ -426,8 +444,8 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     // Placed components.
     let placements = parse_placements(pcb, &to_mm)?;
 
-    // Build absolute pin positions: (ref, pin-id) -> (x_mm, y_mm, padstack).
-    let mut pin_pos: HashMap<(String, String), (f64, f64, String)> = HashMap::new();
+    // Build absolute pin positions and composed pad orientations.
+    let mut pin_pos: HashMap<(String, String), PlacedPin> = HashMap::new();
     for pl in &placements {
         let image = match images.get(&pl.image_id) {
             Some(img) => img,
@@ -442,9 +460,19 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
             let ry = lx * sin + ly * cos;
             let ax = to_mm_translate(pl.x, rx);
             let ay = to_mm_translate(pl.y, ry);
+            // Mirroring reverses a pin-local rotation; placement rotation then
+            // applies in board coordinates. For 90/270-degree rectangular pads
+            // only parity matters, but retaining the full angle also lets the
+            // geometry helper conservatively bound arbitrary rotations.
+            let pin_rotation = if pl.back { -pin.rotation } else { pin.rotation };
             pin_pos.insert(
                 (pl.reference.clone(), pin.id.clone()),
-                (ax, ay, pin.padstack.clone()),
+                PlacedPin {
+                    x: ax,
+                    y: ay,
+                    padstack: pin.padstack.clone(),
+                    rotation: pl.rot + pin_rotation,
+                },
             );
         }
     }
@@ -452,8 +480,8 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     // Obstacles: one rect per placed pad we know the position of, tagged with the
     // REAL layer name(s) the pad sits on (through-hole -> all layers, SMD -> one).
     let mut obstacles: Vec<Obstacle> = Vec::with_capacity(pin_pos.len());
-    for ((reference, pin_id), (ax, ay, padstack)) in &pin_pos {
-        let size = match pad_sizes.get(padstack) {
+    for ((reference, pin_id), pin) in &pin_pos {
+        let size = match pad_sizes.get(&pin.padstack) {
             Some(s) => s,
             None => continue, // unknown padstack -> no geometry to mask
         };
@@ -461,18 +489,19 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         if size.w <= 0.0 || size.h <= 0.0 {
             continue;
         }
+        let (width, height) = oriented_pad_extents(size.w, size.h, pin.rotation);
         let layers = pad_layer_names(&size.layers, &layer_map);
         // The obstacle's representative point layer is its first (top-most) layer.
         let point_layer = layers.first().cloned();
         obstacles.push(Obstacle {
             kind: "rect".to_string(),
             center: Point {
-                x: *ax,
-                y: *ay,
+                x: pin.x,
+                y: pin.y,
                 layer: point_layer,
             },
-            width: size.w,
-            height: size.h,
+            width,
+            height,
             layers,
             connected_to: vec![format!("{reference}-{pin_id}")],
         });
@@ -488,18 +517,18 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     for (net_name, pin_refs) in &nets {
         let mut points = Vec::new();
         for (reference, pin_id) in pin_refs {
-            if let Some((ax, ay, padstack)) = pin_pos.get(&(reference.clone(), pin_id.clone())) {
+            if let Some(pin) = pin_pos.get(&(reference.clone(), pin_id.clone())) {
                 // The connection point's layer is its pad's actual (top-most)
                 // layer. Through-hole pins resolve to the top layer; SMD pins to
                 // whichever single layer they live on.
                 let layer = pad_sizes
-                    .get(padstack)
+                    .get(&pin.padstack)
                     .map(|s| pad_layer_names(&s.layers, &layer_map))
                     .and_then(|ls| ls.into_iter().next())
                     .or_else(|| Some(layer_map.name(0).to_string()));
                 points.push(Point {
-                    x: *ax,
-                    y: *ay,
+                    x: pin.x,
+                    y: pin.y,
                     layer,
                 });
             }
@@ -572,6 +601,27 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
 #[inline]
 fn to_mm_translate(base_mm: f64, offset_mm: f64) -> f64 {
     base_mm + offset_mm
+}
+
+/// Axis-aligned extents of a rectangular pad after rotation. Exact quarter turns
+/// are special-cased so 90/270 degrees swap width and height without floating-point
+/// residue. For other angles, the absolute sine/cosine projection gives the
+/// conservative axis-aligned bounding box of the rotated rectangle.
+fn oriented_pad_extents(width: f64, height: f64, rotation_deg: f64) -> (f64, f64) {
+    if !rotation_deg.is_finite() {
+        return (width, height);
+    }
+    let quarter_turns = (rotation_deg / 90.0).round();
+    if (rotation_deg - quarter_turns * 90.0).abs() <= 1e-9 {
+        if (quarter_turns as i64).rem_euclid(2) == 1 {
+            return (height, width);
+        }
+        return (width, height);
+    }
+
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    (width * cos + height * sin, width * sin + height * cos)
 }
 
 /// Parse a Specctra DSN document into a [`SimpleRouteJson`] plus [`ParseStats`].
@@ -876,15 +926,24 @@ fn parse_bounds(structure: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<Bounds
     })
 }
 
+/// First valid direct property named `property` across all direct `(rule ...)`
+/// blocks at one scope. File order is retained, preserving the historical
+/// first-declaration behavior while allowing width and clearance to live in
+/// separate blocks.
+fn parse_rule_property(node: &Sexpr, property: &str, to_mm: &impl Fn(f64) -> f64) -> Option<f64> {
+    node.children_named("rule").find_map(|rule| {
+        rule.children_named(property).find_map(|value| {
+            let raw = value.as_list()?.get(1)?.as_atom()?.parse::<f64>().ok()?;
+            Some(to_mm(raw))
+        })
+    })
+}
+
 /// First `(rule (width N))` found at structure or pcb level, converted to mm.
+/// Structure scope wins per property; pcb scope is only a fallback.
 fn parse_rule_width(pcb: &Sexpr, structure: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Option<f64> {
-    let find = |node: &Sexpr| -> Option<f64> {
-        let rule = node.child_named("rule")?;
-        let width = rule.child_named("width")?;
-        let raw = width.as_list()?.get(1)?.as_atom()?.parse::<f64>().ok()?;
-        Some(to_mm(raw))
-    };
-    find(structure).or_else(|| find(pcb))
+    parse_rule_property(structure, "width", to_mm)
+        .or_else(|| parse_rule_property(pcb, "width", to_mm))
 }
 
 /// First `(rule (clearance N))` found at structure or pcb level, converted to mm.
@@ -897,18 +956,8 @@ fn parse_rule_clearance(
     structure: &Sexpr,
     to_mm: &impl Fn(f64) -> f64,
 ) -> Option<f64> {
-    let find = |node: &Sexpr| -> Option<f64> {
-        let rule = node.child_named("rule")?;
-        let clearance = rule.child_named("clearance")?;
-        let raw = clearance
-            .as_list()?
-            .get(1)?
-            .as_atom()?
-            .parse::<f64>()
-            .ok()?;
-        Some(to_mm(raw))
-    };
-    find(structure).or_else(|| find(pcb))
+    parse_rule_property(structure, "clearance", to_mm)
+        .or_else(|| parse_rule_property(pcb, "clearance", to_mm))
 }
 
 /// The layer atom named by a `(circle LAYER ...)` / `(rect LAYER ...)` shape.
@@ -922,8 +971,10 @@ fn shape_layer(shape_inner: &Sexpr) -> Option<String> {
 
 /// Padstack name -> representative pad size (mm) + the layers it touches.
 ///
-/// Size uses the first sizeable shape found. Layers are the set of distinct layer
-/// names across ALL of the padstack's shapes, in file order: an SMD padstack names
+/// Size is the conservative component-wise maximum over every sizeable shape.
+/// A padstack may have a larger annulus on one copper layer than another; taking
+/// only the first shape would leave real copper routable. Layers are the set of
+/// distinct layer names across all shapes, in file order: an SMD padstack names
 /// one layer, a through-hole padstack names every signal layer (or a `signal` /
 /// `*` wildcard). Wildcards are recorded verbatim and expanded at emit time.
 fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<String, PadSize>> {
@@ -938,7 +989,7 @@ fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<S
             Some(n) => n.to_string(),
             None => continue,
         };
-        // Find the first sizeable shape, and collect every shape's layer name.
+        // Conservatively bound every shape, and collect every shape's layer name.
         let mut size: Option<(f64, f64)> = None;
         let mut layers: Vec<String> = Vec::new();
         for shape in ps.children_named("shape") {
@@ -949,19 +1000,18 @@ fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<S
                         layers.push(layer);
                     }
                 }
-                if size.is_none() {
-                    let nums: Vec<f64> = circle
-                        .as_list()
-                        .unwrap()
-                        .iter()
-                        .skip(2)
-                        .filter_map(|n| n.as_atom())
-                        .filter_map(|s| s.parse::<f64>().ok())
-                        .collect();
-                    if let Some(&dia) = nums.first() {
-                        let d = to_mm(dia);
-                        size = Some((d, d));
-                    }
+                let nums: Vec<f64> = circle
+                    .as_list()
+                    .unwrap()
+                    .iter()
+                    .skip(2)
+                    .filter_map(|n| n.as_atom())
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if let Some(&dia) = nums.first() {
+                    let d = to_mm(dia).abs();
+                    let (w, h) = size.unwrap_or((0.0, 0.0));
+                    size = Some((w.max(d), h.max(d)));
                 }
             } else if let Some(rect) = shape.child_named("rect") {
                 // (rect LAYER x1 y1 x2 y2).
@@ -970,20 +1020,19 @@ fn parse_padstacks(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<S
                         layers.push(layer);
                     }
                 }
-                if size.is_none() {
-                    let nums: Vec<f64> = rect
-                        .as_list()
-                        .unwrap()
-                        .iter()
-                        .skip(2)
-                        .filter_map(|n| n.as_atom())
-                        .filter_map(|s| s.parse::<f64>().ok())
-                        .collect();
-                    if nums.len() >= 4 {
-                        let w = to_mm((nums[2] - nums[0]).abs());
-                        let h = to_mm((nums[3] - nums[1]).abs());
-                        size = Some((w, h));
-                    }
+                let nums: Vec<f64> = rect
+                    .as_list()
+                    .unwrap()
+                    .iter()
+                    .skip(2)
+                    .filter_map(|n| n.as_atom())
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if nums.len() >= 4 {
+                    let shape_w = to_mm((nums[2] - nums[0]).abs());
+                    let shape_h = to_mm((nums[3] - nums[1]).abs());
+                    let (w, h) = size.unwrap_or((0.0, 0.0));
+                    size = Some((w.max(shape_w), h.max(shape_h)));
                 }
             }
         }
@@ -1039,11 +1088,19 @@ fn parse_images(pcb: &Sexpr, to_mm: &impl Fn(f64) -> f64) -> Result<HashMap<Stri
                 Err(_) => continue,
             };
             let id = atoms[n - 3].to_string();
+            let rotation = pin
+                .child_named("rotate")
+                .and_then(|rotate| rotate.as_list())
+                .and_then(|items| items.get(1))
+                .and_then(|item| item.as_atom())
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .unwrap_or(0.0);
             image.pins.push(ImagePin {
                 id,
                 off_x: to_mm(relx),
                 off_y: to_mm(rely),
                 padstack,
+                rotation,
             });
         }
         images.insert(id, image);
@@ -1223,6 +1280,38 @@ mod tests {
     }
 
     #[test]
+    fn sexpr_parser_rejects_trailing_and_unmatched_input() {
+        for invalid in ["(a) trailing", "(a) (b)", "(a))", "(a", ")"] {
+            assert!(
+                parse_sexpr(invalid).is_err(),
+                "strict full-document parse must reject {invalid:?}"
+            );
+        }
+        assert_eq!(
+            parse_sexpr("(a (b c))").unwrap().head(),
+            Some("a"),
+            "control document remains valid"
+        );
+    }
+
+    #[test]
+    fn resolution_divisor_must_be_positive_and_finite() {
+        for divisor in ["0", "-1", "NaN", "inf", "-inf"] {
+            let dsn = format!(
+                r#"(pcb "bad-resolution"
+                    (resolution mm {divisor})
+                    (structure
+                      (layer F.Cu (type signal))
+                      (boundary (rect pcb 0 0 1000 1000))))"#
+            );
+            assert!(
+                dsn_to_ingest(&dsn).is_err(),
+                "resolution divisor {divisor} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn split_ref_pin_uses_last_dash() {
         assert_eq!(
             split_ref_pin("C1-2"),
@@ -1370,6 +1459,114 @@ mod tests {
         let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
         assert_eq!(srj.min_clearance, Some(0.20));
         assert_eq!(stats.min_clearance_mm, 0.20);
+    }
+
+    #[test]
+    fn aggregates_multiple_rule_blocks_with_per_property_scope_precedence() {
+        // Each property is resolved independently. A structure-level declaration
+        // wins over pcb-level fallback even when width and clearance live in
+        // separate structure rule blocks.
+        let dsn = r#"
+        (pcb "rules.dsn"
+          (resolution mm 1000)
+          (rule (width 100) (clearance 300))
+          (structure
+            (layer F.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (rule (clearance 200))
+            (rule (width 150))
+          )
+        )
+        "#;
+        let (srj, stats) = dsn_to_srj_with_stats(dsn).unwrap();
+        assert_eq!(srj.min_trace_width, Some(0.15));
+        assert_eq!(srj.min_clearance, Some(0.20));
+        assert_eq!(stats.min_trace_width_mm, 0.15);
+        assert_eq!(stats.min_clearance_mm, 0.20);
+    }
+
+    #[test]
+    fn asymmetric_pad_geometry_handles_quarter_turns_and_arbitrary_angles() {
+        let dsn = r#"
+        (pcb "rotated-pads.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000)))
+          (placement
+            (component "plain"
+              (place R0 1000 1000 front 0)
+              (place R90 3000 1000 front 90)
+              (place R180 5000 1000 front 180)
+              (place R270 7000 1000 front 270)
+              (place R45 9000 1000 front 45))
+            (component "pin-rotated"
+              (place P90 3000 4000 front 0)
+              (place P270 7000 4000 front 180))
+            (component "back-pin-rotated"
+              (place B45 5000 7000 back 60)))
+          (library
+            (image "plain" (pin "asym" 1 0 0))
+            (image "pin-rotated" (pin "asym" (rotate 90) 1 0 0))
+            (image "back-pin-rotated" (pin "asym" (rotate 15) 1 0 0))
+            (padstack "asym" (shape (rect F.Cu -1000 -250 1000 250))))
+          (network)
+        )
+        "#;
+        let srj = dsn_to_srj(dsn).unwrap();
+        let dims = |id: &str| {
+            let obstacle = srj
+                .obstacles
+                .iter()
+                .find(|o| o.connected_to == vec![format!("{id}-1")])
+                .unwrap_or_else(|| panic!("missing {id}-1"));
+            (obstacle.width, obstacle.height)
+        };
+        assert_eq!(dims("R0"), (2.0, 0.5));
+        assert_eq!(dims("R180"), (2.0, 0.5));
+        assert_eq!(dims("R90"), (0.5, 2.0));
+        assert_eq!(dims("R270"), (0.5, 2.0));
+        assert_eq!(dims("P90"), (0.5, 2.0), "pin-local rotate must apply");
+        assert_eq!(
+            dims("P270"),
+            (0.5, 2.0),
+            "pin + placement rotation must compose"
+        );
+
+        let expected_45 = 2.5 / 2.0_f64.sqrt();
+        for id in ["R45", "B45"] {
+            let (width, height) = dims(id);
+            assert!(
+                (width - expected_45).abs() < 1e-12
+                    && (height - expected_45).abs() < 1e-12,
+                "{id} 45-degree AABB = ({width}, {height}), expected ({expected_45}, {expected_45})"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_shape_padstack_uses_conservative_maximum_extents() {
+        let dsn = r#"
+        (pcb "multi-shape.dsn"
+          (resolution mm 1000)
+          (structure
+            (layer F.Cu (type signal))
+            (layer B.Cu (type signal))
+            (boundary (rect pcb 0 0 10000 10000)))
+          (placement (component "part" (place U1 5000 5000 front 0)))
+          (library
+            (image "part" (pin "stack" 1 0 0))
+            (padstack "stack"
+              (shape (rect F.Cu -500 -250 500 250))
+              (shape (circle B.Cu 3000))))
+          (network)
+        )
+        "#;
+        let srj = dsn_to_srj(dsn).unwrap();
+        assert_eq!(srj.obstacles.len(), 1);
+        let pad = &srj.obstacles[0];
+        assert_eq!((pad.width, pad.height), (3.0, 3.0));
+        assert_eq!(pad.layers, vec!["F.Cu", "B.Cu"]);
     }
 
     #[test]

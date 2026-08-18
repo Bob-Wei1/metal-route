@@ -40,13 +40,20 @@
 //! the returned [`BoardRoute`] cell-disjoint across groups even if negotiation did
 //! not fully settle. The router NEVER loops unbounded.
 
-use std::collections::HashMap;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
 use mr_core::{
-    BoardRoute, CandidateEval, CellIdx, Cost, Grid, GridCoords, IterSnapshot, LegalizationTrace,
-    NetEndpoints, RouteResult, RouteTrace, Router, RouterError, TracedNet, ViaModel, OBSTACLE,
+    BoardRoute, CandidateEval, CellIdx, Cost, Dims, Grid, GridCoords, IterSnapshot,
+    LegalizationTrace, NetEndpoints, RouteResult, RouteTrace, Router, RouterError, TracedNet,
+    ViaModel, OBSTACLE,
 };
 
 use crate::dijkstra::{astar_buf, edge_cost, SearchBuf, COST_SCALE};
@@ -103,6 +110,19 @@ pub const MAX_ITERS: u32 = 60;
 /// (index-ordered merge) regardless of net count.
 const PARALLEL_NEGOTIATION_THRESHOLD: usize = 16;
 
+/// Bounded deterministic portfolio: grouped medium-sized boards receive one
+/// additional all-serial negotiation candidate. Tiny boards already use serial
+/// negotiation, while both a net-count bound and an unconditional cell-count bound
+/// prevent the fallback from turning a difficult route into a latency multiplier.
+const PORTFOLIO_MIN_NETS: usize = PARALLEL_NEGOTIATION_THRESHOLD + 1;
+const PORTFOLIO_MAX_NETS: usize = 179;
+const PORTFOLIO_CELL_CAP: usize = 250_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NegotiationMode {
+    Adaptive,
+    ForceSerial,
+}
 
 /// Bounded rip-up-and-reroute budget multipliers (see [`ripup_legalize`]). The
 /// global budget caps the total number of rip-up operations; the per-net cap
@@ -115,22 +135,35 @@ const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
 type Committed = Vec<Option<Vec<CellIdx>>>;
 
-/// A rectangular search window in cell coordinates (inclusive bounds). The
-/// per-net A* search is restricted to this box so the explored area scales with a
-/// net's local region instead of the whole board — the dominant speedup for the
-/// local nets of a bed-of-nails board. A full-board window covers `0..w, 0..h`.
-#[derive(Clone, Copy)]
-struct Window {
-    x0: u32,
-    y0: u32,
-    x1: u32,
-    y1: u32,
+/// Clearance-map sentinels. A single-owner cell can be ignored by that owner;
+/// a mixed cell is covered by two or more groups and is therefore foreign to
+/// every group. Rebuilding the map after a rip recovers the precise remaining
+/// owner when one side of an overlap disappears.
+const HALO_FREE: i64 = -1;
+const HALO_MIXED: i64 = -2;
+
+#[inline]
+fn halo_is_foreign(value: i64, own_group: i64) -> bool {
+    value == HALO_MIXED || (value >= 0 && value != own_group)
 }
 
-impl Window {
+/// Inclusive planar search rectangle for one isolated-net request.
+///
+/// The same rectangle applies on every layer. A provider must first solve inside
+/// this normal per-net window, then retry the full board only when that solve is
+/// unreachable; see [`IsolatedRouteProvider`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolatedRouteWindow {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl IsolatedRouteWindow {
     /// The whole board.
-    fn full(dims: mr_core::Dims) -> Self {
-        Window {
+    pub fn full(dims: Dims) -> Self {
+        Self {
             x0: 0,
             y0: 0,
             x1: dims.w.saturating_sub(1),
@@ -145,6 +178,49 @@ impl Window {
         x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
 }
+
+/// Borrowed, already-rounded static inputs for a batch of isolated-net solves.
+///
+/// `x_edge_costs[k]` and `y_edge_costs[k]` price the planar gaps `k <-> k+1`;
+/// their lengths are `w-1` and `h-1`. `via_edge_costs[k]` prices adjacent layer
+/// transition `k <-> k+1`, with `None` forbidding it, and has length `layers-1`.
+/// Providers multiply these edge prices by the destination cell's enter weight,
+/// applying the same own-pad obstacle override and `OBSTACLE - 1` step cap as the
+/// CPU isolated search.
+#[derive(Debug, Clone, Copy)]
+pub struct IsolatedRouteRequest<'a> {
+    pub grid: &'a Grid,
+    pub nets: &'a [NetEndpoints],
+    pub windows: &'a [IsolatedRouteWindow],
+    pub x_edge_costs: &'a [Cost],
+    pub y_edge_costs: &'a [Cost],
+    pub via_edge_costs: &'a [Option<Cost>],
+}
+
+/// Dependency-inverted accelerator for NegotiatedRouter's independent
+/// "route each net alone" batch.
+///
+/// This is a **trusted canonical-path contract**. For every input net, the provider
+/// must return exactly the path selected by the CPU isolated search under labels
+/// `(search cost, minimum hops, lower predecessor cell)`: solve in the supplied
+/// normal window first, and retry on the full board only when the windowed solve is
+/// unreachable. `None` means unreachable even after that retry. Results are aligned
+/// with `request.nets` and the operation is all-or-error.
+///
+/// The router defensively checks batch shape and basic path legality, but those
+/// checks cannot prove optimality, canonical tie-breaking, or that a full-board
+/// path was used only after window failure. Any provider error or detectable invalid
+/// entry discards the **entire** batch and transparently reruns every isolated search
+/// on the CPU; no partial provider result is ever mixed with CPU results.
+pub trait IsolatedRouteProvider {
+    /// Solve the aligned isolated-net batch described by `request`.
+    fn route_isolated_batch(
+        &self,
+        request: IsolatedRouteRequest<'_>,
+    ) -> Result<Vec<Option<Vec<CellIdx>>>, RouterError>;
+}
+
+type Window = IsolatedRouteWindow;
 
 /// Build the per-net search window: the bounding box of `{src, dst}` plus every
 /// cell in `pads` (the net's own passable pads must be reachable), expanded by a
@@ -216,6 +292,108 @@ impl PadSet {
     }
 }
 
+/// Reusable per-cell multiplicity map with O(1) logical reset.
+///
+/// A clearance footprint deliberately visits cells more than once when halos from
+/// several path segments overlap. Jacobi negotiation must subtract the current
+/// net's exact old multiplicity from the shared `present_halo` snapshot; a Boolean
+/// membership set would leave residual self-cost. Generation stamps avoid an
+/// O(n_cells) clear for every net search.
+struct CountedCellSet {
+    count: Vec<u32>,
+    stamp: Vec<u32>,
+    gen: u32,
+}
+
+/// Per-thread scratch for snapshot-based Jacobi negotiation. The eight full-grid
+/// `u32` planes are lazily allocated only on threads that execute a search, then
+/// reused across iterations and concurrent routes on the same Rayon worker.
+struct JacobiScratch {
+    cells: usize,
+    buf: SearchBuf,
+    pad_set: PadSet,
+    own_path: PadSet,
+    own_halo: CountedCellSet,
+}
+
+impl JacobiScratch {
+    fn new(n_cells: usize) -> Self {
+        Self {
+            cells: n_cells,
+            buf: SearchBuf::new(n_cells),
+            pad_set: PadSet::new(n_cells),
+            own_path: PadSet::new(n_cells),
+            own_halo: CountedCellSet::new(n_cells),
+        }
+    }
+}
+
+thread_local! {
+    /// At most one Jacobi scratch allocation per live execution thread. In
+    /// particular, nested corpus `par_iter` routes do not each eagerly allocate a
+    /// full inner pool: all concurrent routes collectively use at most one slot per
+    /// Rayon worker, sized to the largest board that worker has processed.
+    static JACOBI_SCRATCH: RefCell<Option<JacobiScratch>> = const { RefCell::new(None) };
+}
+
+fn with_jacobi_scratch<R>(
+    n_cells: usize,
+    on_allocate: impl FnOnce(),
+    use_scratch: impl FnOnce(&mut JacobiScratch) -> R,
+) -> R {
+    JACOBI_SCRATCH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_none_or(|scratch| scratch.cells < n_cells) {
+            on_allocate();
+            *slot = Some(JacobiScratch::new(n_cells));
+        }
+        use_scratch(slot.as_mut().expect("Jacobi scratch was initialized"))
+    })
+}
+
+impl CountedCellSet {
+    fn new(n: usize) -> Self {
+        Self {
+            count: vec![0; n],
+            stamp: vec![0; n],
+            gen: 0,
+        }
+    }
+
+    /// Logically clear the map in O(1). On generation wrap, reset only the stamps;
+    /// stale counts remain harmless until their cell is stamped again.
+    fn clear(&mut self) {
+        match self.gen.checked_add(1) {
+            Some(g) => self.gen = g,
+            None => {
+                self.stamp.fill(0);
+                self.gen = 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn increment(&mut self, c: CellIdx) {
+        let ci = c as usize;
+        if self.stamp[ci] == self.gen {
+            self.count[ci] = self.count[ci].saturating_add(1);
+        } else {
+            self.stamp[ci] = self.gen;
+            self.count[ci] = 1;
+        }
+    }
+
+    #[inline]
+    fn count(&self, c: CellIdx) -> u32 {
+        let ci = c as usize;
+        if self.stamp[ci] == self.gen {
+            self.count[ci]
+        } else {
+            0
+        }
+    }
+}
+
 /// PathFinder-style negotiated-congestion router. Default multi-net backend.
 ///
 /// `via_model` gates and prices layer changes. When `None` (the default), a
@@ -251,6 +429,22 @@ pub struct NegotiatedRouter {
     /// non-uniform / Hanan grid the geometric distance is what keeps real
     /// copper-to-copper spacing (a cell count there spans a variable physical width).
     clearance_mm: f64,
+    #[cfg(test)]
+    jacobi_scratch_probe: Option<std::sync::Arc<AtomicUsize>>,
+}
+
+/// Lightweight result of a negotiated route with the isolation diagnosis the
+/// router already computes for legalization.
+///
+/// `alone_routable[i]` is aligned with the input `nets[i]` and is true exactly
+/// when that net can route by itself on the base grid using this router's geometry
+/// and via model. Unlike [`RouteTrace`], this carries no paths or per-iteration
+/// snapshots, so callers can classify failed nets without rerunning searches or
+/// paying visualisation-trace memory costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiatedOutcome {
+    pub board: BoardRoute,
+    pub alone_routable: Vec<bool>,
 }
 
 impl NegotiatedRouter {
@@ -259,7 +453,15 @@ impl NegotiatedRouter {
             via_model: None,
             coords: None,
             clearance_mm: 0.0,
+            #[cfg(test)]
+            jacobi_scratch_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_jacobi_scratch_probe(mut self, probe: std::sync::Arc<AtomicUsize>) -> Self {
+        self.jacobi_scratch_probe = Some(probe);
+        self
     }
 
     /// Use an explicit [`ViaModel`] (e.g. a blind/buried stackup) instead of the
@@ -311,12 +513,196 @@ fn group_of(name: &str) -> &str {
     }
 }
 
-/// Cost of a path on the ORIGINAL unit grid: number of steps (cells excluding the
-/// source), matching how [`LeeRouter`](crate::LeeRouter) and
-/// [`RipUpRouter`](crate::RipUpRouter) report cost. Never the inflated congestion
-/// price.
+/// Dense deterministic connection groups used by legalization and route traces.
+///
+/// Name-related sub-nets share a group, as do separately named edges meeting at
+/// the same endpoint cell. Keeping this construction in one place ensures both
+/// routing variants apply identical electrical ownership semantics.
+fn connection_group_ids(nets: &[NetEndpoints]) -> Vec<usize> {
+    let n_nets = nets.len();
+    let mut group_ids = vec![0; n_nets];
+    let mut parent: Vec<usize> = (0..n_nets).collect();
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut child = x;
+        while parent[child] != root {
+            let next = parent[child];
+            parent[child] = root;
+            child = next;
+        }
+        root
+    }
+
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            // Union toward the lower index for deterministic roots.
+            if ra < rb {
+                parent[rb] = ra;
+            } else {
+                parent[ra] = rb;
+            }
+        }
+    };
+
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for (i, net) in nets.iter().enumerate() {
+        match by_name.get(group_of(&net.net)) {
+            Some(&j) => union(&mut parent, i, j),
+            None => {
+                by_name.insert(group_of(&net.net), i);
+            }
+        }
+    }
+
+    let mut by_cell: HashMap<CellIdx, usize> = HashMap::new();
+    for (i, net) in nets.iter().enumerate() {
+        for &cell in &[net.src, net.dst] {
+            match by_cell.get(&cell) {
+                Some(&j) => union(&mut parent, i, j),
+                None => {
+                    by_cell.insert(cell, i);
+                }
+            }
+        }
+    }
+
+    // Intern roots by first appearance, yielding dense stable ids.
+    let mut root_to_group: HashMap<usize, usize> = HashMap::new();
+    for (i, group_id) in group_ids.iter_mut().enumerate() {
+        let root = find(&mut parent, i);
+        let next = root_to_group.len();
+        *group_id = *root_to_group.entry(root).or_insert(next);
+    }
+    group_ids
+}
+
+/// Whether the input explicitly contains multiple routed segments of one named
+/// connection. Shared endpoint cells also merge electrical groups during
+/// legalization, but are deliberately not a portfolio trigger: unrelated fixtures
+/// can quantize endpoints onto the same coarse cell, and treating that coincidence
+/// as a retry signal would broaden the bounded cohort substantially.
+fn has_named_subnet_group(nets: &[NetEndpoints]) -> bool {
+    let mut seen = HashMap::new();
+    nets.iter()
+        .any(|net| seen.insert(group_of(&net.net), ()).is_some())
+}
+
+fn should_try_serial_candidate(
+    dims: Dims,
+    n_nets: usize,
+    has_named_group: bool,
+    primary: &BoardRoute,
+) -> bool {
+    debug_assert!(primary.results.len() <= n_nets);
+    (PORTFOLIO_MIN_NETS..=PORTFOLIO_MAX_NETS).contains(&n_nets)
+        && has_named_group
+        && dims.len() <= PORTFOLIO_CELL_CAP
+}
+
+/// More routed nets wins; for equal completion, lower caller-grid cost wins. An
+/// exact tie deliberately keeps the primary candidate to minimize route churn.
+fn serial_candidate_is_better(primary: &BoardRoute, serial: &BoardRoute) -> bool {
+    serial.results.len() > primary.results.len()
+        || (serial.results.len() == primary.results.len()
+            && serial.total_cost() < primary.total_cost())
+}
+
+fn empty_route_trace(dims: Dims) -> RouteTrace {
+    RouteTrace {
+        dims,
+        nets: Vec::new(),
+        n_groups: 0,
+        iterations: Vec::new(),
+        legalization: None,
+    }
+}
+
+/// Cell-hop length used only as an internal deterministic legalization/rip-up
+/// difficulty metric. Public `RouteResult::cost` is computed by [`grid_path_cost`]
+/// and honors the caller's weighted grid.
 fn unit_cost(path: &[CellIdx]) -> Cost {
     path.len().saturating_sub(1) as Cost
+}
+
+/// Contract cost of a committed path on the caller's grid.  Ordinary passable
+/// cells retain their configured weight; an obstacle explicitly owned by this
+/// net through `passable_pads` is unmasked at the canonical free-cell cost `1`.
+fn grid_path_cost(grid: &Grid, net: &NetEndpoints, path: &[CellIdx]) -> Cost {
+    path.iter().skip(1).fold(0, |acc, &c| {
+        let step = if grid.is_obstacle(c) && net.passable_pads.contains(&c) {
+            1
+        } else {
+            grid.cost_at(c)
+        };
+        acc.saturating_add(step)
+    })
+}
+
+/// Sum the public per-net grid costs for one legalization candidate without
+/// collapsing distinct large candidates at the [`Cost`] ceiling.
+fn committed_grid_cost(grid: &Grid, nets: &[NetEndpoints], committed: &Committed) -> u64 {
+    committed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, path)| {
+            path.as_ref()
+                .map(|path| grid_path_cost(grid, &nets[i], path) as u64)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+#[inline]
+fn legalization_candidate_is_better(
+    routed: usize,
+    total_cost: u64,
+    order: &[usize],
+    best_routed: usize,
+    best_cost: u64,
+    best_order: &[usize],
+) -> bool {
+    routed > best_routed
+        || (routed == best_routed && total_cost < best_cost)
+        || (routed == best_routed && total_cost == best_cost && order < best_order)
+}
+
+/// Convert a computed passable step price into the `u32` search domain without
+/// producing [`OBSTACLE`], which `astar_buf` reserves as its unreachable sentinel.
+#[inline]
+fn passable_search_cost(cost: u64) -> Cost {
+    cost.min((OBSTACLE - 1) as u64) as Cost
+}
+
+/// Prefix sums of the exact per-gap fixed-point costs used by the A* heuristic.
+///
+/// A route can evaluate its heuristic millions of times. Walking every intervening
+/// grid-line gap for each evaluation makes a Hanan-grid heuristic O(axis distance)
+/// per heap operation. These prefixes preserve that exact sum in O(1). `u64` is
+/// sufficient for the unsaturated sum: an axis has at most `u32::MAX - 1` gaps and
+/// every gap costs at most `u32::MAX`, whose product is below `u64::MAX`.
+struct ManhattanCosts {
+    x_prefix: Vec<u64>,
+    y_prefix: Vec<u64>,
+}
+
+impl ManhattanCosts {
+    fn new(dims: Dims, coords: &GridCoords) -> Self {
+        Self {
+            x_prefix: axis_cost_prefix(&coords.x_lines, dims.w),
+            y_prefix: axis_cost_prefix(&coords.y_lines, dims.h),
+        }
+    }
+}
+
+#[inline]
+fn axis_gap_cost(lines: &[f64], k: u32) -> Cost {
+    let a = lines.get(k as usize).copied().unwrap_or(k as f64);
+    let b = lines.get(k as usize + 1).copied().unwrap_or((k + 1) as f64);
+    edge_cost((b - a).abs())
 }
 
 /// Lower bound on the planar A* cost between two cells in fixed-point [`Cost`] units,
@@ -332,8 +718,7 @@ fn unit_cost(path: &[CellIdx]) -> Cost {
 ///
 /// The previous form `edge_cost(manhattan_len(a, b)) = round(COST_SCALE * Σ_axis Δ)`
 /// rounds the AGGREGATE length once. Because `round(Σ x_i)` can exceed `Σ round(x_i)`
-/// (round-of-sum > sum-of-rounds — e.g. two gaps of `1.5/16` each round to `0`, but
-/// their sum `3/16` rounds to `0`… and conversely `0.5/16` twice rounds to `0+0=0`
+/// (round-of-sum > sum-of-rounds — e.g. `0.5/16` twice rounds per gap to `0+0=0`
 /// while their sum `1/16` rounds to `1`), the old heuristic could OVERESTIMATE the
 /// per-step total the search actually pays on non-integer line spacings, making A*
 /// inadmissible and letting `astar_buf`'s "break on pop dst" return a non-optimal path.
@@ -353,58 +738,190 @@ fn unit_cost(path: &[CellIdx]) -> Cost {
 /// only opens on non-integer spacings). The layer term is always 0 on a single-layer
 /// grid.
 fn manhattan_scaled(
-    dims: mr_core::Dims,
-    coords: &GridCoords,
+    dims: Dims,
+    costs: &ManhattanCosts,
     a: CellIdx,
     b: CellIdx,
     min_via_cost: Cost,
 ) -> Cost {
     let (ax, ay) = dims.xy(a);
     let (bx, by) = dims.xy(b);
-    let planar = axis_leg_cost(&coords.x_lines, ax, bx)
-        .saturating_add(axis_leg_cost(&coords.y_lines, ay, by));
+    let planar = axis_leg_cost(&costs.x_prefix, ax, bx).saturating_add(axis_leg_cost(
+        &costs.y_prefix,
+        ay,
+        by,
+    ));
     let dl = dims.layer_of(a).abs_diff(dims.layer_of(b));
     planar.saturating_add(dl.saturating_mul(min_via_cost))
 }
 
-/// Sum of per-gap `edge_cost`s along one axis from line index `i` to line index `j`
-/// (order-independent) — i.e. `Σ edge_cost(|lines[k+1] - lines[k]|)` over every adjacent
-/// line gap strictly between the two indices. This is precisely the base cost the search
-/// accrues stepping straight along that axis, the per-step rounding the aggregate-length
-/// heuristic failed to account for. Out-of-range / mismatched indices fall back to unit
-/// spacing via [`GridCoords::x_of`]-style `.get(...).unwrap_or` semantics, mirrored here
-/// so a coords/grid size mismatch degrades to uniform pricing rather than panicking.
-#[inline]
-fn axis_leg_cost(lines: &[f64], i: u32, j: u32) -> Cost {
-    let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
-    let mut total: Cost = 0;
-    for k in lo..hi {
-        let a = lines.get(k as usize).copied().unwrap_or(k as f64);
-        let b = lines.get(k as usize + 1).copied().unwrap_or((k + 1) as f64);
-        total = total.saturating_add(edge_cost((b - a).abs()));
+/// Build exact unsaturated prefix sums of per-gap `edge_cost`s for one axis.
+///
+/// Short/mismatched coordinate arrays deliberately use the same index-as-position
+/// fallback as [`GridCoords::x_of`], so malformed geometry retains the previous
+/// robust unit-spacing behavior rather than panicking.
+fn axis_cost_prefix(lines: &[f64], count: u32) -> Vec<u64> {
+    let mut prefix = Vec::with_capacity((count as usize).max(1));
+    prefix.push(0);
+    for k in 0..count.saturating_sub(1) {
+        let next = prefix[prefix.len() - 1] + axis_gap_cost(lines, k) as u64;
+        prefix.push(next);
     }
-    total
+    prefix
+}
+
+fn axis_edge_costs(lines: &[f64], count: u32) -> Vec<Cost> {
+    (0..count.saturating_sub(1))
+        .map(|k| axis_gap_cost(lines, k))
+        .collect()
+}
+
+/// Exact per-gap interval sum from a precomputed prefix, with the same `Cost`
+/// saturation as repeated [`Cost::saturating_add`]. Callers pass in-bounds cell
+/// coordinates, so both prefix indices exist even for short coordinate arrays.
+#[inline]
+fn axis_leg_cost(prefix: &[u64], i: u32, j: u32) -> Cost {
+    let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+    let total = prefix[hi as usize] - prefix[lo as usize];
+    total.min(Cost::MAX as u64) as Cost
+}
+
+fn provider_path_is_valid(
+    grid: &Grid,
+    net: &NetEndpoints,
+    via_model: &ViaModel,
+    path: &[CellIdx],
+) -> bool {
+    let dims = grid.dims;
+    if path.is_empty()
+        || path.len() > dims.len()
+        || path.first() != Some(&net.src)
+        || path.last() != Some(&net.dst)
+    {
+        return false;
+    }
+
+    // Accelerator output is untrusted at this boundary. Large rasterized pads can
+    // contain many thousands of cells, so validating every obstacle step with a
+    // linear `Vec::contains` would make this defense-in-depth pass quadratic.
+    let passable_pads: HashSet<CellIdx> = net.passable_pads.iter().copied().collect();
+    let mut seen = HashSet::with_capacity(path.len());
+    for &cell in path {
+        if !dims.contains(cell)
+            || (grid.is_obstacle(cell) && !passable_pads.contains(&cell))
+            || !seen.insert(cell)
+        {
+            return false;
+        }
+    }
+
+    path.windows(2).all(|step| {
+        let (ax, ay, al) = dims.xyz(step[0]);
+        let (bx, by, bl) = dims.xyz(step[1]);
+        if al == bl {
+            (ax.abs_diff(bx) == 1 && ay == by) || (ay.abs_diff(by) == 1 && ax == bx)
+        } else {
+            ax == bx && ay == by && via_model.is_step_legal(al, bl)
+        }
+    })
+}
+
+/// Invoke one trusted provider batch and defensively validate its shape and paths.
+/// `None` means either no usable provider result or invalid routing input; the normal
+/// route variant then performs its existing validation and CPU isolated searches.
+fn provider_alone_paths(
+    router: &NegotiatedRouter,
+    grid: &Grid,
+    nets: &[NetEndpoints],
+    provider: &dyn IsolatedRouteProvider,
+) -> Option<Vec<Vec<CellIdx>>> {
+    if !grid.is_well_formed() {
+        return None;
+    }
+    let dims = grid.dims;
+    for net in nets {
+        if net.passable_pads.iter().any(|&cell| !dims.contains(cell))
+            || !dims.contains(net.src)
+            || !dims.contains(net.dst)
+            || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
+            || (grid.is_obstacle(net.dst) && !net.passable_pads.contains(&net.dst))
+        {
+            return None;
+        }
+    }
+
+    let via_model = router
+        .via_model
+        .clone()
+        .unwrap_or_else(|| ViaModel::through_hole(dims.layers));
+    let coords = router
+        .coords
+        .clone()
+        .unwrap_or_else(|| GridCoords::uniform(dims));
+    let windows: Vec<IsolatedRouteWindow> = nets
+        .iter()
+        .map(|net| net_window(dims, net.src, net.dst, &net.passable_pads))
+        .collect();
+    let x_edge_costs = axis_edge_costs(&coords.x_lines, dims.w);
+    let y_edge_costs = axis_edge_costs(&coords.y_lines, dims.h);
+    let via_edge_costs: Vec<Option<Cost>> = (0..dims.layers.saturating_sub(1))
+        .map(|layer| {
+            via_model
+                .is_step_legal(layer, layer + 1)
+                .then_some(via_model.step_cost)
+        })
+        .collect();
+
+    let provided = provider
+        .route_isolated_batch(IsolatedRouteRequest {
+            grid,
+            nets,
+            windows: &windows,
+            x_edge_costs: &x_edge_costs,
+            y_edge_costs: &y_edge_costs,
+            via_edge_costs: &via_edge_costs,
+        })
+        .ok()?;
+    if provided.len() != nets.len() {
+        return None;
+    }
+
+    let mut paths = Vec::with_capacity(nets.len());
+    for (net, path) in nets.iter().zip(provided) {
+        match path {
+            Some(path) if provider_path_is_valid(grid, net, &via_model, &path) => paths.push(path),
+            Some(_) => return None,
+            None => paths.push(Vec::new()),
+        }
+    }
+    Some(paths)
 }
 
 impl NegotiatedRouter {
-    /// Route a board, optionally recording a [`RouteTrace`] for the visualiser.
+    /// Route one deterministic negotiation variant, optionally recording a
+    /// [`RouteTrace`] for the visualiser.
     ///
-    /// When `recorder` is `None` this is the production route and is BYTE-IDENTICAL
-    /// to the historical behaviour: every capture point below only *reads* loop
-    /// state (it never feeds a value back into the search), and all captures run on
-    /// the main thread between the rayon parallel sections, so the hot A* search is
-    /// never touched. The trait [`Router::route`] calls this with `None`;
-    /// [`NegotiatedRouter::route_traced`] calls it with `Some`.
-    fn route_impl(
+    /// Every capture point below only *reads* loop state (it never feeds a value
+    /// back into the search), and all captures run on the main thread between rayon
+    /// sections, so traced and untraced executions of this variant are identical.
+    fn route_variant(
         &self,
         grid: &Grid,
         nets: &[NetEndpoints],
+        group_ids: &[usize],
+        negotiation_mode: NegotiationMode,
+        provided_alone: Option<&[Vec<CellIdx>]>,
         mut recorder: Option<&mut RouteTrace>,
-    ) -> Result<BoardRoute, RouterError> {
+    ) -> Result<NegotiatedOutcome, RouterError> {
         if !grid.is_well_formed() {
             return Err(RouterError::MalformedGrid);
         }
         for net in nets {
+            if net.passable_pads.iter().any(|&c| !grid.dims.contains(c)) {
+                return Err(RouterError::InvalidEndpoint {
+                    net: net.net.clone(),
+                });
+            }
             // An endpoint is invalid only if out of bounds, or it sits on an
             // obstacle that is NOT one of this net's own (passable) pad cells.
             let endpoint_invalid = |c: CellIdx| {
@@ -420,6 +937,10 @@ impl NegotiatedRouter {
         let dims = grid.dims;
         let n_cells = dims.len();
         let n_nets = nets.len();
+        // Heuristic admissibility only needs to know whether a zero enter-cost
+        // exists. Compute this once per board; routing can invoke A* thousands of
+        // times, so scanning `grid.cost` inside each search is prohibitive.
+        let has_zero_cost = grid.cost.contains(&0);
 
         // Effective via model: the caller's, or a through-hole model over the grid's
         // layer count. On a single-layer grid it is inert (no via neighbours exist),
@@ -437,86 +958,16 @@ impl NegotiatedRouter {
             .coords
             .clone()
             .unwrap_or_else(|| GridCoords::uniform(dims));
+        // Exact per-axis fixed-point prefix sums make every A* heuristic lookup
+        // O(1), while preserving the former sum-of-rounded-gaps value exactly.
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
 
         // Reusable search workspace and own-pad membership set, sized once to the
         // board and reused across every per-net search (no per-net O(n) work).
         let mut buf = SearchBuf::new(n_cells);
         let mut pad_set = PadSet::new(n_cells);
 
-        // Connection group id per net. Cells owned by one group are HARD obstacles
-        // for every OTHER group during legalization, while a group's own sub-nets may
-        // share copper — so nets that must overlap have to live in the SAME group.
-        //
-        // Two effects union nets into one group:
-        //  1. NAME: sub-nets of one multi-point connection share a `group_of` key
-        //     (`<conn>#<seg>` -> `<conn>`), interned by first appearance.
-        //  2. GEOMETRY: nets that share an endpoint CELL (src or dst) are the same
-        //     electrical net meeting at a junction — e.g. the MST edges of a multi-pad
-        //     net, delivered as separately-named 2-point connections that touch at a
-        //     shared branch pad. Without merging them they are forced cell-disjoint and
-        //     the second edge cannot even start from the branch cell the first one
-        //     committed, abandoning a net that routes fine alone. On the non-uniform
-        //     Hanan grid every distinct pad coordinate gets its own grid line, so a
-        //     shared src/dst CELL means the points are identical — this can never fuse
-        //     two genuinely-distinct nets into a short.
-        let mut group_ids: Vec<usize> = vec![0; n_nets];
-        {
-            // Start from the name-based interning, then union by shared endpoint cell.
-            let mut parent: Vec<usize> = (0..n_nets).collect();
-            fn find(parent: &mut [usize], x: usize) -> usize {
-                let mut r = x;
-                while parent[r] != r {
-                    r = parent[r];
-                }
-                let mut c = x; // path-halving keeps repeated finds near-flat
-                while parent[c] != r {
-                    let next = parent[c];
-                    parent[c] = r;
-                    c = next;
-                }
-                r
-            }
-            let union = |parent: &mut [usize], a: usize, b: usize| {
-                let (ra, rb) = (find(parent, a), find(parent, b));
-                if ra != rb {
-                    // Union toward the lower index for deterministic roots.
-                    if ra < rb {
-                        parent[rb] = ra;
-                    } else {
-                        parent[ra] = rb;
-                    }
-                }
-            };
-            // (1) name groups.
-            let mut by_name: HashMap<&str, usize> = HashMap::new();
-            for (i, net) in nets.iter().enumerate() {
-                match by_name.get(group_of(&net.net)) {
-                    Some(&j) => union(&mut parent, i, j),
-                    None => {
-                        by_name.insert(group_of(&net.net), i);
-                    }
-                }
-            }
-            // (2) shared-endpoint-cell junctions.
-            let mut by_cell: HashMap<CellIdx, usize> = HashMap::new();
-            for (i, net) in nets.iter().enumerate() {
-                for &c in &[net.src, net.dst] {
-                    match by_cell.get(&c) {
-                        Some(&j) => union(&mut parent, i, j),
-                        None => {
-                            by_cell.insert(c, i);
-                        }
-                    }
-                }
-            }
-            // Dense group ids by first appearance of each union root (deterministic).
-            let mut root_to_g: HashMap<usize, usize> = HashMap::new();
-            for i in 0..n_nets {
-                let r = find(&mut parent, i);
-                let next = root_to_g.len();
-                group_ids[i] = *root_to_g.entry(r).or_insert(next);
-            }
-        }
+        debug_assert_eq!(group_ids.len(), n_nets);
 
         // TRACE: static board + per-net metadata, now that grouping is known. The
         // per-net `alone_path` is filled later (during legalization). No-op for the
@@ -540,14 +991,14 @@ impl NegotiatedRouter {
         // Persistent congestion state.
         let mut history: Vec<u32> = vec![0; n_cells];
         let mut present: Vec<u32> = vec![0; n_cells];
-        // Per-cell count of how many *other* nets' clearance footprints (planar
-        // clearance halo + via keepout) cover this cell — the negotiation analog of
-        // TritonRoute's `objCost`. Maintained EXACTLY parallel to `present`: when a
-        // net's path is removed from `present` its halo footprint is removed from
-        // `present_halo`, and when the new path is added to `present` its footprint is
-        // added here (see the inc/dec sites in the loop below, both via
-        // `for_each_halo_cell`). So during net i's search `present_halo` excludes net i
-        // = every OTHER net's clearance footprint, exactly like `present`. When
+        // Per-cell count of all currently routed nets' clearance footprints (planar
+        // clearance halo + via keepout) — the negotiation analog of TritonRoute's
+        // `objCost`. Maintained EXACTLY parallel to `present`: when a net's path is
+        // removed its halo footprint is removed, and when the new path is added its
+        // footprint is added here (both via `for_each_halo_cell`). Sequential search
+        // removes its old footprint in place; parallel Jacobi search subtracts its
+        // exact old multiplicity through a per-worker [`CountedCellSet`]. Thus net i
+        // prices only every OTHER net's clearance footprint. When
         // `clearance_cells == 0 && via_model.keepout_mm == 0.0` the footprint is empty so
         // this stays all-zero and contributes nothing (byte-identical default).
         let mut present_halo: Vec<u32> = vec![0; n_cells];
@@ -573,46 +1024,20 @@ impl NegotiatedRouter {
         // O(congested nets). Gated to large net counts so the small deterministic
         // unit tests keep their exact full-reroute behaviour.
         //
-        // CLEARANCE GATING: the quiescence test below skips a routed net whose path
-        // avoids every `prev_overused` cell, on the reasoning that such a net's priced
-        // costs are unchanged. That reasoning is incomplete once clearance is active: a
-        // net's priced cost can also change because a *neighbour's* halo
-        // (`present_halo`) shifted onto its path, which `prev_overused` (a copper-overuse
-        // set) does not capture. The clearance (Jacobi) branch therefore augments the
-        // skip with a second signal — `halo_dirty`, the set of cells whose `present_halo`
-        // value actually CHANGED during the previous iteration's merge — and reroutes a
-        // net whose path touches a `prev_overused` OR a `halo_dirty` cell. A *delta* (not
-        // an absolute `present_halo > 0`) is required because `for_each_halo_cell` stamps
-        // the clearance box including its center, so every routed net self-halos its own
-        // path cells; only genuine external movement should force a reroute. The
-        // sequential (clearance-off) branch keeps the original copper-only skip and stays
-        // byte-identical (`present_halo`/`halo_dirty` remain all-zero / empty there).
+        // Clearance-active searches are deliberately not incrementally skipped:
+        // moving a neighbour changes `present_halo` even when direct copper overuse
+        // did not change, so every net is reconsidered in the exact sequential path.
         let incremental = n_nets > 8 && !clearance_active;
-        // Route nets in parallel (snapshot-based Jacobi merge) when clearance is
-        // active (it REQUIRES the merge to keep `present_halo` consistent) or when the
-        // board is large enough that the sequential per-net loop dominates wall-clock.
-        // Small non-clearance boards keep the sequential Gauss-Seidel path so the
-        // deterministic tests and single-layer fixtures stay byte-identical. For the
-        // large non-clearance case the parallel branch is already correct: `present_halo`
-        // stays all-zero (so its pricing/`halo_dirty` contribute nothing) and the
-        // incremental dirty set is driven by `prev_overused`, which `incremental` (true
-        // for `n_nets > 8`) maintains below.
-        let use_parallel = clearance_active || n_nets > PARALLEL_NEGOTIATION_THRESHOLD;
+        // Large boards use snapshot-based Jacobi negotiation. Each worker subtracts
+        // both the net's own copper and its exact counted halo multiplicity, so the
+        // snapshot prices the same foreign occupancy as the serial path. Small boards
+        // retain Gauss-Seidel to avoid parallel overhead.
+        let use_parallel = negotiation_mode == NegotiationMode::Adaptive
+            && n_nets > PARALLEL_NEGOTIATION_THRESHOLD;
         // `overused` from the previous iteration (cell -> was it over-used). Empty
         // before the first iteration (everything reroutes).
         let mut prev_overused: Vec<bool> = vec![false; n_cells];
         let mut prev_overused_cells: Vec<CellIdx> = Vec::new();
-        // `halo_dirty[c]` == did `present_halo[c]` change during the previous iteration's
-        // merge (clearance branch only). Read by the dirty-net test, repopulated by the
-        // merge. List-reset (no O(all cells) memset). `halo_delta` is per-iteration merge
-        // scratch: the net change to `present_halo[c]` this iteration; a cell is dirty iff
-        // its delta ends non-zero (a net rerouted to the SAME path cancels to zero and is
-        // correctly NOT marked). Both stay empty/zero when clearance is inactive.
-        let mut halo_dirty: Vec<bool> = vec![false; n_cells];
-        let mut halo_dirty_cells: Vec<CellIdx> = Vec::new();
-        let mut halo_delta: Vec<i32> = vec![0; n_cells];
-        let mut halo_touched_cells: Vec<CellIdx> = Vec::new();
-
         // Per-iteration overuse scratch, allocated once and cleared incrementally
         // (via the touched-cell lists) so no iteration pays an O(all cells) memset.
         let mut first_group: Vec<i64> = vec![-1; n_cells];
@@ -624,7 +1049,7 @@ impl NegotiatedRouter {
             if use_parallel {
                 // ---- Snapshot-based (Jacobi-style) PARALLEL negotiation ----
                 //
-                // Every DIRTY net reroutes against a READ-ONLY snapshot of
+                // Every selected net reroutes against a READ-ONLY snapshot of
                 // `present`/`present_halo`/`history` (occupancy from the END of the
                 // previous iteration); clean nets keep their path and their existing
                 // contribution to the occupancy maps. Dirty nets are routed in parallel
@@ -636,34 +1061,25 @@ impl NegotiatedRouter {
                 // (`n_nets > PARALLEL_NEGOTIATION_THRESHOLD`); small non-clearance boards
                 // stay on the sequential path, so their byte-identical output is unchanged.
                 //
-                // DIRTY SET: a net needs rerouting when it is unrouted, or its path
-                // touches a cell that was over-used (`prev_overused`) or whose
-                // `present_halo` changed (`halo_dirty`) during the previous iteration.
-                // Anything else is unaffected (its priced costs are unchanged) and is
-                // skipped — cutting later iterations from O(all nets) to O(congested).
-                // Gated to >8 nets so the small deterministic tests keep full reroute.
-                let dirty: Vec<usize> = (0..n_nets)
-                    .filter(|&i| {
-                        n_nets <= 8
-                            || iter == 0
-                            || paths[i].is_empty()
-                            || paths[i]
-                                .iter()
-                                .any(|&c| prev_overused[c as usize] || halo_dirty[c as usize])
-                    })
-                    .collect();
-                // Reset the previous iteration's `halo_dirty` set now that we have
-                // consumed it; the merge below repopulates it for the next iteration.
-                for &c in &halo_dirty_cells {
-                    halo_dirty[c as usize] = false;
-                }
-                halo_dirty_cells.clear();
+                // CLEARANCE-ACTIVE: route every net every iteration. A moved net can
+                // lower halo cost away from another net's current path, so an on-path
+                // dirty test cannot prove that the latter's optimum is unchanged.
+                // CLEARANCE-FREE: retain the proven copper-overuse incremental set.
+                let dirty: Vec<usize> = if clearance_active {
+                    (0..n_nets).collect()
+                } else {
+                    (0..n_nets)
+                        .filter(|&i| {
+                            iter == 0
+                                || paths[i].is_empty()
+                                || paths[i].iter().any(|&c| prev_overused[c as usize])
+                        })
+                        .collect()
+                };
                 let clearance_mm = self.clearance_mm;
                 // Borrow the snapshots immutably for the duration of the parallel map.
-                // Each worker thread keeps its OWN reusable `SearchBuf` + `PadSet`
-                // scratch via `map_init` (never shared across threads). The closure
-                // captures only shared `&` references (all `Sync`): `grid`, the three
-                // occupancy slices, `nets`, `windows`, `via_model`.
+                // Each executing thread lazily acquires its OWN reusable `SearchBuf`,
+                // pad/path stamps, and counted halo stamp from thread-local storage.
                 let present_snap: &[u32] = &present;
                 let halo_snap: &[u32] = &present_halo;
                 let history_snap: &[u32] = &history;
@@ -673,68 +1089,105 @@ impl NegotiatedRouter {
                 let coords_ref = &coords;
                 let mut routed_paths: Vec<(usize, Option<Vec<CellIdx>>)> = dirty
                     .par_iter()
-                    .map_init(
-                        || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
-                        |(buf, pad_set), &i| {
-                            let net = &nets_ref[i];
-                            pad_set.load(&net.passable_pads);
-                            // Route within the net's window; on failure, retry once on
-                            // the full board so the occasional global net still
-                            // completes. Pure read-only search over the snapshots.
-                            let routed = route_negotiated(
-                                buf,
-                                grid,
-                                coords_ref,
-                                pad_set,
-                                present_snap,
-                                halo_snap,
-                                history_snap,
-                                pfac,
-                                net.src,
-                                net.dst,
-                                windows_ref[i],
-                                via_ref,
-                            )
-                            .or_else(|| {
-                                route_negotiated(
+                    .map(|&i| {
+                        with_jacobi_scratch(
+                            n_cells,
+                            || {
+                                #[cfg(test)]
+                                if let Some(probe) = &self.jacobi_scratch_probe {
+                                    probe.fetch_add(1, Ordering::Relaxed);
+                                }
+                            },
+                            |scratch| {
+                                let JacobiScratch {
+                                    buf,
+                                    pad_set,
+                                    own_path,
+                                    own_halo,
+                                    ..
+                                } = scratch;
+                                let net = &nets_ref[i];
+                                pad_set.load(&net.passable_pads);
+                                own_path.load(&paths[i]);
+                                own_halo.clear();
+                                for_each_halo_cell(
+                                    dims,
+                                    coords_ref,
+                                    grid,
+                                    &paths[i],
+                                    clearance_mm,
+                                    via_ref,
+                                    |c| own_halo.increment(c),
+                                );
+                                // Route within the net's window; on failure, retry once on
+                                // the full board so the occasional global net still completes.
+                                // Pure read-only search over the snapshots.
+                                let routed = route_negotiated(
                                     buf,
                                     grid,
                                     coords_ref,
+                                    &heuristic_costs,
                                     pad_set,
+                                    Some(own_path),
+                                    Some(own_halo),
                                     present_snap,
                                     halo_snap,
                                     history_snap,
                                     pfac,
                                     net.src,
                                     net.dst,
-                                    Window::full(dims),
+                                    windows_ref[i],
                                     via_ref,
+                                    has_zero_cost,
                                 )
-                            });
-                            (i, routed.map(|(p, _)| p))
-                        },
-                    )
+                                .or_else(|| {
+                                    route_negotiated(
+                                        buf,
+                                        grid,
+                                        coords_ref,
+                                        &heuristic_costs,
+                                        pad_set,
+                                        Some(own_path),
+                                        Some(own_halo),
+                                        present_snap,
+                                        halo_snap,
+                                        history_snap,
+                                        pfac,
+                                        net.src,
+                                        net.dst,
+                                        Window::full(dims),
+                                        via_ref,
+                                        has_zero_cost,
+                                    )
+                                });
+                                (i, routed.map(|(p, _)| p))
+                            },
+                        )
+                    })
                     .collect();
                 // Deterministic INCREMENTAL merge: process the rerouted (dirty) nets in
                 // net-index order, each subtracting its OLD path/halo and adding its NEW
                 // path/halo from the shared maps (clean nets are left untouched). Counts
                 // are commutative so the result is identical regardless of scheduling and
-                // matches a full rebuild. `halo_delta` accumulates the net change to
-                // `present_halo`; a cell whose delta ends non-zero is recorded into the
-                // next iteration's `halo_dirty` set (a reroute to the SAME path cancels
-                // to zero and is correctly NOT marked, which is what lets the dirty set
-                // shrink to the congested region and the iteration cost collapse).
+                // matches a full rebuild. Clearance-active routing deliberately keeps
+                // every net dirty, so no lossy on-path halo-dirty approximation is used.
                 routed_paths.sort_unstable_by_key(|(i, _)| *i);
                 for (i, path) in routed_paths {
                     // Remove the old path's copper + halo (the net's prior contribution).
                     for &c in &paths[i] {
                         present[c as usize] = present[c as usize].saturating_sub(1);
                     }
-                    for_each_halo_cell(dims, &coords, grid, &paths[i], clearance_mm, &via_model, |c| {
-                        present_halo[c as usize] = present_halo[c as usize].saturating_sub(1);
-                        halo_delta[c as usize] -= 1;
-                        halo_touched_cells.push(c);
-                    });
+                    for_each_halo_cell(
+                        dims,
+                        &coords,
+                        grid,
+                        &paths[i],
+                        clearance_mm,
+                        &via_model,
+                        |c| {
+                            present_halo[c as usize] = present_halo[c as usize].saturating_sub(1);
+                        },
+                    );
                     match path {
                         Some(path) => {
                             for &c in &path {
@@ -750,8 +1203,6 @@ impl NegotiatedRouter {
                                 |c| {
                                     present_halo[c as usize] =
                                         present_halo[c as usize].saturating_add(1);
-                                    halo_delta[c as usize] += 1;
-                                    halo_touched_cells.push(c);
                                 },
                             );
                             paths[i] = path;
@@ -762,25 +1213,11 @@ impl NegotiatedRouter {
                         }
                     }
                 }
-                // Finalize the halo-dirty set for the next iteration: any touched cell
-                // whose net delta is non-zero changed and is marked dirty; reset the
-                // delta scratch via the touched list (no O(all cells) memset). Touched
-                // cells may repeat — the delta read + reset makes the marking idempotent.
-                for &c in &halo_touched_cells {
-                    let d = &mut halo_delta[c as usize];
-                    if *d != 0 {
-                        *d = 0;
-                        if !halo_dirty[c as usize] {
-                            halo_dirty[c as usize] = true;
-                            halo_dirty_cells.push(c);
-                        }
-                    }
-                }
-                halo_touched_cells.clear();
             } else {
-                // ---- Sequential incremental negotiation (clearance INACTIVE) ----
-                // Verbatim pre-parallel behaviour; kept byte-identical. `clearance_active`
-                // is false here, so `present_halo` stays all-zero and contributes nothing.
+                // ---- Sequential negotiation (small boards) ----
+                // Clearance-free boards may incrementally skip quiescent nets; with
+                // clearance active `incremental` is false and every net reroutes after
+                // its exact old copper + halo footprint is removed in place.
                 for i in 0..n_nets {
                     let net = &nets[i];
 
@@ -824,7 +1261,10 @@ impl NegotiatedRouter {
                         &mut buf,
                         grid,
                         &coords,
+                        &heuristic_costs,
                         &pad_set,
+                        None,
+                        None,
                         &present,
                         &present_halo,
                         &history,
@@ -833,13 +1273,17 @@ impl NegotiatedRouter {
                         net.dst,
                         windows[i],
                         &via_model,
+                        has_zero_cost,
                     )
                     .or_else(|| {
                         route_negotiated(
                             &mut buf,
                             grid,
                             &coords,
+                            &heuristic_costs,
                             &pad_set,
+                            None,
+                            None,
                             &present,
                             &present_halo,
                             &history,
@@ -848,6 +1292,7 @@ impl NegotiatedRouter {
                             net.dst,
                             Window::full(dims),
                             &via_model,
+                            has_zero_cost,
                         )
                     });
 
@@ -943,6 +1388,95 @@ impl NegotiatedRouter {
                 break; // converged: cell-disjoint across groups
             }
         }
+
+        // One bounded Gauss-Seidel polish after parallel clearance negotiation on
+        // single-layer boards. Jacobi restores throughput but can hand legalization
+        // a less coordinated set of simultaneously-chosen paths; a serial sweep
+        // lets each net observe earlier polished paths immediately. On multilayer
+        // boards, however, this grid-local greedy pass can exchange planar spacing
+        // for extra vias/layer changes and worsen the downstream geometric DRC even
+        // while its internal halo score improves, so preserve the Jacobi seed there.
+        // This is deliberately exactly one pass over all nets: off-path halo
+        // decreases make a narrower dirty set unsound, while the hard bound keeps
+        // large-board latency predictable.
+        if use_parallel && clearance_active && dims.layers == 1 {
+            let pfac = MAX_ITERS;
+            for i in 0..n_nets {
+                let net = &nets[i];
+                for &c in &paths[i] {
+                    present[c as usize] = present[c as usize].saturating_sub(1);
+                }
+                for_each_halo_cell(
+                    dims,
+                    &coords,
+                    grid,
+                    &paths[i],
+                    self.clearance_mm,
+                    &via_model,
+                    |c| {
+                        present_halo[c as usize] = present_halo[c as usize].saturating_sub(1);
+                    },
+                );
+                paths[i].clear();
+                pad_set.load(&net.passable_pads);
+
+                let routed = route_negotiated(
+                    &mut buf,
+                    grid,
+                    &coords,
+                    &heuristic_costs,
+                    &pad_set,
+                    None,
+                    None,
+                    &present,
+                    &present_halo,
+                    &history,
+                    pfac,
+                    net.src,
+                    net.dst,
+                    windows[i],
+                    &via_model,
+                    has_zero_cost,
+                )
+                .or_else(|| {
+                    route_negotiated(
+                        &mut buf,
+                        grid,
+                        &coords,
+                        &heuristic_costs,
+                        &pad_set,
+                        None,
+                        None,
+                        &present,
+                        &present_halo,
+                        &history,
+                        pfac,
+                        net.src,
+                        net.dst,
+                        Window::full(dims),
+                        &via_model,
+                        has_zero_cost,
+                    )
+                });
+                if let Some((path, _)) = routed {
+                    for &c in &path {
+                        present[c as usize] = present[c as usize].saturating_add(1);
+                    }
+                    for_each_halo_cell(
+                        dims,
+                        &coords,
+                        grid,
+                        &path,
+                        self.clearance_mm,
+                        &via_model,
+                        |c| {
+                            present_halo[c as usize] = present_halo[c as usize].saturating_add(1);
+                        },
+                    );
+                    paths[i] = path;
+                }
+            }
+        }
         // ---- Order-robust legalization ----
         //
         // Legalization commits whole connection groups, one at a time, in a chosen
@@ -964,7 +1498,15 @@ impl NegotiatedRouter {
         // Full alone-path cells per net, used by the rip-up stage to find which
         // committed foreign-group nets a stranded net's natural route would cross.
         let mut alone_path: Vec<Vec<CellIdx>> = vec![Vec::new(); n_nets];
-        {
+        if let Some(provided) = provided_alone {
+            debug_assert_eq!(provided.len(), n_nets);
+            for (i, path) in provided.iter().enumerate() {
+                if !path.is_empty() {
+                    alone_len[i] = grid_path_cost(grid, &nets[i], path);
+                    alone_path[i] = path.clone();
+                }
+            }
+        } else {
             // No foreign occupancy here; the alone-path is the net by itself on the
             // base grid (route within the window first, full board on failure). Each
             // net's search is INDEPENDENT and pure over the read-only grid, so they run
@@ -983,14 +1525,27 @@ impl NegotiatedRouter {
                         let net = &nets[i];
                         pad_set.load(&net.passable_pads);
                         let routed = route_legal(
-                            buf, grid, &coords, pad_set, &no_owner, &no_halo, -1, net.src,
-                            net.dst, windows[i], &via_model, self.clearance_mm,
+                            buf,
+                            grid,
+                            &coords,
+                            &heuristic_costs,
+                            pad_set,
+                            &no_owner,
+                            &no_halo,
+                            -1,
+                            net.src,
+                            net.dst,
+                            windows[i],
+                            &via_model,
+                            self.clearance_mm,
+                            has_zero_cost,
                         )
                         .or_else(|| {
                             route_legal(
                                 buf,
                                 grid,
                                 &coords,
+                                &heuristic_costs,
                                 pad_set,
                                 &no_owner,
                                 &no_halo,
@@ -1000,10 +1555,11 @@ impl NegotiatedRouter {
                                 Window::full(dims),
                                 &via_model,
                                 self.clearance_mm,
+                                has_zero_cost,
                             )
                         });
                         match routed {
-                            Some((path, _)) => (unit_cost(&path), path),
+                            Some((path, _)) => (grid_path_cost(grid, net, &path), path),
                             None => (0, Vec::new()),
                         }
                     },
@@ -1063,7 +1619,7 @@ impl NegotiatedRouter {
         // `PadSet` scratch via `map_init` (never shared). Results are collected with
         // their candidate INDEX, then the winner is picked by a fully deterministic,
         // scheduling-independent fold over the indexed results.
-        let evaluated: Vec<(usize, usize, Cost, Committed)> = candidates
+        let evaluated: Vec<(usize, usize, u64, Committed)> = candidates
             .par_iter()
             .enumerate()
             .map_init(
@@ -1072,45 +1628,38 @@ impl NegotiatedRouter {
                     let committed = legalize_in_order(
                         grid,
                         &coords,
+                        &heuristic_costs,
                         buf,
                         pad_set,
                         nets,
-                        &group_ids,
+                        group_ids,
                         &paths,
                         &windows,
                         order,
                         n_cells,
                         &via_model,
                         self.clearance_mm,
+                        has_zero_cost,
                     );
                     let routed = committed.iter().filter(|c| c.is_some()).count();
-                    let total_cost: Cost = committed
-                        .iter()
-                        .filter_map(|c| c.as_ref())
-                        .map(|p| unit_cost(p))
-                        .fold(0, |a, b| a.saturating_add(b));
+                    let total_cost = committed_grid_cost(grid, nets, &committed);
                     (idx, routed, total_cost, committed)
                 },
             )
             .collect();
 
-        // Deterministic pick — IDENTICAL to the old sequential criterion: most nets
-        // routed, then lowest total unit cost, then lexicographically lowest group
-        // ORDER (`order < bo`). Iterating the indexed results in candidate-index
-        // order (sequential scan) reproduces the exact tie-break path the sequential
-        // loop took (it processed `candidates` in order with the same `better` test),
-        // so the chosen `committed` is byte-identical regardless of how rayon
-        // scheduled the parallel evaluation.
-        let mut best: Option<(usize, Cost, &Vec<usize>)> = None;
+        // Deterministic pick: most nets routed, then lowest true `u64` aggregate
+        // caller-grid cost, then lexicographically lowest group ORDER (`order < bo`).
+        // Iterating the indexed results in candidate-index order makes the chosen
+        // `committed` independent of how rayon scheduled the parallel evaluation.
+        let mut best: Option<(usize, u64, &Vec<usize>)> = None;
         let mut best_idx: Option<usize> = None;
         for (idx, routed, total_cost, _committed) in &evaluated {
             let order = &candidates[*idx];
             let better = match &best {
                 None => true,
                 Some((br, bc, bo)) => {
-                    *routed > *br
-                        || (*routed == *br && *total_cost < *bc)
-                        || (*routed == *br && *total_cost == *bc && order < bo)
+                    legalization_candidate_is_better(*routed, *total_cost, order, *br, *bc, bo)
                 }
             };
             if better {
@@ -1122,13 +1671,15 @@ impl NegotiatedRouter {
         // consumed by the `best_idx` match below. Sorted by candidate index so the
         // list is deterministic and aligns with `candidates`. Read-only.
         let traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
-            let mut idxs: Vec<&(usize, usize, Cost, Committed)> = evaluated.iter().collect();
+            let mut idxs: Vec<&(usize, usize, u64, Committed)> = evaluated.iter().collect();
             idxs.sort_unstable_by_key(|(idx, _, _, _)| *idx);
             idxs.into_iter()
                 .map(|(idx, routed, total_cost, _)| CandidateEval {
                     order: candidates[*idx].clone(),
                     routed: *routed,
-                    total_cost: *total_cost,
+                    // RouteTrace's stable public schema stores a `Cost`; selection
+                    // above has already used the full `u64` value.
+                    total_cost: (*total_cost).min(Cost::MAX as u64) as Cost,
                 })
                 .collect()
         });
@@ -1161,10 +1712,11 @@ impl NegotiatedRouter {
             let rip = ripup_legalize(
                 grid,
                 &coords,
+                &heuristic_costs,
                 &mut buf,
                 &mut pad_set,
                 nets,
-                &group_ids,
+                group_ids,
                 &alone_path,
                 &windows,
                 &best_order,
@@ -1172,6 +1724,7 @@ impl NegotiatedRouter {
                 n_cells,
                 &via_model,
                 self.clearance_mm,
+                has_zero_cost,
             );
             let rip_routed = rip.iter().filter(|c| c.is_some()).count();
             if rip_routed > best_routed {
@@ -1210,7 +1763,7 @@ impl NegotiatedRouter {
                     results.push(RouteResult {
                         net: net.net.clone(),
                         path: path.clone(),
-                        cost: unit_cost(path),
+                        cost: grid_path_cost(grid, net, path),
                     });
                     groups.push(group_ids[i] as u32);
                 }
@@ -1219,12 +1772,104 @@ impl NegotiatedRouter {
         }
 
         let congestion = BoardRoute::congestion_from(dims, &results);
-        Ok(BoardRoute {
-            results,
-            unrouted,
-            congestion,
-            groups,
+        Ok(NegotiatedOutcome {
+            board: BoardRoute {
+                results,
+                unrouted,
+                congestion,
+                groups,
+            },
+            alone_routable: alone_path.iter().map(|path| !path.is_empty()).collect(),
         })
+    }
+
+    /// Route the adaptive primary and, for the bounded grouped-board cohort, an
+    /// all-serial candidate. Candidate selection is deterministic and monotonic in
+    /// completion; an exact score tie retains the primary route.
+    fn route_impl(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        provider: Option<&dyn IsolatedRouteProvider>,
+        recorder: Option<&mut RouteTrace>,
+    ) -> Result<NegotiatedOutcome, RouterError> {
+        let group_ids = connection_group_ids(nets);
+        let has_named_group = has_named_subnet_group(nets);
+        // The isolated batch is board-static: compute it at most once and share it
+        // with both portfolio variants. A rejected provider response is represented
+        // as `None`, which preserves the existing all-CPU path in each variant.
+        let provided_alone =
+            provider.and_then(|provider| provider_alone_paths(self, grid, nets, provider));
+        let capture_trace = recorder.is_some();
+        let mut primary_trace = empty_route_trace(grid.dims);
+        let primary_recorder = if capture_trace {
+            Some(&mut primary_trace)
+        } else {
+            None
+        };
+        let primary = self.route_variant(
+            grid,
+            nets,
+            &group_ids,
+            NegotiationMode::Adaptive,
+            provided_alone.as_deref(),
+            primary_recorder,
+        )?;
+
+        let mut selected = primary;
+        let mut selected_trace = primary_trace;
+        if should_try_serial_candidate(grid.dims, nets.len(), has_named_group, &selected.board) {
+            let mut serial_trace = empty_route_trace(grid.dims);
+            let serial_recorder = if capture_trace {
+                Some(&mut serial_trace)
+            } else {
+                None
+            };
+            let serial = self.route_variant(
+                grid,
+                nets,
+                &group_ids,
+                NegotiationMode::ForceSerial,
+                provided_alone.as_deref(),
+                serial_recorder,
+            )?;
+            if serial_candidate_is_better(&selected.board, &serial.board) {
+                selected = serial;
+                selected_trace = serial_trace;
+            }
+        }
+
+        if let Some(output_trace) = recorder {
+            *output_trace = selected_trace;
+        }
+        Ok(selected)
+    }
+
+    /// Route without a visualisation trace while returning the per-input-net
+    /// isolation result already computed by legalization.
+    ///
+    /// `outcome.board` is byte-identical to [`Router::route`] for the same inputs.
+    pub fn route_with_outcome(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+    ) -> Result<NegotiatedOutcome, RouterError> {
+        self.route_impl(grid, nets, None, None)
+    }
+
+    /// Route while sourcing the board-static isolated-net batch from `provider`.
+    ///
+    /// The provider is invoked at most once, including when the bounded portfolio
+    /// evaluates both adaptive and serial negotiation variants. If the provider
+    /// errors or returns a malformed batch, the router transparently falls back to
+    /// the same CPU isolated searches used by [`Self::route_with_outcome`].
+    pub fn route_with_isolated_provider(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        provider: &dyn IsolatedRouteProvider,
+    ) -> Result<NegotiatedOutcome, RouterError> {
+        self.route_impl(grid, nets, Some(provider), None)
     }
 
     /// Route a board and additionally return a [`RouteTrace`] recording each
@@ -1239,23 +1884,33 @@ impl NegotiatedRouter {
     ) -> Result<(BoardRoute, RouteTrace), RouterError> {
         // Construct the trace explicitly with the real `dims` (it has no meaningful
         // `Default`); the capture points fill the rest.
-        let mut trace = RouteTrace {
-            dims: grid.dims,
-            nets: Vec::new(),
-            n_groups: 0,
-            iterations: Vec::new(),
-            legalization: None,
-        };
-        let board = self.route_impl(grid, nets, Some(&mut trace))?;
-        Ok((board, trace))
+        let mut trace = empty_route_trace(grid.dims);
+        let outcome = self.route_impl(grid, nets, None, Some(&mut trace))?;
+        Ok((outcome.board, trace))
+    }
+
+    /// Traced counterpart of [`Self::route_with_isolated_provider`].
+    ///
+    /// Recording is observational only: for the same provider batch, this method's
+    /// board is identical to the untraced provider-aware method.
+    pub fn route_traced_with_isolated_provider(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        provider: &dyn IsolatedRouteProvider,
+    ) -> Result<(BoardRoute, RouteTrace), RouterError> {
+        let mut trace = empty_route_trace(grid.dims);
+        let outcome = self.route_impl(grid, nets, Some(provider), Some(&mut trace))?;
+        Ok((outcome.board, trace))
     }
 }
 
 impl Router for NegotiatedRouter {
-    /// The production route: delegates to [`NegotiatedRouter::route_impl`] with no
-    /// recorder, so it is byte-identical to the historical behaviour.
+    /// The production route delegates to the deterministic bounded portfolio
+    /// without allocating a visualisation trace.
     fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
-        self.route_impl(grid, nets, None)
+        self.route_with_outcome(grid, nets)
+            .map(|outcome| outcome.board)
     }
 }
 
@@ -1275,7 +1930,10 @@ fn route_negotiated(
     buf: &mut SearchBuf,
     base: &Grid,
     coords: &GridCoords,
+    heuristic_costs: &ManhattanCosts,
     pads: &PadSet,
+    own_path: Option<&PadSet>,
+    own_halo: Option<&CountedCellSet>,
     present: &[u32],
     present_halo: &[u32],
     history: &[u32],
@@ -1284,6 +1942,7 @@ fn route_negotiated(
     dst: CellIdx,
     window: Window,
     via_model: &ViaModel,
+    has_zero_cost: bool,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
     // Price to MOVE onto cell `c` over a base step cost `base_cost` (the planar
@@ -1298,19 +1957,29 @@ fn route_negotiated(
     // when clearance is inactive, so that term vanishes (byte-identical default).
     let priced_with_base = |c: CellIdx, base_cost: u64| -> Cost {
         let ci = c as usize;
+        let self_present = own_path.is_some_and(|set| set.contains(c)) as u32;
+        let foreign_present = present[ci].saturating_sub(self_present);
+        let self_halo = own_halo.map_or(0, |set| set.count(c));
+        let foreign_halo = present_halo[ci].saturating_sub(self_halo);
         let priced = base_cost
             .saturating_add(history[ci] as u64)
-            .saturating_add((pfac as u64) * (SCALE as u64) * (present[ci] as u64))
-            .saturating_add(
-                (pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * (present_halo[ci] as u64),
-            );
-        priced.min(OBSTACLE as u64 - 1) as Cost
+            .saturating_add((pfac as u64) * (SCALE as u64) * (foreign_present as u64))
+            .saturating_add((pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * (foreign_halo as u64));
+        passable_search_cost(priced)
     };
     // Edge-aware planar base: the geometric length of the move `u -> v`, in the same
     // fixed-point units as the heuristic. On a uniform grid this is the constant
     // `SCALE`, so `cost_fn` reduces to the historical `priced_with_base(v, SCALE)`.
+    let enter_weight = |c: CellIdx| -> Cost {
+        if base.is_obstacle(c) && pads.contains(c) {
+            1
+        } else {
+            base.cost_at(c)
+        }
+    };
     let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
-        priced_with_base(v, edge_cost(coords.manhattan_len(dims, u, v)) as u64)
+        let geometric = edge_cost(coords.manhattan_len(dims, u, v)) as u64;
+        priced_with_base(v, geometric.saturating_mul(enter_weight(v) as u64))
     };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
@@ -1329,12 +1998,21 @@ fn route_negotiated(
     // already blocks the via.
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
         if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v)) {
-            Some(priced_with_base(v, via_model.step_cost as u64))
+            Some(priced_with_base(
+                v,
+                (via_model.step_cost as u64).saturating_mul(enter_weight(v) as u64),
+            ))
         } else {
             None
         }
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, coords, c, dst, via_model.step_cost);
+    let h = |c: CellIdx| {
+        if has_zero_cost {
+            0
+        } else {
+            manhattan_scaled(dims, heuristic_costs, c, dst, via_model.step_cost)
+        }
+    };
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
@@ -1347,10 +2025,9 @@ fn route_negotiated(
 ///   * `owner` — committed COPPER. A cell owned by a group other than `own_group`
 ///     is a HARD obstacle (two distinct nets may never overlap). Cells owned by
 ///     `own_group` (siblings) and free cells are passable at their base cost.
-///   * `halo`  — foreign clearance / via-keepout halo. A cell with `halo[c]` a
-///     foreign group (`>= 0 && != own_group`) that is NOT also this net's own copper
-///     is a HARD obstacle too — the legalizer must not place copper inside another
-///     net's required spacing. Own-group halo costs nothing (same-net override).
+///   * `halo`  — foreign clearance / via-keepout halo. A cell owned by a foreign
+///     group, or [`HALO_MIXED`] because multiple groups cover it, is a HARD obstacle
+///     unless it is already this group's copper. Own-group halo costs nothing.
 ///   * `src`/`dst` stay forced-passable (a net's own pads must remain reachable).
 ///
 /// Every passable step is priced by its GEOMETRIC length (`edge_cost` from `coords`)
@@ -1366,6 +2043,7 @@ fn route_legal(
     buf: &mut SearchBuf,
     base: &Grid,
     coords: &GridCoords,
+    heuristic_costs: &ManhattanCosts,
     pads: &PadSet,
     owner: &[i64],
     halo: &[i64],
@@ -1375,6 +2053,7 @@ fn route_legal(
     window: Window,
     via_model: &ViaModel,
     clearance: f64,
+    has_zero_cost: bool,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
     let has_owner = !owner.is_empty();
@@ -1384,9 +2063,21 @@ fn route_legal(
     // On a uniform grid every step is length 1, so the base is the constant `SCALE`
     // (the legalizer reports `unit_cost(path)` — path length — so this magnitude only
     // affects the path CHOICE, never the emitted cost). Clearance is now HARD (handled
-    // in `blocked_fn`), so `cost_fn` is the pure geometric base.
-    let cost_fn =
-        |u: CellIdx, v: CellIdx| -> Cost { edge_cost(coords.manhattan_len(dims, u, v)) };
+    // in `blocked_fn`), so `cost_fn` is the pure weighted geometric base, capped below
+    // `OBSTACLE` because that exact value is the search's unreachable sentinel.
+    let enter_weight = |c: CellIdx| -> Cost {
+        if base.is_obstacle(c) && pads.contains(c) {
+            1
+        } else {
+            base.cost_at(c)
+        }
+    };
+    let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
+        passable_search_cost(
+            (edge_cost(coords.manhattan_len(dims, u, v)) as u64)
+                .saturating_mul(enter_weight(v) as u64),
+        )
+    };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
             return true;
@@ -1412,7 +2103,7 @@ fn route_legal(
         if has_halo {
             let h = halo[c as usize];
             let own_copper = has_owner && owner[c as usize] == own_group;
-            if h >= 0 && h != own_group && !own_copper {
+            if halo_is_foreign(h, own_group) && !own_copper {
                 return true;
             }
         }
@@ -1431,7 +2122,13 @@ fn route_legal(
         let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, via_r);
         let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, via_r);
         for ny in y0..y1 {
+            if !geom_line_within(&coords.y_lines, dims.h, cy, ny, via_r) {
+                continue;
+            }
             for nx in x0..x1 {
+                if !geom_line_within(&coords.x_lines, dims.w, cx, nx, via_r) {
+                    continue;
+                }
                 let n = dims.idx3(nx, ny, layer);
                 if n == src || n == dst {
                     continue;
@@ -1442,7 +2139,7 @@ fn route_legal(
                     return true; // ring overlaps foreign copper
                 }
                 let hh = halo[ni];
-                if hh >= 0 && hh != own_group && !(o == own_group) {
+                if halo_is_foreign(hh, own_group) && o != own_group {
                     return true; // ring overlaps a foreign halo cell
                 }
             }
@@ -1464,9 +2161,17 @@ fn route_legal(
                 return None;
             }
         }
-        Some(via_model.step_cost)
+        Some(passable_search_cost(
+            (via_model.step_cost as u64).saturating_mul(enter_weight(v) as u64),
+        ))
     };
-    let h = |c: CellIdx| manhattan_scaled(dims, coords, c, dst, via_model.step_cost);
+    let h = |c: CellIdx| {
+        if has_zero_cost {
+            0
+        } else {
+            manhattan_scaled(dims, heuristic_costs, c, dst, via_model.step_cost)
+        }
+    };
     astar_buf(buf, dims, src, dst, cost_fn, blocked_fn, h, via_step)
 }
 
@@ -1523,7 +2228,13 @@ fn for_each_halo_cell(
         let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
         let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
         for ny in y0..y1 {
+            if !geom_line_within(&coords.y_lines, dims.h, cy, ny, r) {
+                continue;
+            }
             for nx in x0..x1 {
+                if !geom_line_within(&coords.x_lines, dims.w, cx, nx, r) {
+                    continue;
+                }
                 let n = dims.idx3(nx, ny, layer);
                 if !base.is_obstacle(n) {
                     visit(n);
@@ -1554,32 +2265,47 @@ fn for_each_halo_cell(
     }
 }
 
-/// Half-open `[lo, hi)` range of line indices in `lines` (sorted ascending,
-/// non-empty, length `count`) within `r` continuous units of the seed line at index
-/// `seed`. The in-clearance indices form a contiguous band (lines are sorted), so we
-/// walk outward from `seed` and stop at the first line strictly farther than `r`.
+/// Half-open candidate range containing every line index within `r` continuous
+/// units of `seed`.
 ///
-/// This is the negotiation-halo twin of `mr_grid`'s `line_span`: on a
-/// [`GridCoords::uniform`] grid (unit-spaced lines) `geom_box(.., seed, r)` returns
-/// `[seed - floor(r), seed + floor(r) + 1)`, i.e. the former Chebyshev cell box of
-/// radius `r`, keeping the uniform path byte-identical. Only `lines[..count]` is
-/// consulted so a defensive coords array longer than `dims` never reads past the grid.
+/// Complete coordinate arrays are sorted, so their matches form one contiguous band
+/// and the normal path walks outward from `seed`. A truncated array uses
+/// [`GridCoords::x_of`]'s documented index fallback, which can be non-monotonic at
+/// the explicit/fallback boundary; in that defensive case the only sound candidate
+/// range is the full axis. Callers apply [`geom_line_within`] inside the returned
+/// range, making the fallback an exact full scan rather than over-inflation.
+///
+/// On a [`GridCoords::uniform`] grid this returns
+/// `[seed - floor(r), seed + floor(r) + 1)`, preserving the historical Chebyshev box.
 fn geom_box(lines: &[f64], count: u32, seed: u32, r: f64) -> (u32, u32) {
-    let n = (lines.len() as u32).min(count);
-    if n == 0 {
+    if count == 0 {
         return (0, 0);
     }
-    let seed = seed.min(n - 1);
+    if lines.len() < count as usize {
+        return (0, count);
+    }
+    let seed = seed.min(count - 1);
     let pos = lines[seed as usize];
     let mut lo = seed;
     while lo > 0 && (pos - lines[(lo - 1) as usize]).abs() <= r {
         lo -= 1;
     }
     let mut hi = seed + 1;
-    while hi < n && (lines[hi as usize] - pos).abs() <= r {
+    while hi < count && (lines[hi as usize] - pos).abs() <= r {
         hi += 1;
     }
     (lo, hi)
+}
+
+/// Exact membership predicate paired with [`geom_box`]. Missing coordinates use
+/// the same unit-position fallback as [`GridCoords::x_of`] / `y_of`.
+#[inline]
+fn geom_line_within(lines: &[f64], count: u32, seed: u32, candidate: u32, r: f64) -> bool {
+    if count == 0 || candidate >= count {
+        return false;
+    }
+    let at = |i: u32| lines.get(i as usize).copied().unwrap_or(i as f64);
+    (at(candidate) - at(seed.min(count - 1))).abs() <= r
 }
 
 /// Fold a committed `path` into the ownership maps, separating HARD copper from the
@@ -1602,13 +2328,10 @@ fn geom_box(lines: &[f64], count: u32, seed: u32, r: f64) -> (u32, u32) {
 /// 2. **Planar clearance halo.** For each path cell, on that cell's OWN layer,
 ///    visit every cell `n` within geometric distance `clearance` over `coords` (the
 ///    [`geom_box`] band; on a uniform grid this is the `(2r+1)x(2r+1)` Chebyshev
-///    box). Set `halo[n] = group` ONLY IF `owner[n] == -1`
-///    (the cell is not real copper — a halo never overwrites copper ownership) AND
-///    `halo[n] == -1` (still free halo) AND `!base.is_obstacle(n)`. Overlap
-///    tie-break: the FIRST group to claim a free halo cell keeps it (`halo[n] == -1`
-///    guard); a later group's halo never overwrites it. A base obstacle / foreign
-///    pad is never claimed (claiming it could deter access to that net's own pad,
-///    though here the penalty is only soft).
+///    box). If the cell is not copper or a base obstacle, set a free halo cell to
+///    `group`, leave an existing same-group claim alone, or mark a cross-group
+///    overlap [`HALO_MIXED`]. A mixed cell is foreign to every group; otherwise a
+///    rerouted first claimant could incorrectly enter the second claimant's halo.
 /// 3. **Via keepout.** A via is detected as two consecutive path cells sharing the
 ///    same `(x, y)` but differing in layer. At each such `(x, y)`, on *every* layer
 ///    the via spans, stamp a halo of radius `max(clearance, via_model.keepout_mm)`
@@ -1636,8 +2359,8 @@ fn stamp_owner(
 ) {
     // Stamp a planar geometric halo of radius `r` (continuous units, over `coords`)
     // around `(cx, cy)` on `layer` into the `halo` map, claiming only cells that are
-    // not real copper (`owner == -1`), not yet claimed by any group's halo
-    // (`halo == -1`, first-claim-wins), and not base obstacles. The centre cell is
+    // not real copper (`owner == -1`) and not base obstacles. Cross-group overlap
+    // becomes `HALO_MIXED`, while repeated same-group claims remain that group. The centre cell is
     // included, but a path cell already has `owner == group`, so the `owner == -1`
     // guard skips it (its halo entry stays free — own-group halo is irrelevant since
     // own-group cells cost nothing).
@@ -1648,10 +2371,21 @@ fn stamp_owner(
         let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
         let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
         for ny in y0..y1 {
+            if !geom_line_within(&coords.y_lines, dims.h, cy, ny, r) {
+                continue;
+            }
             for nx in x0..x1 {
+                if !geom_line_within(&coords.x_lines, dims.w, cx, nx, r) {
+                    continue;
+                }
                 let n = dims.idx3(nx, ny, layer);
-                if owner[n as usize] == -1 && halo[n as usize] == -1 && !base.is_obstacle(n) {
-                    halo[n as usize] = group;
+                let ni = n as usize;
+                if owner[ni] == -1 && !base.is_obstacle(n) {
+                    halo[ni] = match halo[ni] {
+                        HALO_FREE => group,
+                        existing if existing == group => existing,
+                        _ => HALO_MIXED,
+                    };
                 }
             }
         }
@@ -1683,64 +2417,39 @@ fn stamp_owner(
     }
 }
 
-/// Inverse of [`stamp_owner`] for the rip-up stage: free every cell in a committed
-/// `path`'s footprint (the copper path cells in `owner` AND the clearance /
-/// via-keepout halo cells in `halo`) that is currently owned by `group`. Cells
-/// owned by another group (a foreign group's copper, or a halo cell the first-claim
-/// tie-break awarded to another group) are left untouched, so freeing is idempotent
-/// and never releases a cell another group depends on. The footprint must be
-/// scanned identically to `stamp_owner` so no halo cell leaks across a rip.
-fn free_owner(
+/// Rebuild legalization ownership after a rip.
+///
+/// A clearance cell may belong to multiple groups. Incrementally deleting one
+/// group's scalar halo label would either leak its reservation or erase another
+/// group's overlapping reservation. A deterministic net-index rebuild is exact,
+/// naturally reduces [`HALO_MIXED`] to the sole remaining group, and rip-up is rare
+/// enough that the linear pass is cheaper than a per-cell owner set.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_owner_maps(
     owner: &mut [i64],
     halo: &mut [i64],
-    dims: mr_core::Dims,
+    base: &Grid,
     coords: &GridCoords,
-    path: &[CellIdx],
-    group: i64,
+    committed: &Committed,
+    group_ids: &[usize],
     clearance: f64,
     via_model: &ViaModel,
 ) {
-    // Release halo cells this group claimed (only `halo[n] == group`; first-claim
-    // tie-break may have awarded an overlapping cell to another group, which we must
-    // not clear). Copper path cells are released separately below. The scan mirrors
-    // `stamp_owner`'s geometric `geom_box` exactly so no halo cell leaks across a rip.
-    let clear_halo = |halo: &mut [i64], cx: u32, cy: u32, layer: u32, r: f64| {
-        if r <= 0.0 {
-            return;
-        }
-        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, r);
-        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, r);
-        for ny in y0..y1 {
-            for nx in x0..x1 {
-                let n = dims.idx3(nx, ny, layer);
-                if halo[n as usize] == group {
-                    halo[n as usize] = -1;
-                }
-            }
-        }
-    };
-
-    // Path cells: clear the copper still owned by `group` (siblings may have re-owned
-    // an overlap to the same `group`, so this stays idempotent).
-    for &c in path {
-        if owner[c as usize] == group {
-            owner[c as usize] = -1;
-        }
-    }
-    for &c in path {
-        let (cx, cy, cl) = dims.xyz(c);
-        clear_halo(halo, cx, cy, cl, clearance);
-    }
-
-    let via_r = clearance.max(via_model.keepout_mm);
-    if via_r > 0.0 {
-        for w in path.windows(2) {
-            let (ax, ay, al) = dims.xyz(w[0]);
-            let (bx, by, bl) = dims.xyz(w[1]);
-            if ax == bx && ay == by && al != bl {
-                clear_halo(halo, ax, ay, al, via_r);
-                clear_halo(halo, bx, by, bl, via_r);
-            }
+    owner.fill(-1);
+    halo.fill(HALO_FREE);
+    for (i, path) in committed.iter().enumerate() {
+        if let Some(path) = path {
+            stamp_owner(
+                owner,
+                halo,
+                base,
+                base.dims,
+                coords,
+                path,
+                group_ids[i] as i64,
+                clearance,
+                via_model,
+            );
         }
     }
 }
@@ -1761,6 +2470,7 @@ fn free_owner(
 fn legalize_in_order(
     grid: &Grid,
     coords: &GridCoords,
+    heuristic_costs: &ManhattanCosts,
     buf: &mut SearchBuf,
     pad_set: &mut PadSet,
     nets: &[NetEndpoints],
@@ -1771,6 +2481,7 @@ fn legalize_in_order(
     n_cells: usize,
     via_model: &ViaModel,
     clearance: f64,
+    has_zero_cost: bool,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -1780,7 +2491,7 @@ fn legalize_in_order(
     // Owning group per committed clearance-HALO cell, or -1 for free: a foreign
     // halo cell is a HARD block in `route_legal` (the committing pass), so copper is
     // never placed inside another net's spacing — an unroutable net is dropped.
-    let mut halo: Vec<i64> = vec![-1; n_cells];
+    let mut halo: Vec<i64> = vec![HALO_FREE; n_cells];
     let mut committed: Committed = vec![None; n_nets];
 
     // Net indices committed by the group currently being placed; their paths are
@@ -1828,21 +2539,23 @@ fn legalize_in_order(
             Some(b)
         })
         .collect();
-    // Conservative cell-count inflation of the per-group bbox for the staging
-    // (which groups may legalize in the same parallel stage) heuristic ONLY: a
-    // too-small value merely co-schedules groups the per-stage in-order hard-blocking
-    // commit still resolves correctly, so a geometric-distance approximation is safe
-    // here. `clearance.ceil()` matches the old cell count exactly on a uniform grid.
-    let infl = clearance.max(via_model.keepout_mm).ceil() as u32;
+    // Stage conflicts are geometric, not cell-count based.  On a dense Hanan grid
+    // `ceil(0.5 mm) == 1 cell` can be far smaller than 0.5 mm (dozens of lines),
+    // which previously co-scheduled clearance-conflicting groups and accepted both
+    // precomputed paths without revalidation.  Expand each window's physical box
+    // by the actual clearance / via radius instead.
+    let infl = clearance.max(via_model.keepout_mm);
     let conflict = |a: usize, b: usize| -> bool {
         match (gbox[a], gbox[b]) {
             (Some(a), Some(b)) => {
-                let ax0 = a.0.saturating_sub(infl);
-                let ay0 = a.1.saturating_sub(infl);
-                let (ax1, ay1) = (a.2 + infl, a.3 + infl);
-                let bx0 = b.0.saturating_sub(infl);
-                let by0 = b.1.saturating_sub(infl);
-                let (bx1, by1) = (b.2 + infl, b.3 + infl);
+                let ax0 = coords.x_of(a.0).min(coords.x_of(a.2)) - infl;
+                let ay0 = coords.y_of(a.1).min(coords.y_of(a.3)) - infl;
+                let ax1 = coords.x_of(a.0).max(coords.x_of(a.2)) + infl;
+                let ay1 = coords.y_of(a.1).max(coords.y_of(a.3)) + infl;
+                let bx0 = coords.x_of(b.0).min(coords.x_of(b.2)) - infl;
+                let by0 = coords.y_of(b.1).min(coords.y_of(b.3)) - infl;
+                let bx1 = coords.x_of(b.0).max(coords.x_of(b.2)) + infl;
+                let by1 = coords.y_of(b.1).max(coords.y_of(b.3)) + infl;
                 !(ax1 < bx0 || bx1 < ax0 || ay1 < by0 || by1 < ay0)
             }
             _ => false,
@@ -1892,15 +2605,27 @@ fn legalize_in_order(
                         && cur.iter().all(|&c| {
                             let o = owner_ref[c as usize];
                             let h = halo_ref[c as usize];
-                            (o < 0 || o == gi) && (h < 0 || h == gi)
+                            (o < 0 || o == gi) && !halo_is_foreign(h, gi)
                         });
                     if clean {
                         Some(cur.clone())
                     } else {
                         ps.load(&net.passable_pads);
                         route_legal(
-                            b, grid, coords_ref, ps, owner_ref, halo_ref, gi, net.src, net.dst,
-                            windows[i], via_model, clearance,
+                            b,
+                            grid,
+                            coords_ref,
+                            heuristic_costs,
+                            ps,
+                            owner_ref,
+                            halo_ref,
+                            gi,
+                            net.src,
+                            net.dst,
+                            windows[i],
+                            via_model,
+                            clearance,
+                            has_zero_cost,
                         )
                         .map(|(p, _)| p)
                     }
@@ -1922,6 +2647,7 @@ fn legalize_in_order(
                             buf,
                             grid,
                             coords,
+                            heuristic_costs,
                             pad_set,
                             &owner,
                             &halo,
@@ -1931,6 +2657,7 @@ fn legalize_in_order(
                             Window::full(dims),
                             via_model,
                             clearance,
+                            has_zero_cost,
                         )
                         .map(|(p, _)| p)
                     }
@@ -1944,15 +2671,7 @@ fn legalize_in_order(
             for &i in &group_members {
                 if let Some(path) = &committed[i] {
                     stamp_owner(
-                        &mut owner,
-                        &mut halo,
-                        grid,
-                        dims,
-                        coords,
-                        path,
-                        gi,
-                        clearance,
-                        via_model,
+                        &mut owner, &mut halo, grid, dims, coords, path, gi, clearance, via_model,
                     );
                 }
             }
@@ -1990,6 +2709,7 @@ fn legalize_in_order(
 fn ripup_legalize(
     grid: &Grid,
     coords: &GridCoords,
+    heuristic_costs: &ManhattanCosts,
     buf: &mut SearchBuf,
     pad_set: &mut PadSet,
     nets: &[NetEndpoints],
@@ -2001,6 +2721,7 @@ fn ripup_legalize(
     n_cells: usize,
     via_model: &ViaModel,
     clearance: f64,
+    has_zero_cost: bool,
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
@@ -2030,23 +2751,11 @@ fn ripup_legalize(
     // a foreign-group halo cell is ALSO a HARD block in `route_legal`, so a stranded
     // net that cannot route clear is left unrouted rather than violating spacing.
     let mut owner: Vec<i64> = vec![-1; n_cells];
-    let mut halo: Vec<i64> = vec![-1; n_cells];
+    let mut halo: Vec<i64> = vec![HALO_FREE; n_cells];
     // Stamp the seeded commits into owner/halo so the residue routes against them.
-    for (i, slot) in committed.iter().enumerate() {
-        if let Some(path) = slot {
-            stamp_owner(
-                &mut owner,
-                &mut halo,
-                grid,
-                dims,
-                coords,
-                path,
-                group_ids[i] as i64,
-                clearance,
-                via_model,
-            );
-        }
-    }
+    rebuild_owner_maps(
+        &mut owner, &mut halo, grid, coords, &committed, group_ids, clearance, via_model,
+    );
 
     let mut rip_count: Vec<usize> = vec![0; n_nets];
     let global_budget = RIPUP_GLOBAL_BUDGET_PER_NET * n_nets.max(1);
@@ -2087,10 +2796,9 @@ fn ripup_legalize(
     let mut best_count = committed.iter().filter(|c| c.is_some()).count();
     let mut even_rounds = 0usize;
 
-    // Free every cell currently owned by group `g` — both the committed path cells
-    // AND their clearance / via-keepout halo (via `free_owner`, the symmetric
-    // inverse of `stamp_owner`) so no reserved cell leaks across a rip. Reset
-    // committed entries here.
+    // Free every committed path in group `g`, then rebuild both ownership maps.
+    // Rebuilding is necessary because a halo cell can be shared by several groups:
+    // deleting a first-owner scalar in place would lose a surviving reservation.
     let free_group_cells = |owner: &mut [i64],
                             halo: &mut [i64],
                             committed: &mut Committed,
@@ -2098,20 +2806,12 @@ fn ripup_legalize(
                             g: usize| {
         for i in 0..committed.len() {
             if group_ids[i] == g {
-                if let Some(path) = committed[i].take() {
-                    free_owner(
-                        owner,
-                        halo,
-                        dims,
-                        coords,
-                        &path,
-                        g as i64,
-                        clearance,
-                        via_model,
-                    );
-                }
+                committed[i] = None;
             }
         }
+        rebuild_owner_maps(
+            owner, halo, grid, coords, committed, group_ids, clearance, via_model,
+        );
     };
 
     while let Some(i) = queue.pop_front() {
@@ -2159,8 +2859,20 @@ fn ripup_legalize(
         // many purely-local nets.
         pad_set.load(&net.passable_pads);
         let routed = route_legal(
-            buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
-            via_model, clearance,
+            buf,
+            grid,
+            coords,
+            heuristic_costs,
+            pad_set,
+            &owner,
+            &halo,
+            gi,
+            net.src,
+            net.dst,
+            windows[i],
+            via_model,
+            clearance,
+            has_zero_cost,
         )
         .or_else(|| {
             if needs_full[i] {
@@ -2168,6 +2880,7 @@ fn ripup_legalize(
                     buf,
                     grid,
                     coords,
+                    heuristic_costs,
                     pad_set,
                     &owner,
                     &halo,
@@ -2177,6 +2890,7 @@ fn ripup_legalize(
                     Window::full(dims),
                     via_model,
                     clearance,
+                    has_zero_cost,
                 )
             } else {
                 None
@@ -2185,15 +2899,7 @@ fn ripup_legalize(
 
         if let Some((path, _)) = routed {
             stamp_owner(
-                &mut owner,
-                &mut halo,
-                grid,
-                dims,
-                coords,
-                &path,
-                gi,
-                clearance,
-                via_model,
+                &mut owner, &mut halo, grid, dims, coords, &path, gi, clearance, via_model,
             );
             committed[i] = Some(path);
             continue;
@@ -2250,8 +2956,20 @@ fn ripup_legalize(
 
         // Re-route i now that the victim's cells are free.
         let rerouted = route_legal(
-            buf, grid, coords, pad_set, &owner, &halo, gi, net.src, net.dst, windows[i],
-            via_model, clearance,
+            buf,
+            grid,
+            coords,
+            heuristic_costs,
+            pad_set,
+            &owner,
+            &halo,
+            gi,
+            net.src,
+            net.dst,
+            windows[i],
+            via_model,
+            clearance,
+            has_zero_cost,
         )
         .or_else(|| {
             if needs_full[i] {
@@ -2259,6 +2977,7 @@ fn ripup_legalize(
                     buf,
                     grid,
                     coords,
+                    heuristic_costs,
                     pad_set,
                     &owner,
                     &halo,
@@ -2268,6 +2987,7 @@ fn ripup_legalize(
                     Window::full(dims),
                     via_model,
                     clearance,
+                    has_zero_cost,
                 )
             } else {
                 None
@@ -2275,15 +2995,7 @@ fn ripup_legalize(
         });
         if let Some((path, _)) = rerouted {
             stamp_owner(
-                &mut owner,
-                &mut halo,
-                grid,
-                dims,
-                coords,
-                &path,
-                gi,
-                clearance,
-                via_model,
+                &mut owner, &mut halo, grid, dims, coords, &path, gi, clearance, via_model,
             );
             committed[i] = Some(path);
         } else {
@@ -2333,8 +3045,50 @@ fn permute_rec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mr_core::Dims;
     use mr_grid::GridBuilder;
+
+    enum MockProviderReply {
+        Paths(Vec<Option<Vec<CellIdx>>>),
+        Error,
+    }
+
+    struct MockProvider {
+        calls: AtomicUsize,
+        reply: MockProviderReply,
+    }
+
+    impl MockProvider {
+        fn paths(paths: Vec<Option<Vec<CellIdx>>>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                reply: MockProviderReply::Paths(paths),
+            }
+        }
+
+        fn error() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                reply: MockProviderReply::Error,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl IsolatedRouteProvider for MockProvider {
+        fn route_isolated_batch(
+            &self,
+            _request: IsolatedRouteRequest<'_>,
+        ) -> Result<Vec<Option<Vec<CellIdx>>>, RouterError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match &self.reply {
+                MockProviderReply::Paths(paths) => Ok(paths.clone()),
+                MockProviderReply::Error => Err(RouterError::BackendUnavailable("mock".into())),
+            }
+        }
+    }
 
     fn net(name: &str, src: CellIdx, dst: CellIdx) -> NetEndpoints {
         NetEndpoints {
@@ -2348,6 +3102,318 @@ mod tests {
     fn disjoint(a: &[CellIdx], b: &[CellIdx]) -> bool {
         let sa: std::collections::HashSet<_> = a.iter().copied().collect();
         b.iter().all(|c| !sa.contains(c))
+    }
+
+    fn board_with_costs(costs: &[Cost], n_total: usize) -> BoardRoute {
+        let results = costs
+            .iter()
+            .enumerate()
+            .map(|(i, &cost)| RouteResult {
+                net: format!("n{i}"),
+                path: Vec::new(),
+                cost,
+            })
+            .collect();
+        BoardRoute {
+            results,
+            unrouted: (costs.len()..n_total).map(|i| format!("n{i}")).collect(),
+            congestion: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+
+    fn assert_trace_eq(actual: &RouteTrace, expected: &RouteTrace) {
+        assert_eq!(actual.dims, expected.dims);
+        assert_eq!(actual.n_groups, expected.n_groups);
+        assert_eq!(actual.nets.len(), expected.nets.len());
+        for (a, b) in actual.nets.iter().zip(&expected.nets) {
+            assert_eq!(
+                (&a.net, a.src, a.dst, a.group, &a.alone_path),
+                (&b.net, b.src, b.dst, b.group, &b.alone_path)
+            );
+        }
+        assert_eq!(actual.iterations.len(), expected.iterations.len());
+        for (a, b) in actual.iterations.iter().zip(&expected.iterations) {
+            assert_eq!(
+                (a.iter, a.pfac, a.any_overuse),
+                (b.iter, b.pfac, b.any_overuse)
+            );
+            assert_eq!(a.paths, b.paths);
+            assert_eq!(a.overused_cells, b.overused_cells);
+        }
+        let a = actual.legalization.as_ref().unwrap();
+        let b = expected.legalization.as_ref().unwrap();
+        assert_eq!(a.chosen_order, b.chosen_order);
+        assert_eq!(a.committed, b.committed);
+        assert_eq!(a.candidates.len(), b.candidates.len());
+        for (a, b) in a.candidates.iter().zip(&b.candidates) {
+            assert_eq!(
+                (&a.order, a.routed, a.total_cost),
+                (&b.order, b.routed, b.total_cost)
+            );
+        }
+    }
+
+    fn provider_paths_from_trace(trace: &RouteTrace) -> Vec<Option<Vec<CellIdx>>> {
+        trace
+            .nets
+            .iter()
+            .map(|net| (!net.alone_path.is_empty()).then(|| net.alone_path.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn isolated_provider_matches_cpu_for_reachable_unreachable_and_zero_hop_nets() {
+        let dims = Dims::new(5, 5);
+        let mut builder = GridBuilder::new(dims, 1);
+        for (x, y) in [(2, 1), (1, 2), (3, 2), (2, 3)] {
+            builder.mark_cell(x, y);
+        }
+        let grid = builder.build();
+        let nets = vec![
+            net("open", dims.idx(0, 4), dims.idx(4, 4)),
+            net("blocked", dims.idx(0, 0), dims.idx(2, 2)),
+            net("zero", dims.idx(4, 0), dims.idx(4, 0)),
+        ];
+        let router = NegotiatedRouter::new();
+        let cpu_outcome = router.route_with_outcome(&grid, &nets).unwrap();
+        let (cpu_board, cpu_trace) = router.route_traced(&grid, &nets).unwrap();
+        assert_eq!(cpu_outcome.board, cpu_board);
+        assert_eq!(cpu_outcome.alone_routable, [true, false, true]);
+        assert_eq!(cpu_trace.nets[1].alone_path, Vec::<CellIdx>::new());
+        assert_eq!(cpu_trace.nets[2].alone_path, vec![nets[2].src]);
+
+        let provider = MockProvider::paths(provider_paths_from_trace(&cpu_trace));
+        let accelerated = router
+            .route_with_isolated_provider(&grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(accelerated, cpu_outcome);
+
+        let (traced_board, accelerated_trace) = router
+            .route_traced_with_isolated_provider(&grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(traced_board, cpu_board);
+        assert_trace_eq(&accelerated_trace, &cpu_trace);
+        assert_eq!(provider.calls(), 2, "one batch call per public route call");
+    }
+
+    #[test]
+    fn isolated_provider_rejection_falls_back_for_the_whole_batch() {
+        let dims = Dims::new(5, 5);
+        let grid = Grid::filled(dims, 1);
+        let nets = vec![
+            net("top", dims.idx(0, 0), dims.idx(4, 0)),
+            net("bottom", dims.idx(0, 4), dims.idx(4, 4)),
+        ];
+        let router = NegotiatedRouter::new();
+        let (expected_board, expected_trace) = router.route_traced(&grid, &nets).unwrap();
+
+        let providers = [
+            MockProvider::error(),
+            MockProvider::paths(vec![Some(vec![nets[0].src, nets[0].dst])]),
+            // The first entry is a legal but deliberately non-canonical detour;
+            // the second jumps four cells and invalidates the batch. If fallback
+            // were per-entry, the trace would expose the detour for `top`.
+            MockProvider::paths(vec![
+                Some(vec![0, 5, 6, 7, 8, 9, 4]),
+                Some(vec![nets[1].src, nets[1].dst]),
+            ]),
+        ];
+
+        for provider in &providers {
+            let (board, trace) = router
+                .route_traced_with_isolated_provider(&grid, &nets, provider)
+                .unwrap();
+            assert_eq!(board, expected_board);
+            assert_trace_eq(&trace, &expected_trace);
+            assert_eq!(provider.calls(), 1);
+        }
+    }
+
+    #[test]
+    fn isolated_provider_path_validation_covers_obstacles_repeats_and_vias() {
+        let planar_dims = Dims::new(3, 2);
+        let mut planar = Grid::filled(planar_dims, 1);
+        planar.set(planar_dims.idx(1, 0), OBSTACLE);
+        let planar_net = net("p", planar_dims.idx(0, 0), planar_dims.idx(2, 0));
+        let through = ViaModel::through_hole(1);
+        assert!(!provider_path_is_valid(
+            &planar,
+            &planar_net,
+            &through,
+            &[planar_net.src, planar_dims.idx(1, 0), planar_net.dst]
+        ));
+        assert!(!provider_path_is_valid(
+            &Grid::filled(planar_dims, 1),
+            &planar_net,
+            &through,
+            &[
+                planar_net.src,
+                planar_dims.idx(0, 1),
+                planar_net.src,
+                planar_net.dst
+            ]
+        ));
+
+        let via_dims = Dims::with_layers(1, 1, 2);
+        let via_grid = Grid::filled(via_dims, 1);
+        let via_net = net("v", via_dims.idx3(0, 0, 0), via_dims.idx3(0, 0, 1));
+        let forbidden = ViaModel::with_allowed_steps(2, 7, Vec::new());
+        assert!(!provider_path_is_valid(
+            &via_grid,
+            &via_net,
+            &forbidden,
+            &[via_net.src, via_net.dst]
+        ));
+    }
+
+    struct InspectingFallbackProvider {
+        calls: AtomicUsize,
+    }
+
+    impl IsolatedRouteProvider for InspectingFallbackProvider {
+        fn route_isolated_batch(
+            &self,
+            request: IsolatedRouteRequest<'_>,
+        ) -> Result<Vec<Option<Vec<CellIdx>>>, RouterError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.grid.dims, Dims::with_layers(4, 3, 3));
+            assert_eq!(request.nets.len(), 1);
+            assert_eq!(
+                request.windows,
+                [IsolatedRouteWindow::full(request.grid.dims)]
+            );
+            // Short coordinate arrays use GridCoords' exact index fallback on
+            // each endpoint of each gap, not a separate uniform approximation.
+            assert_eq!(request.x_edge_costs, [144, 16, 16]);
+            assert_eq!(request.y_edge_costs, [16, 16]);
+            assert_eq!(request.via_edge_costs, [Some(7), None]);
+            Err(RouterError::BackendUnavailable(
+                "inspect then fallback".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn isolated_provider_request_uses_exact_short_coordinate_and_via_costs() {
+        let dims = Dims::with_layers(4, 3, 3);
+        let grid = Grid::filled(dims, 1);
+        let nets = vec![net("n", dims.idx3(0, 0, 0), dims.idx3(3, 2, 0))];
+        let router = NegotiatedRouter::new()
+            .with_coords(GridCoords::from_lines(vec![10.0], Vec::new()))
+            .with_via_model(ViaModel::with_allowed_steps(3, 7, vec![(0, 1)]));
+        let provider = InspectingFallbackProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        let expected = router.route_with_outcome(&grid, &nets).unwrap();
+        let actual = router
+            .route_with_isolated_provider(&grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn serial_portfolio_score_is_completion_then_u64_cost_with_primary_ties() {
+        let primary = board_with_costs(&[u32::MAX, u32::MAX], 3);
+        let fewer = board_with_costs(&[1], 3);
+        let equal_but_cheaper = board_with_costs(&[u32::MAX, u32::MAX - 1], 3);
+        let equal_exact = primary.clone();
+        let more = board_with_costs(&[u32::MAX, u32::MAX, u32::MAX], 3);
+
+        assert!(!serial_candidate_is_better(&primary, &fewer));
+        assert!(serial_candidate_is_better(&primary, &equal_but_cheaper));
+        assert!(!serial_candidate_is_better(&primary, &equal_exact));
+        assert!(serial_candidate_is_better(&primary, &more));
+        assert_eq!(primary.total_cost(), 2 * u32::MAX as u64);
+    }
+
+    #[test]
+    fn legalization_candidate_score_distinguishes_totals_above_cost_max() {
+        let dims = Dims::new(3, 2);
+        let mut grid = Grid::filled(dims, 1);
+        grid.set(dims.idx(1, 0), 100);
+        grid.set(dims.idx(2, 0), Cost::MAX / 2);
+        let nets = vec![net("a", 0, 2), net("b", 0, 2)];
+
+        let costly: Committed = vec![Some(vec![0, 1, 2]), Some(vec![0, 1, 2])];
+        let cheaper: Committed = vec![Some(vec![0, 3, 4, 5, 2]), Some(vec![0, 3, 4, 5, 2])];
+        let costly_total = committed_grid_cost(&grid, &nets, &costly);
+        let cheaper_total = committed_grid_cost(&grid, &nets, &cheaper);
+
+        assert!(cheaper_total > Cost::MAX as u64);
+        assert!(cheaper_total < costly_total);
+        // The stable trace field must narrow both totals, but candidate selection
+        // must still prefer the genuinely cheaper later (lexicographically larger)
+        // order using the full-width totals.
+        assert_eq!(costly_total.min(Cost::MAX as u64) as Cost, Cost::MAX);
+        assert_eq!(cheaper_total.min(Cost::MAX as u64) as Cost, Cost::MAX);
+        assert!(legalization_candidate_is_better(
+            2,
+            cheaper_total,
+            &[1, 0],
+            2,
+            costly_total,
+            &[0, 1],
+        ));
+    }
+
+    #[test]
+    fn serial_portfolio_trigger_enforces_group_net_and_cell_bounds() {
+        let incomplete = |n| board_with_costs(&[1], n);
+        let complete = |n| board_with_costs(&vec![1; n], n);
+        let at_cap = Dims::new(500, 500);
+        let above_cap = Dims::new(501, 500);
+
+        assert!(!should_try_serial_candidate(
+            at_cap,
+            PORTFOLIO_MIN_NETS - 1,
+            true,
+            &incomplete(PORTFOLIO_MIN_NETS - 1)
+        ));
+        // An incomplete primary must not bypass the unconditional cell cap.
+        assert!(!should_try_serial_candidate(
+            above_cap,
+            PORTFOLIO_MIN_NETS,
+            true,
+            &incomplete(PORTFOLIO_MIN_NETS)
+        ));
+        assert!(should_try_serial_candidate(
+            at_cap,
+            PORTFOLIO_MAX_NETS,
+            true,
+            &incomplete(PORTFOLIO_MAX_NETS)
+        ));
+        assert!(!should_try_serial_candidate(
+            at_cap,
+            PORTFOLIO_MAX_NETS + 1,
+            true,
+            &incomplete(PORTFOLIO_MAX_NETS + 1)
+        ));
+        assert!(!should_try_serial_candidate(
+            at_cap,
+            PORTFOLIO_MIN_NETS,
+            false,
+            &incomplete(PORTFOLIO_MIN_NETS)
+        ));
+        assert!(should_try_serial_candidate(
+            at_cap,
+            PORTFOLIO_MIN_NETS,
+            true,
+            &complete(PORTFOLIO_MIN_NETS)
+        ));
+        assert!(!should_try_serial_candidate(
+            above_cap,
+            PORTFOLIO_MIN_NETS,
+            true,
+            &complete(PORTFOLIO_MIN_NETS)
+        ));
+
+        let named_group = vec![net("g#0", 0, 1), net("g#1", 2, 3)];
+        let shared_cell_only = vec![net("a", 0, 1), net("b", 1, 2)];
+        assert!(has_named_subnet_group(&named_group));
+        assert!(!has_named_subnet_group(&shared_cell_only));
     }
 
     /// Two nets whose individually-shortest straight paths cross in the middle.
@@ -2407,18 +3473,24 @@ mod tests {
         let s0 = net("g#0", dims.idx(0, 0), dims.idx(7, 0));
         let s1 = net("g#1", dims.idx(0, 2), dims.idx(7, 2));
         let f = net("foreign", dims.idx(0, 5), dims.idx(7, 5));
-        let br = NegotiatedRouter::new()
-            .route(&grid, &[s0, s1, f])
-            .unwrap();
+        let br = NegotiatedRouter::new().route(&grid, &[s0, s1, f]).unwrap();
         assert!(br.unrouted.is_empty(), "all nets must route: {br:?}");
-        assert_eq!(br.groups.len(), br.results.len(), "groups align 1:1 with results");
+        assert_eq!(
+            br.groups.len(),
+            br.results.len(),
+            "groups align 1:1 with results"
+        );
         // Map back from results (which are in input order here) to assert grouping.
         let g_of = |name: &str| {
             let i = br.results.iter().position(|r| r.net == name).unwrap();
             br.groups[i]
         };
         assert_eq!(g_of("g#0"), g_of("g#1"), "`#`-siblings share a group id");
-        assert_ne!(g_of("g#0"), g_of("foreign"), "a foreign net is a distinct group");
+        assert_ne!(
+            g_of("g#0"),
+            g_of("foreign"),
+            "a foreign net is a distinct group"
+        );
     }
 
     /// A net must detour around a foreign net's pad (a hard obstacle it does not
@@ -2501,6 +3573,53 @@ mod tests {
         assert_eq!(br1.results, br2.results);
         assert_eq!(br1.unrouted, br2.unrouted);
         assert_eq!(br1.congestion, br2.congestion);
+    }
+
+    #[test]
+    fn lightweight_outcome_matches_route_and_solo_routability() {
+        let router = NegotiatedRouter::new();
+        let mut saw_routable = false;
+        let mut saw_unroutable = false;
+
+        for fixture in mr_fixtures::obstacle_battery() {
+            let outcome = router
+                .route_with_outcome(&fixture.grid, &fixture.nets)
+                .unwrap();
+            assert_eq!(
+                outcome.board,
+                router.route(&fixture.grid, &fixture.nets).unwrap(),
+                "{}: outcome board must equal the Router API",
+                fixture.name
+            );
+
+            let solo: Vec<bool> = fixture
+                .nets
+                .iter()
+                .map(|net| {
+                    let board = router
+                        .route(&fixture.grid, std::slice::from_ref(net))
+                        .unwrap();
+                    !board.results.is_empty() && board.unrouted.is_empty()
+                })
+                .collect();
+            assert_eq!(
+                outcome.alone_routable, solo,
+                "{}: cached isolation result must equal a real solo route",
+                fixture.name
+            );
+            saw_routable |= solo.iter().any(|&routable| routable);
+            saw_unroutable |= solo.iter().any(|&routable| !routable);
+        }
+
+        assert!(saw_routable && saw_unroutable);
+
+        let dims = Dims::new(1, 1);
+        let zero = vec![net("zero", 0, 0)];
+        let outcome = router
+            .route_with_outcome(&Grid::filled(dims, 1), &zero)
+            .unwrap();
+        assert_eq!(outcome.alone_routable, [true]);
+        assert_eq!(outcome.board.results[0].cost, 0);
     }
 
     /// Two chained sub-nets of one connection ("X#0","X#1") share a middle cell.
@@ -2770,11 +3889,13 @@ mod tests {
         let via_model = ViaModel::through_hole(dims.layers);
         // Abstract Dims-only grid: uniform unit coords reproduce unit-hop pricing.
         let coords = GridCoords::uniform(dims);
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
 
         // Order [0,1] = A first: B should be stranded.
         let c_ab = legalize_in_order(
             &grid,
             &coords,
+            &heuristic_costs,
             &mut buf,
             &mut pad_set,
             &nets_ab,
@@ -2785,6 +3906,7 @@ mod tests {
             n_cells,
             &via_model,
             0.0,
+            false,
         );
         assert!(c_ab[0].is_some(), "A commits in A-first order");
         assert!(
@@ -2796,6 +3918,7 @@ mod tests {
         let c_ba = legalize_in_order(
             &grid,
             &coords,
+            &heuristic_costs,
             &mut buf,
             &mut pad_set,
             &nets_ab,
@@ -2806,6 +3929,7 @@ mod tests {
             n_cells,
             &via_model,
             0.0,
+            false,
         );
         assert!(
             c_ba[0].is_some() && c_ba[1].is_some(),
@@ -3212,15 +4336,93 @@ mod tests {
         assert!(disjoint(&br_zero.results[0].path, &br_zero.results[1].path));
     }
 
-    /// Determinism under parallelism: a clearance-ACTIVE route (which now takes the
-    /// snapshot-based rayon-parallel negotiation path) must produce a byte-identical
-    /// [`BoardRoute`] across two runs. The deterministic snapshot + index-ordered
-    /// merge make the result independent of how rayon schedules the parallel net
-    /// searches, so two runs of the same problem agree exactly.
     #[test]
-    fn clearance_active_route_is_deterministic_under_parallelism() {
-        // A handful of nets on a roomy board so several route in parallel each
-        // iteration. clearance_cells = 1 makes `clearance_active` true → parallel path.
+    fn counted_halo_stamp_removes_exact_parallel_self_cost() {
+        // A radius-1 footprint visits central cells once for each neighbouring path
+        // segment. Boolean membership would subtract only one and leave a large,
+        // artificial self-penalty in a Jacobi snapshot.
+        let dims = Dims::new(7, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+        let coords = GridCoords::uniform(dims);
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
+        let via_model = ViaModel::through_hole(1);
+        let src = dims.idx(1, 2);
+        let dst = dims.idx(5, 2);
+        let old_path: Vec<_> = (1..=5).map(|x| dims.idx(x, 2)).collect();
+        let mut present = vec![0u32; dims.len()];
+        for &c in &old_path {
+            present[c as usize] += 1;
+        }
+        let mut present_halo = vec![0u32; dims.len()];
+        for_each_halo_cell(dims, &coords, &grid, &old_path, 1.0, &via_model, |c| {
+            present_halo[c as usize] += 1
+        });
+
+        let mut pads = PadSet::new(dims.len());
+        pads.load(&[]);
+        let mut own_path = PadSet::new(dims.len());
+        own_path.load(&old_path);
+        let mut own_halo = CountedCellSet::new(dims.len());
+        own_halo.clear();
+        for_each_halo_cell(dims, &coords, &grid, &old_path, 1.0, &via_model, |c| {
+            own_halo.increment(c)
+        });
+        let centre = dims.idx(3, 2);
+        assert!(present_halo[centre as usize] > 1, "fixture needs overlap");
+        for c in 0..dims.len() as CellIdx {
+            assert_eq!(own_halo.count(c), present_halo[c as usize], "cell {c}");
+        }
+
+        let zeros = vec![0u32; dims.len()];
+        let mut with_snapshot_buf = SearchBuf::new(dims.len());
+        let with_snapshot = route_negotiated(
+            &mut with_snapshot_buf,
+            &grid,
+            &coords,
+            &heuristic_costs,
+            &pads,
+            Some(&own_path),
+            Some(&own_halo),
+            &present,
+            &present_halo,
+            &zeros,
+            7,
+            src,
+            dst,
+            Window::full(dims),
+            &via_model,
+            false,
+        );
+        let mut empty_buf = SearchBuf::new(dims.len());
+        let without_snapshot = route_negotiated(
+            &mut empty_buf,
+            &grid,
+            &coords,
+            &heuristic_costs,
+            &pads,
+            None,
+            None,
+            &zeros,
+            &zeros,
+            &zeros,
+            7,
+            src,
+            dst,
+            Window::full(dims),
+            &via_model,
+            false,
+        );
+        assert_eq!(
+            with_snapshot, without_snapshot,
+            "a net's old copper and repeated halo visits must contribute zero self-cost"
+        );
+    }
+
+    /// Determinism with active clearance: repeated runs must produce a byte-identical
+    /// [`BoardRoute`].
+    #[test]
+    fn clearance_active_route_is_deterministic() {
+        // A handful of nets on a roomy board with the halo cost model active.
         let dims = Dims::new(12, 12);
         let grid = GridBuilder::new(dims, 1).build();
         let nets = vec![
@@ -3241,11 +4443,9 @@ mod tests {
         assert_eq!(br1.congestion, br2.congestion);
     }
 
-    /// Parallel + clearance still routes all nets on a roomy board (a
-    /// timing-independent correctness check on the parallel negotiation path). Three
-    /// well-separated nets with clearance active must all route, cell-disjoint.
+    /// Three well-separated nets with clearance active must all route cell-disjointly.
     #[test]
-    fn clearance_active_parallel_routes_all_on_roomy_board() {
+    fn clearance_active_routes_all_on_roomy_board() {
         let dims = Dims::new(10, 10);
         let grid = GridBuilder::new(dims, 1).build();
         let nets = vec![
@@ -3261,7 +4461,7 @@ mod tests {
 
         assert!(
             br.unrouted.is_empty(),
-            "parallel clearance route must place all nets on a roomy board: {br:?}"
+            "clearance route must place all nets on a roomy board: {br:?}"
         );
         assert_eq!(br.results.len(), 3);
         for i in 0..br.results.len() {
@@ -3272,6 +4472,484 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nonuniform_stage_enforces_geometric_clearance() {
+        // The windows are 38 cell indices apart, but on this dense Hanan axis the
+        // copper is only 0.38 mm apart.  Cell-count staging used to co-schedule the
+        // groups and commit both despite a 0.5 mm hard clearance.
+        let dims = Dims::new(80, 1);
+        let grid = GridBuilder::new(dims, 1).build();
+        let coords =
+            GridCoords::from_lines((0..dims.w).map(|i| i as f64 * 0.01).collect(), vec![0.0]);
+        let nets = vec![net("a", 0, 2), net("b", 40, 42)];
+        let board = NegotiatedRouter::new()
+            .with_coords(coords.clone())
+            .with_clearance_mm(0.5)
+            .route(&grid, &nets)
+            .unwrap();
+        assert_eq!(
+            board.results.len(),
+            1,
+            "both straight 1-D routes are too close"
+        );
+        assert_eq!(board.unrouted.len(), 1);
+    }
+
+    #[test]
+    fn short_coordinate_arrays_fall_back_to_uniform_for_clearance() {
+        let dims = Dims::new(3, 5);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = vec![
+            net("a", dims.idx(1, 0), dims.idx(1, 3)),
+            net("b", dims.idx(0, 2), dims.idx(2, 2)),
+        ];
+        let uniform = NegotiatedRouter::new()
+            .with_coords(GridCoords::uniform(dims))
+            .with_clearance_cells(1)
+            .route(&grid, &nets)
+            .unwrap();
+        let defensive = NegotiatedRouter::new()
+            .with_coords(GridCoords::default())
+            .with_clearance_cells(1)
+            .route(&grid, &nets)
+            .unwrap();
+        assert_eq!(
+            defensive, uniform,
+            "missing lines use x_of/y_of unit fallback"
+        );
+    }
+
+    #[test]
+    fn roomy_clearance_crossing_converges_before_iteration_cap() {
+        let dims = Dims::new(9, 9);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = vec![
+            net("a", dims.idx(4, 1), dims.idx(4, 7)),
+            net("b", dims.idx(1, 4), dims.idx(7, 4)),
+        ];
+        let (_board, trace) = NegotiatedRouter::new()
+            .with_clearance_cells(1)
+            .route_traced(&grid, &nets)
+            .unwrap();
+        assert!(
+            trace.iterations.len() < MAX_ITERS as usize,
+            "a two-net open board must not oscillate for all {MAX_ITERS} iterations"
+        );
+        assert!(!trace.iterations.last().unwrap().any_overuse);
+    }
+
+    #[test]
+    fn large_parallel_route_is_identical_across_rayon_pool_sizes() {
+        let dims = Dims::new(24, 24);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets: Vec<_> = (0..18u32)
+            .map(|i| net(&format!("n{i}"), dims.idx(0, i + 2), dims.idx(23, i + 2)))
+            .collect();
+        let route_in = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| NegotiatedRouter::new().route(&grid, &nets).unwrap())
+        };
+        let one = route_in(1);
+        assert_eq!(route_in(2), one);
+        assert_eq!(route_in(4), one);
+    }
+
+    #[test]
+    fn parallel_clearance_route_is_identical_across_rayon_pool_sizes() {
+        // More than PARALLEL_NEGOTIATION_THRESHOLD nets forces the Jacobi path.
+        // Two central nets collide, ensuring a second iteration where each worker
+        // must subtract its old counted halo; the other nets are separated fillers.
+        let dims = Dims::new(40, 40);
+        let grid = GridBuilder::new(dims, 1).build();
+        let mut nets = vec![
+            net("cross-v", dims.idx(25, 12), dims.idx(25, 28)),
+            net("cross-h", dims.idx(17, 20), dims.idx(33, 20)),
+        ];
+        nets.extend((0..15u32).map(|i| {
+            let y = i * 2;
+            net(&format!("filler-{i}"), dims.idx(0, y), dims.idx(4, y))
+        }));
+
+        let route_in = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    NegotiatedRouter::new()
+                        .with_clearance_cells(1)
+                        .route_traced(&grid, &nets)
+                        .unwrap()
+                })
+        };
+        let one = route_in(1);
+        assert!(
+            one.1.iterations.len() > 1,
+            "fixture must exercise old-path self-halo subtraction"
+        );
+        let assert_same = |got: (BoardRoute, RouteTrace)| {
+            assert_eq!(got.0, one.0);
+            assert_eq!(got.1.iterations.len(), one.1.iterations.len());
+            for (a, b) in got.1.iterations.iter().zip(&one.1.iterations) {
+                assert_eq!(
+                    (a.iter, a.pfac, a.any_overuse),
+                    (b.iter, b.pfac, b.any_overuse)
+                );
+                assert_eq!(a.paths, b.paths);
+                assert_eq!(a.overused_cells, b.overused_cells);
+            }
+        };
+        assert_same(route_in(2));
+        assert_same(route_in(4));
+    }
+
+    const MULTILAYER_PORTFOLIO_ENDPOINTS: [(u32, u32, u32, u32, u32, u32); 17] = [
+        (9, 0, 0, 0, 10, 0),
+        (6, 13, 1, 13, 0, 1),
+        (0, 3, 1, 13, 9, 1),
+        (0, 4, 1, 10, 13, 0),
+        (7, 0, 1, 4, 13, 1),
+        (3, 0, 0, 8, 13, 0),
+        (0, 13, 1, 13, 4, 1),
+        (8, 0, 1, 3, 13, 1),
+        (2, 0, 1, 13, 13, 1),
+        (0, 8, 0, 13, 7, 0),
+        (0, 4, 0, 10, 13, 1),
+        (0, 6, 0, 13, 7, 1),
+        (4, 13, 0, 3, 0, 1),
+        (13, 2, 1, 2, 13, 0),
+        (2, 13, 0, 13, 0, 0),
+        (12, 0, 0, 0, 10, 0),
+        (4, 0, 0, 12, 13, 0),
+    ];
+
+    fn multilayer_portfolio_nets(dims: Dims, grouped_first_pair: bool) -> Vec<NetEndpoints> {
+        MULTILAYER_PORTFOLIO_ENDPOINTS
+            .into_iter()
+            .enumerate()
+            .map(|(i, (sx, sy, sl, dx, dy, dl))| {
+                let name = if grouped_first_pair && i < 2 {
+                    format!("group#{i}")
+                } else {
+                    format!("n{i}")
+                };
+                net(&name, dims.idx3(sx, sy, sl), dims.idx3(dx, dy, dl))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multilayer_parallel_clearance_preserves_better_jacobi_seed() {
+        // This two-layer, 17-net fixture crosses the parallel threshold. The exact
+        // Jacobi result legalizes five nets, while running the former unconditional
+        // one-pass Gauss-Seidel polish first legalizes only four. Pin both the
+        // better outcome and cross-pool determinism: multilayer routing must pass
+        // the Jacobi seed directly to legalization instead of applying that polish.
+        let dims = Dims::with_layers(14, 14, 2);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = multilayer_portfolio_nets(dims, false);
+        let group_ids = connection_group_ids(&nets);
+        assert!(nets.len() > PARALLEL_NEGOTIATION_THRESHOLD);
+
+        let route_in = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    NegotiatedRouter::new()
+                        .with_clearance_cells(1)
+                        .route_variant(
+                            &grid,
+                            &nets,
+                            &group_ids,
+                            NegotiationMode::Adaptive,
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                        .board
+                })
+        };
+        let one = route_in(1);
+        assert_eq!(
+            one.results
+                .iter()
+                .map(|result| result.net.as_str())
+                .collect::<Vec<_>>(),
+            ["n0", "n1", "n2", "n3", "n15"],
+            "the unpolished multilayer Jacobi seed must retain its fifth legal net"
+        );
+        assert_eq!(route_in(2), one);
+        assert_eq!(route_in(4), one);
+    }
+
+    #[test]
+    fn jacobi_thread_local_scratch_bounds_concurrent_routes() {
+        let dims = Dims::with_layers(14, 14, 2);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = multilayer_portfolio_nets(dims, false);
+        let constructions = std::sync::Arc::new(AtomicUsize::new(0));
+        let router = NegotiatedRouter::new()
+            .with_clearance_cells(1)
+            .with_jacobi_scratch_probe(constructions.clone());
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let outcomes: Vec<_> = pool.install(|| {
+            (0..8)
+                .into_par_iter()
+                .map(|_| router.route_traced(&grid, &nets).unwrap())
+                .collect()
+        });
+
+        assert!(
+            outcomes[0].1.iterations.len() > 1,
+            "fixture must exercise scratch reuse across iterations"
+        );
+        for (board, trace) in &outcomes[1..] {
+            assert_eq!(board, &outcomes[0].0);
+            assert_trace_eq(trace, &outcomes[0].1);
+        }
+        let allocated = constructions.load(Ordering::Relaxed);
+        assert!(
+            (1..=4).contains(&allocated),
+            "eight concurrent routes on four workers must allocate at most four \
+             thread-local slots total, got {allocated}"
+        );
+    }
+
+    #[test]
+    fn serial_portfolio_selects_lower_cost_candidate_with_identical_trace() {
+        let dims = Dims::with_layers(14, 14, 2);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = multilayer_portfolio_nets(dims, true);
+        let group_ids = connection_group_ids(&nets);
+        let router = NegotiatedRouter::new().with_clearance_cells(1);
+
+        let primary = router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::Adaptive,
+                None,
+                None,
+            )
+            .unwrap()
+            .board;
+        let mut serial_trace = empty_route_trace(dims);
+        let serial = router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::ForceSerial,
+                None,
+                Some(&mut serial_trace),
+            )
+            .unwrap()
+            .board;
+        assert_eq!((primary.results.len(), primary.total_cost()), (5, 108));
+        assert_eq!((serial.results.len(), serial.total_cost()), (5, 88));
+        assert!(serial_candidate_is_better(&primary, &serial));
+        assert_eq!(router.route(&grid, &nets).unwrap(), serial);
+
+        let route_in = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| router.route_traced(&grid, &nets).unwrap())
+        };
+        let one = route_in(1);
+        assert_eq!(one.0, serial);
+        assert_trace_eq(&one.1, &serial_trace);
+        for threads in [2, 4] {
+            let got = route_in(threads);
+            assert_eq!(got.0, one.0);
+            assert_trace_eq(&got.1, &one.1);
+        }
+    }
+
+    #[test]
+    fn isolated_provider_batch_is_reused_across_bounded_portfolio_variants() {
+        let dims = Dims::with_layers(14, 14, 2);
+        let grid = GridBuilder::new(dims, 1).build();
+        let nets = multilayer_portfolio_nets(dims, true);
+        let router = NegotiatedRouter::new().with_clearance_cells(1);
+
+        // This is the serial-winner fixture, so route_impl necessarily evaluates
+        // both the adaptive primary and ForceSerial alternate before selection.
+        let (expected_board, expected_trace) = router.route_traced(&grid, &nets).unwrap();
+        assert_eq!(
+            (expected_board.results.len(), expected_board.total_cost()),
+            (5, 88)
+        );
+        let provider = MockProvider::paths(provider_paths_from_trace(&expected_trace));
+        let (board, trace) = router
+            .route_traced_with_isolated_provider(&grid, &nets, &provider)
+            .unwrap();
+
+        assert_eq!(board, expected_board);
+        assert_trace_eq(&trace, &expected_trace);
+        assert_eq!(
+            provider.calls(),
+            1,
+            "primary and serial variants must borrow one precomputed batch"
+        );
+    }
+
+    #[test]
+    fn serial_portfolio_retains_primary_when_serial_routes_fewer() {
+        let dims = Dims::with_layers(14, 14, 2);
+        let grid = GridBuilder::new(dims, 1).build();
+        let endpoints = [
+            (97, 381),
+            (176, 32),
+            (271, 326),
+            (169, 20),
+            (131, 284),
+            (110, 261),
+            (213, 253),
+            (128, 13),
+            (115, 388),
+            (86, 264),
+            (356, 233),
+            (77, 58),
+            (236, 151),
+            (380, 215),
+            (62, 156),
+            (104, 107),
+            (276, 218),
+        ];
+        let nets: Vec<_> = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(i, (src, dst))| {
+                let name = if i < 2 {
+                    format!("group#{i}")
+                } else {
+                    format!("n{i}")
+                };
+                net(&name, src, dst)
+            })
+            .collect();
+        let group_ids = connection_group_ids(&nets);
+        let router = NegotiatedRouter::new().with_clearance_cells(1);
+        let primary = router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::Adaptive,
+                None,
+                None,
+            )
+            .unwrap()
+            .board;
+        let serial = router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::ForceSerial,
+                None,
+                None,
+            )
+            .unwrap()
+            .board;
+
+        assert_eq!((primary.results.len(), primary.total_cost()), (9, 120));
+        assert_eq!((serial.results.len(), serial.total_cost()), (8, 81));
+        assert!(!serial_candidate_is_better(&primary, &serial));
+        assert_eq!(router.route(&grid, &nets).unwrap(), primary);
+    }
+
+    #[test]
+    fn geometric_clearance_boundary_is_inclusive() {
+        let dims = Dims::new(6, 1);
+        let coords = GridCoords::from_lines(vec![0.0, 0.2, 0.5, 1.0, 1.51, 2.1], vec![0.0]);
+        assert_eq!(geom_box(&coords.x_lines, dims.w, 3, 0.5), (2, 4));
+        assert_eq!(geom_box(&coords.x_lines, dims.w, 3, 0.51), (2, 5));
+    }
+
+    #[test]
+    fn truncated_coordinates_scan_every_geometric_witness() {
+        let dims = Dims::new(4, 1);
+        // `x_of` positions are [0, 100, 2, 3]: the documented unit fallback after
+        // the explicit prefix is intentionally non-monotonic.  Around seed x=3 at
+        // radius 3, x=0,2,3 are in range while x=1 is not.  An outward monotonic
+        // walk stops at x=1 and used to omit the disconnected x=0 witness.
+        let coords = GridCoords::from_lines(vec![0.0, 100.0], vec![0.0]);
+        let grid = Grid::filled(dims, 1);
+        let mut visited = Vec::new();
+        for_each_halo_cell(
+            dims,
+            &coords,
+            &grid,
+            &[dims.idx(3, 0)],
+            3.0,
+            &ViaModel::through_hole(dims.layers),
+            |c| visited.push(c),
+        );
+        visited.sort_unstable();
+        visited.dedup();
+        assert_eq!(
+            visited,
+            vec![dims.idx(0, 0), dims.idx(2, 0), dims.idx(3, 0)]
+        );
+    }
+
+    #[test]
+    fn maximum_passable_weight_is_not_confused_with_obstacle() {
+        let dims = Dims::new(2, 1);
+        let mut grid = Grid::filled(dims, 1);
+        grid.set(dims.idx(1, 0), OBSTACLE - 1);
+        let nets = vec![net("high", dims.idx(0, 0), dims.idx(1, 0))];
+
+        // Exercise the legalization search directly: multiplying the destination's
+        // valid weight by the uniform geometric scale must stay below the sentinel.
+        let mut buf = SearchBuf::new(dims.len());
+        let mut pads = PadSet::new(dims.len());
+        pads.load(&[]);
+        let coords = GridCoords::uniform(dims);
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
+        let legal = route_legal(
+            &mut buf,
+            &grid,
+            &coords,
+            &heuristic_costs,
+            &pads,
+            &[],
+            &[],
+            -1,
+            dims.idx(0, 0),
+            dims.idx(1, 0),
+            Window::full(dims),
+            &ViaModel::through_hole(dims.layers),
+            0.0,
+            false,
+        );
+        assert_eq!(legal.map(|(path, _)| path), Some(vec![0, 1]));
+
+        let routed = NegotiatedRouter::new().route(&grid, &nets).unwrap();
+        assert_eq!(routed.results.len(), 1);
+        assert_eq!(routed.results[0].path, vec![dims.idx(0, 0), dims.idx(1, 0)]);
+        assert_eq!(routed.results[0].cost, OBSTACLE - 1);
+
+        grid.set(dims.idx(1, 0), OBSTACLE);
+        assert!(matches!(
+            NegotiatedRouter::new().route(&grid, &nets),
+            Err(RouterError::InvalidEndpoint { .. })
+        ));
     }
 
     // ---- heuristic admissibility (lower-bound) property ----------------------
@@ -3300,18 +4978,60 @@ mod tests {
         edge_cost(coords.manhattan_len(dims, a, b))
     }
 
+    /// Former O(axis-distance) implementation retained as a test oracle for the
+    /// prefix lookup. This mirrors the coordinate fallback and saturation exactly.
+    fn scanned_axis_leg_cost(lines: &[f64], i: u32, j: u32) -> Cost {
+        let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+        let mut total: Cost = 0;
+        for k in lo..hi {
+            let a = lines.get(k as usize).copied().unwrap_or(k as f64);
+            let b = lines.get(k as usize + 1).copied().unwrap_or((k + 1) as f64);
+            total = total.saturating_add(edge_cost((b - a).abs()));
+        }
+        total
+    }
+
+    #[test]
+    fn heuristic_prefix_exactly_matches_gap_scan_and_saturation() {
+        // Complete, truncated, empty, non-monotonic defensive input, and totals
+        // that saturate `Cost`. Only indices inside the routed dimension are
+        // queried; missing line positions use the documented index fallback.
+        let cases: &[(u32, &[f64])] = &[
+            (6, &[0.0, 0.03125, 0.5, 2.25, 2.25, 9.0]),
+            (7, &[10.0, 10.125]),
+            (5, &[]),
+            (6, &[0.0, 4.0, -2.0]),
+            (5, &[0.0, 1.0e20, 2.0e20, 3.0e20, 4.0e20]),
+        ];
+        for &(count, lines) in cases {
+            let prefix = axis_cost_prefix(lines, count);
+            assert_eq!(prefix.len(), count as usize);
+            for i in 0..count {
+                for j in 0..count {
+                    assert_eq!(
+                        axis_leg_cost(&prefix, i, j),
+                        scanned_axis_leg_cost(lines, i, j),
+                        "count={count} lines={lines:?} interval=({i},{j})"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(axis_cost_prefix(&[], 0), vec![0]);
+    }
+
     #[test]
     fn heuristic_is_lower_bound_collinear_and_l_shaped() {
         // Sweep a range of non-integer gap patterns on a single layer (no via term),
         // and assert the heuristic never exceeds the per-step summed path base for
         // both a straight (collinear) path and an L-shaped path between the corners.
         let gap_sets: &[&[f64]] = &[
-            &[0.5, 0.5, 0.5, 0.5],          // halves: round-of-sum vs sum-of-rounds
-            &[0.03125, 0.03125, 0.03125],   // 0.5/16 each: each rounds to 0, sum doesn't
+            &[0.5, 0.5, 0.5, 0.5],        // halves: round-of-sum vs sum-of-rounds
+            &[0.03125, 0.03125, 0.03125], // 0.5/16 each: each rounds to 0, sum doesn't
             &[1.5, 2.5, 0.5, 3.5],
             &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-            &[0.46875, 0.46875, 0.46875],   // 7.5/16 each
-            &[2.0, 2.0, 2.0],               // integers: must match exactly (uniform-like)
+            &[0.46875, 0.46875, 0.46875], // 7.5/16 each
+            &[2.0, 2.0, 2.0],             // integers: must match exactly (uniform-like)
         ];
         for xs in gap_sets {
             for ys in gap_sets {
@@ -3319,13 +5039,20 @@ mod tests {
                 let y_lines = cumsum(ys);
                 let dims = Dims::new(x_lines.len() as u32, y_lines.len() as u32);
                 let coords = GridCoords::from_lines(x_lines.clone(), y_lines.clone());
+                let heuristic_costs = ManhattanCosts::new(dims, &coords);
                 let a = dims.idx(0, 0);
                 let b = dims.idx(dims.w - 1, dims.h - 1);
 
-                let h = manhattan_scaled(dims, &coords, a, b, 0);
+                let h = manhattan_scaled(dims, &heuristic_costs, a, b, 0);
 
                 // Collinear leg along x (then y handled by the y-only pair below).
-                let x_only = manhattan_scaled(dims, &coords, dims.idx(0, 0), dims.idx(dims.w - 1, 0), 0);
+                let x_only = manhattan_scaled(
+                    dims,
+                    &heuristic_costs,
+                    dims.idx(0, 0),
+                    dims.idx(dims.w - 1, 0),
+                    0,
+                );
                 let x_path: Vec<CellIdx> = (0..dims.w).map(|x| dims.idx(x, 0)).collect();
                 assert!(
                     x_only <= summed_path_base(dims, &coords, &x_path),
@@ -3365,13 +5092,14 @@ mod tests {
         let x_lines = cumsum(&[g, g, g]); // 4 lines, 3 gaps
         let dims = Dims::new(x_lines.len() as u32, 1);
         let coords = GridCoords::from_lines(x_lines, vec![0.0]);
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
         let a = dims.idx(0, 0);
         let b = dims.idx(dims.w - 1, 0);
         let path: Vec<CellIdx> = (0..dims.w).map(|x| dims.idx(x, 0)).collect();
         let summed = summed_path_base(dims, &coords, &path);
 
         let old = old_manhattan_planar(dims, &coords, a, b);
-        let new = manhattan_scaled(dims, &coords, a, b, 0);
+        let new = manhattan_scaled(dims, &heuristic_costs, a, b, 0);
 
         assert_eq!(summed, 0, "search pays 0 per-step here");
         assert!(
@@ -3390,15 +5118,47 @@ mod tests {
         // aggregate form and the historical (dx + dy) * SCALE, preserving byte-identity.
         let dims = Dims::new(7, 5);
         let coords = GridCoords::uniform(dims);
+        let heuristic_costs = ManhattanCosts::new(dims, &coords);
         for &(ax, ay, bx, by) in &[(0u32, 0u32, 6u32, 4u32), (3, 1, 3, 4), (0, 2, 6, 2)] {
             let a = dims.idx(ax, ay);
             let b = dims.idx(bx, by);
-            let new = manhattan_scaled(dims, &coords, a, b, 0);
+            let new = manhattan_scaled(dims, &heuristic_costs, a, b, 0);
             let old = old_manhattan_planar(dims, &coords, a, b);
             let expected = (ax.abs_diff(bx) + ay.abs_diff(by)) * SCALE;
             assert_eq!(new, old, "uniform: new must equal old aggregate form");
             assert_eq!(new, expected, "uniform: new must equal (dx+dy)*SCALE");
         }
+    }
+
+    #[test]
+    fn overlapping_halo_survives_owner_rip_deterministically() {
+        // With clearance 1, copper at x=1 and x=3 is legal (distance 2), but both
+        // halos cover x=2.  The overlap must block both owners while both remain;
+        // after ripping group 0 it must become group 1's ordinary halo, not free.
+        let dims = Dims::new(5, 1);
+        let grid = GridBuilder::new(dims, 1).build();
+        let coords = GridCoords::uniform(dims);
+        let via_model = ViaModel::through_hole(1);
+        let mut committed: Committed = vec![Some(vec![dims.idx(1, 0)]), Some(vec![dims.idx(3, 0)])];
+        let group_ids = vec![0, 1];
+        let mut owner = vec![-1; dims.len()];
+        let mut halo = vec![HALO_FREE; dims.len()];
+
+        rebuild_owner_maps(
+            &mut owner, &mut halo, &grid, &coords, &committed, &group_ids, 1.0, &via_model,
+        );
+        let overlap = dims.idx(2, 0) as usize;
+        assert_eq!(halo[overlap], HALO_MIXED);
+        assert!(halo_is_foreign(halo[overlap], 0));
+        assert!(halo_is_foreign(halo[overlap], 1));
+
+        committed[0] = None;
+        rebuild_owner_maps(
+            &mut owner, &mut halo, &grid, &coords, &committed, &group_ids, 1.0, &via_model,
+        );
+        assert_eq!(halo[overlap], 1, "surviving reservation must transfer");
+        assert!(halo_is_foreign(halo[overlap], 0));
+        assert!(!halo_is_foreign(halo[overlap], 1));
     }
 
     /// Prefix sums starting at 0.0 → a sorted line array of `gaps.len() + 1` lines.

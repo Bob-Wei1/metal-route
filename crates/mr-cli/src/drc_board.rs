@@ -106,7 +106,10 @@ pub fn reconstruct_net_labels(srj: &SimpleRouteJson, traces: &[PcbTrace]) -> Vec
             None => {
                 let r = uf.find(i);
                 let n = root_name.len();
-                root_name.entry(r).or_insert_with(|| format!("net#{n}")).clone()
+                root_name
+                    .entry(r)
+                    .or_insert_with(|| format!("net#{n}"))
+                    .clone()
             }
         };
         net_name.push(name);
@@ -195,7 +198,12 @@ pub fn solution_to_drc_board(
                     }
                     prev = Some((*x, *y, *width, l));
                 }
-                RoutePoint::Via { x, y, from_layer, to_layer } => {
+                RoutePoint::Via {
+                    x,
+                    y,
+                    from_layer,
+                    to_layer,
+                } => {
                     let from = idx.intern(from_layer);
                     let to = idx.intern(to_layer);
                     vias.push(Via {
@@ -293,7 +301,9 @@ struct UnionFind {
 
 impl UnionFind {
     fn new(n: usize) -> Self {
-        Self { parent: (0..n).collect() }
+        Self {
+            parent: (0..n).collect(),
+        }
     }
 
     fn find(&mut self, mut x: usize) -> usize {
@@ -331,7 +341,12 @@ mod tests {
     }
 
     fn wire(x: f64, y: f64) -> RoutePoint {
-        RoutePoint::Wire { x, y, width: 0.1, layer: "top".into() }
+        RoutePoint::Wire {
+            x,
+            y,
+            width: 0.1,
+            layer: "top".into(),
+        }
     }
 
     #[test]
@@ -343,11 +358,21 @@ mod tests {
             PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)]),
             PcbTrace::new(vec![wire(0.0, 0.15), wire(10.0, 0.15)]),
         ];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         let v = board.check();
-        let clearance = v.iter().filter(|x| x.class == ViolationClass::Clearance).count();
-        assert!(clearance >= 1, "sub-clearance crossing must produce a violation");
+        let clearance = v
+            .iter()
+            .filter(|x| x.class == ViolationClass::Clearance)
+            .count();
+        assert!(
+            clearance >= 1,
+            "sub-clearance crossing must produce a violation"
+        );
     }
 
     #[test]
@@ -358,9 +383,16 @@ mod tests {
             PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)]),
             PcbTrace::new(vec![wire(0.0, 1.0), wire(10.0, 1.0)]),
         ];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
-        assert!(board.check().is_empty(), "well-spaced solution must be DRC-clean");
+        assert!(
+            board.check().is_empty(),
+            "well-spaced solution must be DRC-clean"
+        );
     }
 
     #[test]
@@ -373,9 +405,16 @@ mod tests {
             wire(10.0, 0.05),
             wire(0.0, 0.05),
         ])];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
-        assert!(board.check().is_empty(), "a trace's own corners never conflict");
+        assert!(
+            board.check().is_empty(),
+            "a trace's own corners never conflict"
+        );
     }
 
     #[test]
@@ -389,7 +428,11 @@ mod tests {
             // Shares the (1.0, 0.0) vertex, then runs parallel 0.05 away.
             PcbTrace::new(vec![wire(1.0, 0.0), wire(1.0, 0.05), wire(0.0, 0.05)]),
         ];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         assert!(
             board.check().is_empty(),
@@ -413,7 +456,11 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_value(v).unwrap();
         // Trace starts inside the pad rect at (0,0) and runs out.
         let traces = vec![PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)])];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         assert!(
             board.check().is_empty(),
@@ -445,7 +492,11 @@ mod tests {
             PcbTrace::new(vec![wire(10.0, 0.0), wire(0.0, 0.0)]).with_net("g0"),
             PcbTrace::new(vec![wire(10.0, 0.05), wire(0.0, 0.0)]).with_net("g1"),
         ];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         assert!(
             board.check().is_empty(),
@@ -474,7 +525,11 @@ mod tests {
             PcbTrace::new(vec![wire(0.0, 0.0), wire(10.0, 0.0)]).with_net("g0"),
             PcbTrace::new(vec![wire(0.0, 0.15), wire(10.0, 0.15)]).with_net("g1"),
         ];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 1);
         assert!(
             !board.check().is_empty(),
@@ -486,11 +541,30 @@ mod tests {
     fn via_emits_real_geometry() {
         let srj = srj_no_obstacles();
         let traces = vec![PcbTrace::new(vec![
-            RoutePoint::Wire { x: 1.0, y: 1.0, width: 0.1, layer: "top".into() },
-            RoutePoint::Via { x: 1.0, y: 1.0, from_layer: "top".into(), to_layer: "bottom".into() },
-            RoutePoint::Wire { x: 1.0, y: 1.0, width: 0.1, layer: "bottom".into() },
+            RoutePoint::Wire {
+                x: 1.0,
+                y: 1.0,
+                width: 0.1,
+                layer: "top".into(),
+            },
+            RoutePoint::Via {
+                x: 1.0,
+                y: 1.0,
+                from_layer: "top".into(),
+                to_layer: "bottom".into(),
+            },
+            RoutePoint::Wire {
+                x: 1.0,
+                y: 1.0,
+                width: 0.1,
+                layer: "bottom".into(),
+            },
         ])];
-        let rules = DrcRules { clearance: 0.2, plane_antipad: 0.25, min_annular_ring: 0.05 };
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
         let board = solution_to_drc_board(&srj, &traces, rules, 2);
         assert_eq!(board.vias.len(), 1);
         assert_eq!(board.vias[0].pad_diameter, VIA_PAD_MM);

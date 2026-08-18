@@ -143,6 +143,30 @@ impl GridBuilder {
             // band (deterministic: a purely positional, integer-indexed scan).
             let sxp = coords.x_of(sx);
             let syp = coords.y_of(sy);
+
+            // `GridCoords::{x,y}_of` deliberately degrade missing coordinate
+            // entries to unit-spaced positions. A truncated array is not guaranteed
+            // to remain sorted at the explicit/fallback boundary, so the bounded
+            // `line_span` walk is not sound there. This malformed-input defensive
+            // path scans the plane directly and applies the documented getters;
+            // normal well-formed mappings keep the fast bounded window below.
+            if coords.x_lines.len() < self.dims.w as usize
+                || coords.y_lines.len() < self.dims.h as usize
+            {
+                for ny in 0..self.dims.h {
+                    if (coords.y_of(ny) - syp).abs() > clearance {
+                        continue;
+                    }
+                    for nx in 0..self.dims.w {
+                        if (coords.x_of(nx) - sxp).abs() <= clearance {
+                            let i = self.dims.idx3(nx, ny, sl) as usize;
+                            self.blocked[i] = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
             let (x0, x1) = line_span(&coords.x_lines, self.dims.w, sx, sxp, clearance);
             let (y0, y1) = line_span(&coords.y_lines, self.dims.h, sy, syp, clearance);
             for ny in y0..y1 {
@@ -334,7 +358,10 @@ mod tests {
             .inflate_clearance(1.0, &coords)
             .build();
         for x in 1..=5 {
-            assert!(g.is_obstacle(d.idx(x, 0)), "x={x} within 1mm must be blocked");
+            assert!(
+                g.is_obstacle(d.idx(x, 0)),
+                "x={x} within 1mm must be blocked"
+            );
         }
         assert!(!g.is_obstacle(d.idx(0, 0)), "x=0 (1.5mm) stays passable");
         assert!(!g.is_obstacle(d.idx(6, 0)), "x=6 (1.5mm) stays passable");
@@ -362,5 +389,101 @@ mod tests {
             .inflate_clearance(0.0, &coords)
             .build();
         assert_eq!(g.cost.iter().filter(|&&c| c == OBSTACLE).count(), 1);
+    }
+
+    #[test]
+    fn truncated_coordinate_arrays_use_documented_uniform_fallback() {
+        let d = Dims::new(5, 1);
+        for coords in [
+            GridCoords::from_lines(vec![], vec![]),
+            GridCoords::from_lines(vec![0.0, 1.0], vec![0.0]),
+        ] {
+            let g = GridBuilder::new(d, 1)
+                .mark_cell(2, 0)
+                .inflate_clearance(1.0, &coords)
+                .build();
+            let blocked: Vec<u32> = (0..d.w).filter(|&x| g.is_obstacle(d.idx(x, 0))).collect();
+            assert_eq!(blocked, vec![1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn geometric_inflation_matches_slow_reference_on_small_nonuniform_grids() {
+        let xs = vec![-1.0, -0.4, 0.0, 0.15, 1.7];
+        let ys = vec![-2.0, -0.25, 0.5, 2.25];
+        let d = Dims::with_layers(xs.len() as u32, ys.len() as u32, 3);
+        let coords = GridCoords::from_lines(xs, ys);
+        let seeds = [(0, 0, 0), (3, 1, 0), (2, 2, 1), (4, 3, 2)];
+
+        for clearance in [0.0, 0.14, 0.15, 0.6, 1.75, 10.0] {
+            let mut builder = GridBuilder::new(d, 7);
+            for &(x, y, l) in &seeds {
+                builder.mark_cell_layer(x, y, l);
+            }
+            builder.inflate_clearance(clearance, &coords);
+            let grid = builder.build();
+
+            for l in 0..d.layers {
+                for y in 0..d.h {
+                    for x in 0..d.w {
+                        let expected = seeds.iter().any(|&(sx, sy, sl)| {
+                            sl == l
+                                && (coords.x_of(x) - coords.x_of(sx)).abs() <= clearance
+                                && (coords.y_of(y) - coords.y_of(sy)).abs() <= clearance
+                        });
+                        assert_eq!(
+                            grid.is_obstacle(d.idx3(x, y, l)),
+                            expected,
+                            "clearance={clearance}, cell=({x},{y},{l})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rectangle_corner_order_clipping_and_clear_are_consistent() {
+        let d = Dims::with_layers(4, 3, 2);
+        let forward = GridBuilder::new(d, 1)
+            .mark_rect_layer(1, 1, 99, 99, 1)
+            .build();
+        let reverse = GridBuilder::new(d, 1)
+            .mark_rect_layer(99, 99, 1, 1, 1)
+            .build();
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward.cost.iter().filter(|&&c| c == OBSTACLE).count(),
+            3 * 2
+        );
+
+        let cleared = GridBuilder::new(d, 1)
+            .mark_cell_layer(2, 1, 1)
+            .clear_cell_layer(2, 1, 1)
+            .mark_cell_layer(500, 500, 500)
+            .clear_cell_layer(500, 500, 500)
+            .build();
+        assert!(cleared.cost.iter().all(|&c| c == 1));
+    }
+
+    #[test]
+    fn inflation_is_monotone_in_clearance() {
+        let d = Dims::new(6, 5);
+        let coords = GridCoords::from_lines(
+            vec![0.0, 0.2, 0.9, 1.0, 2.8, 5.0],
+            vec![-1.0, 0.0, 0.1, 1.5, 4.0],
+        );
+        let build = |clearance| {
+            GridBuilder::new(d, 1)
+                .mark_cell(2, 2)
+                .mark_cell(5, 4)
+                .inflate_clearance(clearance, &coords)
+                .build()
+        };
+        let small = build(0.25);
+        let large = build(1.0);
+        for i in 0..d.len() as u32 {
+            assert!(!small.is_obstacle(i) || large.is_obstacle(i));
+        }
     }
 }

@@ -311,12 +311,15 @@ fn cell_budget(x_features: usize, y_features: usize) -> usize {
             let t = raw.trim();
             if t.eq_ignore_ascii_case("adaptive") {
                 let feature_cells = x_features.saturating_mul(y_features);
-                let adaptive = feature_cells
-                    .saturating_mul(CELL_BUDGET_HEADROOM_NUM)
+                let adaptive = feature_cells.saturating_mul(CELL_BUDGET_HEADROOM_NUM)
                     / CELL_BUDGET_HEADROOM_DEN;
                 adaptive.max(CELL_BUDGET_FLOOR)
             } else if let Ok(v) = t.parse::<usize>() {
-                if v == 0 { usize::MAX } else { v }
+                if v == 0 {
+                    usize::MAX
+                } else {
+                    v
+                }
             } else {
                 CELL_BUDGET_FLOOR
             }
@@ -469,7 +472,15 @@ fn build_grid_lines(
         // relative to the array, so on the target boards all fit; on a pathologically
         // dense array we add as many as the headroom allows (deterministic order),
         // never blowing the ceiling the budget enforcer just established.
-        add_escape_within_budget(&xs, &ys, &mut x_fill, &mut y_fill, x_escape, y_escape, budget);
+        add_escape_within_budget(
+            &xs,
+            &ys,
+            &mut x_fill,
+            &mut y_fill,
+            x_escape,
+            y_escape,
+            budget,
+        );
     }
 
     xs.append(&mut x_fill);
@@ -494,7 +505,7 @@ fn escape_lines(features: &[f64], track_w: f64, clearance: f64, escape_clearance
     }
     let coarse_channel = track_w + 2.0 * clearance; // regular fill already covers >= this
     let escape_channel = track_w + 2.0 * escape_clearance; // true-clearance lane fits
-    if !(escape_channel < coarse_channel) {
+    if escape_channel.partial_cmp(&coarse_channel) != Some(std::cmp::Ordering::Less) {
         return Vec::new();
     }
     let mut out: Vec<f64> = Vec::new();
@@ -698,7 +709,11 @@ fn drop_least_important(features: &[f64], fill: &mut Vec<f64>) {
         // Neighbour spacing of `f` in the merged set = min distance to the line just
         // below and just above it.
         let pos = all.partition_point(|&x| x < f); // first index >= f (f itself)
-        let left = if pos > 0 { f - all[pos - 1] } else { f64::INFINITY };
+        let left = if pos > 0 {
+            f - all[pos - 1]
+        } else {
+            f64::INFINITY
+        };
         // skip past the copy(ies) of f to its upper neighbour
         let mut up = pos + 1;
         while up < all.len() && (all[up] - f).abs() <= LINE_EPSILON {
@@ -861,7 +876,14 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
     // The board's layer axis. `layer_count == 1` yields `["top"]`, so every
     // single-layer construction below collapses onto layer 0 and is byte-identical
     // to the pre-layers path.
-    rasterize_with_layers(srj, resolution, LayerMap::standard(srj.layer_count), 0, 0.0, 0.0)
+    rasterize_with_layers(
+        srj,
+        resolution,
+        LayerMap::standard(srj.layer_count),
+        0,
+        0.0,
+        0.0,
+    )
 }
 
 /// (B3) Rasterise with an explicit [`LayerMap`] — use this when the layer *names*
@@ -909,7 +931,10 @@ pub fn rasterize_with_layers(
     // and `trace_route`). The design-rule track width / clearance drive the fill
     // channel threshold; both fall back to `resolution` when the problem omits them,
     // so a rule-less fixture still gets sensible routing lanes.
-    let track_w = srj.min_trace_width.filter(|w| *w > 0.0).unwrap_or(resolution);
+    let track_w = srj
+        .min_trace_width
+        .filter(|w| *w > 0.0)
+        .unwrap_or(resolution);
     // Effective copper clearance the rasteriser will actually enforce: the halo width
     // applied below (`clearance_cells · resolution`) — NOT the raw `srj.min_clearance`.
     // The fill-channel policy MUST use this same value, otherwise it would size routing
@@ -1170,14 +1195,23 @@ fn pad_cells_for_point(
     layer: u32,
     mapping: &Mapping,
     obstacles: &[Obstacle],
+    layers: &LayerMap,
     clearance_mm: f64,
     foreign_margin_mm: f64,
 ) -> Vec<CellIdx> {
     let (px, py) = point;
+    // Ownership and foreign clipping are layer-local. A bottom SMD pad may
+    // overlap a top endpoint in XY without becoming that endpoint's own pad or
+    // clipping its top-layer escape halo. Empty/all-unknown layer declarations
+    // retain the conservative all-layer fallback from `obstacle_layers`.
+    let layer_obstacles: Vec<&Obstacle> = obstacles
+        .iter()
+        .filter(|obs| obstacle_layers(obs, layers).contains(&layer))
+        .collect();
     // Pad cells as (x, y) on this endpoint's layer; we inflate these planar coords
     // before resolving to layered cell indices so the halo stays on `layer`.
     let mut planar: Vec<(u32, u32)> = Vec::new();
-    for obs in obstacles {
+    for obs in &layer_obstacles {
         let min_x = obs.center.x - obs.width / 2.0;
         let max_x = obs.center.x + obs.width / 2.0;
         let min_y = obs.center.y - obs.height / 2.0;
@@ -1226,7 +1260,7 @@ fn pad_cells_for_point(
     // Inflating the foreign test by the margin closes that leak at the source.
     let margin = foreign_margin_mm.max(0.0);
     let foreign_blocks = |lx: f64, ly: f64| -> bool {
-        obstacles.iter().any(|obs| {
+        layer_obstacles.iter().any(|obs| {
             let min_x = obs.center.x - obs.width / 2.0 - margin;
             let max_x = obs.center.x + obs.width / 2.0 + margin;
             let min_y = obs.center.y - obs.height / 2.0 - margin;
@@ -1243,26 +1277,34 @@ fn pad_cells_for_point(
         })
     };
     let own_planar: std::collections::HashSet<(u32, u32)> = planar.iter().copied().collect();
-    let mut cells: Vec<CellIdx> = Vec::new();
+    // A large pad covers many adjacent Hanan cells, whose clearance bands overlap
+    // heavily.  Deduplicate those candidate cells *before* the foreign-pad query:
+    // the old code repeated the O(layer-obstacles) geometry scan once for every
+    // overlapping source-cell band and only deduplicated after all of that work.
+    // The set changes no semantics (the public result was already sorted/deduped),
+    // while bounding foreign-pad checks to once per candidate grid cell.
+    let mut candidates: std::collections::HashSet<CellIdx> = std::collections::HashSet::new();
     let clearance = clearance_mm.max(0.0);
     for &(x, y) in &planar {
         let (x0, x1) = line_band(&mapping.x_lines, x, clearance);
         let (y0, y1) = line_band(&mapping.y_lines, y, clearance);
         for ny in y0..=y1 {
             for nx in x0..=x1 {
-                // Keep own-pad cells unconditionally; clip expanded-halo cells that
-                // fall inside a foreign pad.
-                if !own_planar.contains(&(nx, ny))
-                    && foreign_blocks(mapping.x_lines[nx as usize], mapping.y_lines[ny as usize])
-                {
-                    continue;
-                }
-                cells.push(mapping.dims.idx3(nx, ny, layer));
+                candidates.insert(mapping.dims.idx3(nx, ny, layer));
             }
         }
     }
+    let mut cells: Vec<CellIdx> = candidates
+        .into_iter()
+        .filter(|&cell| {
+            let (nx, ny) = mapping.dims.xy(cell);
+            // Keep own-pad cells unconditionally; clip expanded-halo cells that
+            // fall inside a foreign pad.
+            own_planar.contains(&(nx, ny))
+                || !foreign_blocks(mapping.x_lines[nx as usize], mapping.y_lines[ny as usize])
+        })
+        .collect();
     cells.sort_unstable();
-    cells.dedup();
     cells
 }
 
@@ -1367,6 +1409,7 @@ fn decompose_connections(
                 src_layer,
                 mapping,
                 obstacles,
+                layers,
                 clearance_mm,
                 foreign_margin_mm,
             );
@@ -1375,6 +1418,7 @@ fn decompose_connections(
                 dst_layer,
                 mapping,
                 obstacles,
+                layers,
                 clearance_mm,
                 foreign_margin_mm,
             ));
@@ -1568,7 +1612,10 @@ fn group_results(results: &[RouteResult]) -> Vec<String> {
     // (2) shared endpoint-cell junctions (a routed path's ends are its src/dst cells).
     let mut by_cell: HashMap<CellIdx, usize> = HashMap::new();
     for (i, r) in results.iter().enumerate() {
-        for c in [r.path.first().copied(), r.path.last().copied()].into_iter().flatten() {
+        for c in [r.path.first().copied(), r.path.last().copied()]
+            .into_iter()
+            .flatten()
+        {
             match by_cell.get(&c) {
                 Some(&j) => union(&mut parent, i, j),
                 None => {
@@ -1655,7 +1702,6 @@ fn trace_route(
 mod tests {
     use super::*;
     use mr_core::RouteResult;
-
 
     /// A small but realistic problem: 10×10 board, one rect obstacle, two
     /// connections (one 2-point, one 3-point).
@@ -2225,16 +2271,36 @@ mod tests {
         assert_eq!(mapping.dims, Dims::new(3, 3));
         // Boundaries: between 0 and 1 -> 0.5; between 1 and 10 -> 5.5.
         assert_eq!(mapping.point_to_xy((0.4, 0.0)).0, 0);
-        assert_eq!(mapping.point_to_xy((0.5, 0.0)).0, 1, "midpoint -> upper index");
+        assert_eq!(
+            mapping.point_to_xy((0.5, 0.0)).0,
+            1,
+            "midpoint -> upper index"
+        );
         assert_eq!(mapping.point_to_xy((5.4, 0.0)).0, 1);
-        assert_eq!(mapping.point_to_xy((5.5, 0.0)).0, 2, "midpoint -> upper index");
-        assert_eq!(mapping.point_to_xy((100.0, 0.0)).0, 2, "clamps to last line");
+        assert_eq!(
+            mapping.point_to_xy((5.5, 0.0)).0,
+            2,
+            "midpoint -> upper index"
+        );
+        assert_eq!(
+            mapping.point_to_xy((100.0, 0.0)).0,
+            2,
+            "clamps to last line"
+        );
         // cell_upper: a box ending strictly inside region 1 (< 5.5) tops out at 1;
         // ending exactly on a boundary excludes the next region.
         assert_eq!(mapping.x_cell_upper(0.4), 0);
-        assert_eq!(mapping.x_cell_upper(0.5), 0, "edge on 0.5 boundary excludes cell 1");
+        assert_eq!(
+            mapping.x_cell_upper(0.5),
+            0,
+            "edge on 0.5 boundary excludes cell 1"
+        );
         assert_eq!(mapping.x_cell_upper(0.6), 1);
-        assert_eq!(mapping.x_cell_upper(5.5), 1, "edge on 5.5 boundary excludes cell 2");
+        assert_eq!(
+            mapping.x_cell_upper(5.5),
+            1,
+            "edge on 5.5 boundary excludes cell 2"
+        );
         assert_eq!(mapping.x_cell_upper(6.0), 2);
     }
 
@@ -2455,8 +2521,10 @@ mod tests {
         // reserved as an obstacle — the geometric Chebyshev halo. Check pad "a".
         for ny in 0..d.h {
             for nx in 0..d.w {
-                let dx = (prob.mapping.x_lines[nx as usize] - prob.mapping.x_lines[ax as usize]).abs();
-                let dy = (prob.mapping.y_lines[ny as usize] - prob.mapping.y_lines[ay as usize]).abs();
+                let dx =
+                    (prob.mapping.x_lines[nx as usize] - prob.mapping.x_lines[ax as usize]).abs();
+                let dy =
+                    (prob.mapping.y_lines[ny as usize] - prob.mapping.y_lines[ay as usize]).abs();
                 if dx <= clearance && dy <= clearance {
                     assert!(
                         prob.grid.is_obstacle(d.idx(nx, ny)),
@@ -2586,7 +2654,14 @@ mod tests {
         let track_w = 0.3_f64;
         let margin = clearance + track_w / 2.0; // 0.25 — the track-centreline rule
         let clearance_cells = (clearance / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0, 0.0);
+        let prob = rasterize_with_layers(
+            &srj,
+            resolution,
+            LayerMap::standard(1),
+            clearance_cells,
+            0.0,
+            0.0,
+        );
         let d = prob.mapping.dims;
 
         // Each pad's copper rect (continuous).
@@ -2662,7 +2737,14 @@ mod tests {
         let srj: SimpleRouteJson = serde_json::from_str(TRACK_GT_CLEARANCE_SRJ).unwrap();
         let resolution = 0.05;
         let clearance_cells = (0.1_f64 / resolution).ceil() as u32;
-        let prob = rasterize_with_layers(&srj, resolution, LayerMap::standard(1), clearance_cells, 0.0, 0.0);
+        let prob = rasterize_with_layers(
+            &srj,
+            resolution,
+            LayerMap::standard(1),
+            clearance_cells,
+            0.0,
+            0.0,
+        );
         let d = prob.mapping.dims;
         let net_a = prob.nets.iter().find(|n| n.net == "a").unwrap();
         let (ax, ay) = prob.mapping.point_to_xy((2.0, 2.0));
@@ -2743,18 +2825,38 @@ mod tests {
         // Every endpoint coordinate is a line on its axis.
         for conn in &srj.connections {
             for p in &conn.points_to_connect {
-                assert!(has(&prob.mapping.x_lines, p.x), "x line through endpoint {}", p.x);
-                assert!(has(&prob.mapping.y_lines, p.y), "y line through endpoint {}", p.y);
+                assert!(
+                    has(&prob.mapping.x_lines, p.x),
+                    "x line through endpoint {}",
+                    p.x
+                );
+                assert!(
+                    has(&prob.mapping.y_lines, p.y),
+                    "y line through endpoint {}",
+                    p.y
+                );
             }
         }
 
         // Every obstacle edge is a line on its axis.
         for obs in &srj.obstacles {
-            for ex in [obs.center.x - obs.width / 2.0, obs.center.x + obs.width / 2.0] {
-                assert!(has(&prob.mapping.x_lines, ex), "x line through obstacle edge {ex}");
+            for ex in [
+                obs.center.x - obs.width / 2.0,
+                obs.center.x + obs.width / 2.0,
+            ] {
+                assert!(
+                    has(&prob.mapping.x_lines, ex),
+                    "x line through obstacle edge {ex}"
+                );
             }
-            for ey in [obs.center.y - obs.height / 2.0, obs.center.y + obs.height / 2.0] {
-                assert!(has(&prob.mapping.y_lines, ey), "y line through obstacle edge {ey}");
+            for ey in [
+                obs.center.y - obs.height / 2.0,
+                obs.center.y + obs.height / 2.0,
+            ] {
+                assert!(
+                    has(&prob.mapping.y_lines, ey),
+                    "y line through obstacle edge {ey}"
+                );
             }
         }
     }
@@ -2775,11 +2877,7 @@ mod tests {
         let (sx, sy) = prob.mapping.dims.xy(src);
         assert!(sx + 2 < prob.mapping.dims.w, "room for a straight exit");
         let d = prob.mapping.dims;
-        let path = vec![
-            src,
-            d.idx(sx + 1, sy),
-            d.idx(sx + 2, sy),
-        ];
+        let path = vec![src, d.idx(sx + 1, sy), d.idx(sx + 2, sy)];
         let board = BoardRoute {
             results: vec![RouteResult {
                 net: prob.nets[0].net.clone(),
@@ -2790,13 +2888,8 @@ mod tests {
             congestion: vec![],
             groups: vec![],
         };
-        let traces = to_solution_layered(
-            &board,
-            &prob.mapping,
-            &prob.pin_points,
-            0.15,
-            &prob.layers,
-        );
+        let traces =
+            to_solution_layered(&board, &prob.mapping, &prob.pin_points, 0.15, &prob.layers);
         let pts: Vec<(f64, f64)> = traces[0]
             .route
             .iter()
@@ -2834,8 +2927,8 @@ mod tests {
         let track_w = 0.1;
         let clearance = 0.1;
         let channel = track_w + 2.0 * clearance; // 0.3
-                                                  // Two 0.4-wide pads centred at x=0 and x=1.0: inner edges 0.2 and 0.8,
-                                                  // gap 0.6 > channel. Free corridor (edges + clearance) is [0.3, 0.7].
+                                                 // Two 0.4-wide pads centred at x=0 and x=1.0: inner edges 0.2 and 0.8,
+                                                 // gap 0.6 > channel. Free corridor (edges + clearance) is [0.3, 0.7].
         let srj = SimpleRouteJson {
             layer_count: 1,
             min_trace_width: Some(track_w),
@@ -2843,7 +2936,11 @@ mod tests {
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.0,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -2851,7 +2948,11 @@ mod tests {
                 },
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 1.0, y: 0.0, layer: None },
+                    center: Point {
+                        x: 1.0,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -2859,12 +2960,19 @@ mod tests {
                 },
             ],
             connections: vec![],
-            bounds: Bounds { min_x: -1.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
+            bounds: Bounds {
+                min_x: -1.0,
+                max_x: 2.0,
+                min_y: -1.0,
+                max_y: 1.0,
+            },
         };
         let (xs, _ys) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         // At least one fill line falls strictly inside the free corridor [0.3, 0.7]
         // (≥ clearance from both pad edges), so a track of another net can run there.
-        let lane = xs.iter().find(|&&x| x > 0.3 + LINE_EPSILON && x < 0.7 - LINE_EPSILON);
+        let lane = xs
+            .iter()
+            .find(|&&x| x > 0.3 + LINE_EPSILON && x < 0.7 - LINE_EPSILON);
         assert!(
             lane.is_some(),
             "expected a routing lane in the [0.3,0.7] corridor between the pads, got {xs:?}"
@@ -2878,7 +2986,11 @@ mod tests {
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: -0.36, y: 0.0, layer: None },
+                    center: Point {
+                        x: -0.36,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -2886,7 +2998,11 @@ mod tests {
                 },
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.36, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.36,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -2926,7 +3042,11 @@ mod tests {
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.0,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 1.6,
                     height: 1.6,
                     layers: vec![],
@@ -2934,7 +3054,11 @@ mod tests {
                 },
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 2.54, y: 0.0, layer: None },
+                    center: Point {
+                        x: 2.54,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 1.6,
                     height: 1.6,
                     layers: vec![],
@@ -2942,13 +3066,20 @@ mod tests {
                 },
             ],
             connections: vec![],
-            bounds: Bounds { min_x: -2.0, max_x: 4.54, min_y: -2.0, max_y: 2.0 },
+            bounds: Bounds {
+                min_x: -2.0,
+                max_x: 4.54,
+                min_y: -2.0,
+                max_y: 2.0,
+            },
         };
         // Coarse build (escape == coarse): no lane in the 0.94-wide inter-pad gap
         // [0.8, 1.74] — the regular fill skips it (gap 0.94 < coarse_channel 1.386).
         let (xs_coarse, _) = build_grid_lines(&srj, 1, track_w, coarse, coarse);
         assert!(
-            !xs_coarse.iter().any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
+            !xs_coarse
+                .iter()
+                .any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
             "coarse build must leave the sub-pitch gap empty, got {xs_coarse:?}"
         );
         // Escape build (true escape 0.15 < coarse 0.618): one midpoint escape lane at
@@ -2974,7 +3105,11 @@ mod tests {
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.0,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 1.6,
                     height: 1.6,
                     layers: vec![],
@@ -2982,7 +3117,11 @@ mod tests {
                 },
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 2.54, y: 0.0, layer: None },
+                    center: Point {
+                        x: 2.54,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 1.6,
                     height: 1.6,
                     layers: vec![],
@@ -2990,14 +3129,20 @@ mod tests {
                 },
             ],
             connections: vec![],
-            bounds: Bounds { min_x: -2.0, max_x: 4.54, min_y: -2.0, max_y: 2.0 },
+            bounds: Bounds {
+                min_x: -2.0,
+                max_x: 4.54,
+                min_y: -2.0,
+                max_y: 2.0,
+            },
         };
         // escape == clearance: escape_channel == coarse_channel, so `escape_lines`
         // bails (the gate `escape_clearance + eps < clearance` is false) — no lane in
         // the tight gap.
         let (xs, _) = build_grid_lines(&srj, 1, track_w, cl, cl);
         assert!(
-            !xs.iter().any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
+            !xs.iter()
+                .any(|&x| x > 0.8 + LINE_EPSILON && x < 1.74 - LINE_EPSILON),
             "no escape lane when the true rule is not finer than the coarse one, got {xs:?}"
         );
     }
@@ -3018,7 +3163,11 @@ mod tests {
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.0, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.0,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -3026,7 +3175,11 @@ mod tests {
                 },
                 Obstacle {
                     kind: "rect".into(),
-                    center: Point { x: 0.42, y: 0.0, layer: None },
+                    center: Point {
+                        x: 0.42,
+                        y: 0.0,
+                        layer: None,
+                    },
                     width: 0.4,
                     height: 0.4,
                     layers: vec![],
@@ -3034,18 +3187,25 @@ mod tests {
                 },
             ],
             connections: vec![],
-            bounds: Bounds { min_x: -2.0, max_x: 2.0, min_y: -1.0, max_y: 1.0 },
+            bounds: Bounds {
+                min_x: -2.0,
+                max_x: 2.0,
+                min_y: -1.0,
+                max_y: 1.0,
+            },
         };
         let (xs, _) = build_grid_lines(&srj, 1, track_w, clearance, clearance);
         // No fill line inside the unroutable 0.02-wide gap [0.2, 0.22].
         assert!(
-            !xs.iter().any(|&x| x > 0.2 + LINE_EPSILON && x < 0.22 - LINE_EPSILON),
+            !xs.iter()
+                .any(|&x| x > 0.2 + LINE_EPSILON && x < 0.22 - LINE_EPSILON),
             "must NOT place a lane in a sub-track gap, got {xs:?}"
         );
         // But a go-around lane exists in the wide open board area beyond the pads
         // (e.g. between the right pad edge 0.62 and the +2.0 bound).
         assert!(
-            xs.iter().any(|&x| x > 0.62 + LINE_EPSILON && x < 2.0 - LINE_EPSILON),
+            xs.iter()
+                .any(|&x| x > 0.62 + LINE_EPSILON && x < 2.0 - LINE_EPSILON),
             "a go-around channel must exist in the open area, got {xs:?}"
         );
     }
@@ -3155,18 +3315,29 @@ mod tests {
         let mut x_fill: Vec<f64> = (0..199).map(|k| k as f64 + 0.5).collect();
         let mut y_fill: Vec<f64> = (0..199).map(|k| k as f64 + 0.5).collect();
         let feature_cells = x_features.len() * y_features.len(); // 40 000
-        // The full grid with all fill: ~399² ≈ 159 201 cells.
+                                                                 // The full grid with all fill: ~399² ≈ 159 201 cells.
         let full = (x_features.len() + x_fill.len()) * (y_features.len() + y_fill.len());
         // Adaptive headroom over the feature grid (×3/2 = 60 000) … but the full grid
         // (~159k) is larger, so adaptive ALONE would still thin. Use a budget that
         // models the production "no ceiling" / generous-headroom case: feature_cells
         // ×4 = 160 000, which exceeds the full grid, so NO fill is dropped.
         let budget = feature_cells * 4;
-        assert!(budget >= full, "budget must cover the full grid for this test");
+        assert!(
+            budget >= full,
+            "budget must cover the full grid for this test"
+        );
         enforce_budget(&x_features, &y_features, &mut x_fill, &mut y_fill, budget);
         // Fill lanes are RETAINED (only coalescing of coincident lines, none here).
-        assert_eq!(x_fill.len(), 199, "x fill lanes retained under generous budget");
-        assert_eq!(y_fill.len(), 199, "y fill lanes retained under generous budget");
+        assert_eq!(
+            x_fill.len(),
+            199,
+            "x fill lanes retained under generous budget"
+        );
+        assert_eq!(
+            y_fill.len(),
+            199,
+            "y fill lanes retained under generous budget"
+        );
         // And the adaptive resolver itself rises above the floor for a dense grid.
         // (cell_budget reads MR_CELL_BUDGET; only assert when it is set to "adaptive".)
         if std::env::var(CELL_BUDGET_ENV)
@@ -3192,7 +3363,10 @@ mod tests {
         let budget = 100; // far below 50×50 = 2500 feature cells
         enforce_budget(&x_features, &y_features, &mut x_fill, &mut y_fill, budget);
         // Fill fully dropped (it cannot rescue an over-budget feature grid) …
-        assert!(x_fill.is_empty() && y_fill.is_empty(), "all fill must be dropped");
+        assert!(
+            x_fill.is_empty() && y_fill.is_empty(),
+            "all fill must be dropped"
+        );
         // … and every feature line is untouched.
         assert_eq!(x_features.len(), 50);
         assert_eq!(y_features.len(), 50);
@@ -3214,6 +3388,112 @@ mod tests {
         assert_eq!(cell_budget(10, 10), CELL_BUDGET_FLOOR);
         // Even a dense feature grid gets the floor by default (adaptive is opt-in).
         assert_eq!(cell_budget(600, 600), CELL_BUDGET_FLOOR);
+    }
+
+    /// A pad on another copper layer is neither owned by this endpoint nor part of
+    /// its passable escape area. In particular, a wide bottom SMD pad that happens
+    /// to overlap a top-layer endpoint in XY must not open bottom-pad cells on top.
+    #[test]
+    fn passable_pads_ignore_overlapping_pad_on_another_layer() {
+        let mapping = Mapping::from_lines(vec![0.0, 1.0, 2.0, 3.0, 4.0], vec![0.0, 1.0, 2.0], 2);
+        let bottom_pad = Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 2.0,
+                y: 1.0,
+                layer: Some("bottom".into()),
+            },
+            width: 2.4,
+            height: 0.4,
+            layers: vec!["bottom".into()],
+            connected_to: vec!["foreign-bottom".into()],
+        };
+
+        let cells = pad_cells_for_point(
+            (2.0, 1.0),
+            0,
+            &mapping,
+            &[bottom_pad],
+            &LayerMap::standard(2),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            cells,
+            vec![mapping.dims.idx3(2, 1, 0)],
+            "only the endpoint cell itself is passable on top"
+        );
+    }
+
+    /// Foreign-pad clipping is layer-aware too: a bottom-only pad may occupy the
+    /// same XY lane as a top pad's escape halo without clipping that top-layer lane.
+    #[test]
+    fn foreign_pad_clipping_ignores_other_layers() {
+        let mapping = Mapping::from_lines(vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 2.0], 2);
+        let obstacles = vec![
+            Obstacle {
+                kind: "rect".into(),
+                center: Point {
+                    x: 1.0,
+                    y: 1.0,
+                    layer: Some("top".into()),
+                },
+                width: 0.2,
+                height: 0.2,
+                layers: vec!["top".into()],
+                connected_to: vec!["own-top".into()],
+            },
+            Obstacle {
+                kind: "rect".into(),
+                center: Point {
+                    x: 2.0,
+                    y: 1.0,
+                    layer: Some("bottom".into()),
+                },
+                width: 0.4,
+                height: 0.4,
+                layers: vec!["bottom".into()],
+                connected_to: vec!["foreign-bottom".into()],
+            },
+        ];
+
+        let cells = pad_cells_for_point(
+            (1.0, 1.0),
+            0,
+            &mapping,
+            &obstacles,
+            &LayerMap::standard(2),
+            1.0,
+            0.1,
+        );
+        assert!(
+            cells.contains(&mapping.dims.idx3(2, 1, 0)),
+            "bottom copper must not clip the top-layer escape halo"
+        );
+    }
+
+    /// Parse and rasterise one small, checked-in upstream regression fixture. This
+    /// catches schema drift and requires the rasteriser to be deterministic without
+    /// turning the unit suite into a full corpus benchmark.
+    #[test]
+    fn checked_in_corpus_fixture_parses_and_rasterizes_deterministically() {
+        const FIXTURE: &str = include_str!(
+            "../../../benchmarks/corpus/bug-reports/bugreport20-obstacle-clipping.srj.json"
+        );
+        let srj: SimpleRouteJson = serde_json::from_str(FIXTURE).expect("fixture parses");
+        assert_eq!(srj.layer_count, 2);
+        assert_eq!(srj.obstacles.len(), 4);
+        assert_eq!(srj.connections.len(), 1);
+
+        let first = rasterize(&srj, 0.15);
+        let second = rasterize(&srj, 0.15);
+        assert_eq!(first.mapping, second.mapping);
+        assert_eq!(first.grid.cost, second.grid.cost);
+        assert_eq!(first.nets, second.nets);
+        assert_eq!(first.pin_points, second.pin_points);
+        assert_eq!(first.nets.len(), 1);
+        assert_eq!(first.mapping.dims.layers, 2);
+        assert_ne!(first.nets[0].src, first.nets[0].dst);
     }
 
     /// `enforce_budget` thins fill (keeping every feature line) until the product is

@@ -9,7 +9,7 @@
 
 use mr_core::{BoardRoute, CellIdx, Cost, Grid, NetEndpoints, RouteResult, Router, RouterError};
 
-use crate::dijkstra::{dijkstra, reconstruct_path};
+use crate::dijkstra::{astar_buf, SearchBuf};
 
 /// Lee/Dijkstra single-source router. Routes every net independently.
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,9 +29,36 @@ impl LeeRouter {
         src: CellIdx,
         dst: CellIdx,
     ) -> Option<(Vec<CellIdx>, Cost)> {
-        let field = dijkstra(grid, src, |_| 0);
-        let path = reconstruct_path(&field.pred, src, dst, &field.dist)?;
-        Some((path, field.dist[dst as usize]))
+        let mut buf = SearchBuf::new(grid.dims.len());
+        Self::route_one_with_buf(&mut buf, grid, src, dst, &[])
+    }
+
+    /// Targeted Lee/Dijkstra search with reusable scratch and per-net pad
+    /// unmasking.  An obstacle listed in `passable_pads` is entered at the normal
+    /// free-cell cost (`1`); ordinary weighted cells retain their grid cost.
+    fn route_one_with_buf(
+        buf: &mut SearchBuf,
+        grid: &Grid,
+        src: CellIdx,
+        dst: CellIdx,
+        passable_pads: &[CellIdx],
+    ) -> Option<(Vec<CellIdx>, Cost)> {
+        astar_buf(
+            buf,
+            grid.dims,
+            src,
+            dst,
+            |_u, v| {
+                if grid.is_obstacle(v) && passable_pads.contains(&v) {
+                    1
+                } else {
+                    grid.cost_at(v)
+                }
+            },
+            |c| grid.is_obstacle(c) && !passable_pads.contains(&c),
+            |_| 0,
+            |_, _| None,
+        )
     }
 }
 
@@ -42,17 +69,23 @@ impl Router for LeeRouter {
         }
         let mut results = Vec::new();
         let mut unrouted = Vec::new();
+        let mut buf = SearchBuf::new(grid.dims.len());
         for net in nets {
+            if net.passable_pads.iter().any(|&c| !grid.dims.contains(c)) {
+                return Err(RouterError::InvalidEndpoint {
+                    net: net.net.clone(),
+                });
+            }
             if !grid.dims.contains(net.src)
                 || !grid.dims.contains(net.dst)
-                || grid.is_obstacle(net.src)
-                || grid.is_obstacle(net.dst)
+                || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
+                || (grid.is_obstacle(net.dst) && !net.passable_pads.contains(&net.dst))
             {
                 return Err(RouterError::InvalidEndpoint {
                     net: net.net.clone(),
                 });
             }
-            match Self::route_one(grid, net.src, net.dst) {
+            match Self::route_one_with_buf(&mut buf, grid, net.src, net.dst, &net.passable_pads) {
                 Some((path, cost)) => results.push(RouteResult {
                     net: net.net.clone(),
                     path,

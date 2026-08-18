@@ -1,6 +1,7 @@
 //! `RipUpRouter` (A3 / M2) — sequential routing with bounded rip-up-on-collision.
 //!
-//! Nets are routed one at a time (in the order given). Each net is routed with
+//! Nets are provisionally placed from lowest to highest priority (reverse input
+//! order), then resolved one at a time. Each net is routed with
 //! [`LeeRouter`] over a working grid in which the cells already occupied by
 //! *other* committed nets are treated as obstacles. When a net cannot be routed
 //! because the corridor it needs is occupied, it rips up the conflicting
@@ -8,8 +9,9 @@
 //!
 //! ## Priority / anti-oscillation
 //!
-//! Earlier nets (lower index) have priority: a net may only rip up committed nets
-//! of **higher** index than itself. A lower-index net is never displaced for a
+//! Earlier nets (lower index) have priority: placing them after provisional
+//! lower-priority routes gives them something real to displace. A net may only rip
+//! up committed nets of **higher** index than itself. A lower-index net is never displaced for a
 //! higher-index one. This makes the outcome deterministic and prevents two nets
 //! from endlessly ripping each other up. A net blocked only by un-displaceable
 //! (lower-index) committed nets is left unrouted.
@@ -86,12 +88,23 @@ fn working_grid(
     work
 }
 
-impl Router for RipUpRouter {
-    fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
+impl RipUpRouter {
+    /// Implementation plus a displacement count used by the adversarial tests to
+    /// prove the router's namesake rip-up path is live.
+    fn route_with_stats(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+    ) -> Result<(BoardRoute, usize), RouterError> {
         if !grid.is_well_formed() {
             return Err(RouterError::MalformedGrid);
         }
         for net in nets {
+            if net.passable_pads.iter().any(|&c| !grid.dims.contains(c)) {
+                return Err(RouterError::InvalidEndpoint {
+                    net: net.net.clone(),
+                });
+            }
             // An endpoint is invalid only if out of bounds, or it sits on an
             // obstacle that is NOT one of this net's own (passable) pad cells.
             // Sitting on one's own pad obstacle is valid (the router unmasks it).
@@ -109,6 +122,7 @@ impl Router for RipUpRouter {
         // Nets we have permanently given up on (blocked by un-displaceable nets or
         // unroutable even on the empty grid). Never retried.
         let mut abandoned: Vec<bool> = vec![false; nets.len()];
+        let mut rip_count = 0usize;
 
         let mut passes = 0u32;
         loop {
@@ -117,9 +131,12 @@ impl Router for RipUpRouter {
             }
             passes += 1;
 
-            // Deterministic order: ascending index. A net is "pending" when it is
-            // neither placed nor abandoned.
+            // Route low-priority nets first (descending index), then let an earlier
+            // / higher-priority net displace them when necessary.  Processing in
+            // ascending order made the first legal rip impossible: no higher-index
+            // route could ever exist when a lower index was examined.
             let pending: Vec<usize> = (0..nets.len())
+                .rev()
                 .filter(|i| !placed.contains_key(i) && !abandoned[*i])
                 .collect();
             if pending.is_empty() {
@@ -154,12 +171,13 @@ impl Router for RipUpRouter {
 
                 // Find committed nets of HIGHER index that overlap our free path —
                 // these we may rip up (priority rule).
-                let blockers: Vec<usize> = placed
+                let mut blockers: Vec<usize> = placed
                     .iter()
                     .filter(|(&oi, _)| oi > ni)
                     .filter(|(_, p)| p.path.iter().any(|c| free_path.contains(c)))
                     .map(|(&oi, _)| oi)
                     .collect();
+                blockers.sort_unstable();
 
                 if blockers.is_empty() {
                     // Only lower-index (un-displaceable) nets block us, or no
@@ -170,11 +188,24 @@ impl Router for RipUpRouter {
                     continue;
                 }
 
-                for b in blockers {
-                    placed.remove(&b);
+                for b in &blockers {
+                    placed.remove(b);
                 }
+                rip_count += blockers.len();
                 progressed = true;
-                // `ni` will be retried next pass (it is now pending again).
+
+                // Commit the higher-priority net immediately in the space it just
+                // freed.  Deferring it to the next descending pass allowed each
+                // victim to reclaim the corridor first and caused a bounded but
+                // pointless ping-pong.
+                let retry = working_grid(grid, ni, net, &placed);
+                if let Some((path, cost)) = LeeRouter::route_one(&retry, net.src, net.dst) {
+                    placed.insert(ni, Placed { path, cost });
+                } else {
+                    // A lower-priority committed route still blocks it; that route
+                    // is intentionally not displaceable under the priority rule.
+                    abandoned[ni] = true;
+                }
             }
 
             if !progressed {
@@ -197,12 +228,21 @@ impl Router for RipUpRouter {
         }
 
         let congestion = BoardRoute::congestion_from(grid.dims, &results);
-        Ok(BoardRoute {
-            results,
-            unrouted,
-            congestion,
-            groups: Vec::new(),
-        })
+        Ok((
+            BoardRoute {
+                results,
+                unrouted,
+                congestion,
+                groups: Vec::new(),
+            },
+            rip_count,
+        ))
+    }
+}
+
+impl Router for RipUpRouter {
+    fn route(&self, grid: &Grid, nets: &[NetEndpoints]) -> Result<BoardRoute, RouterError> {
+        self.route_with_stats(grid, nets).map(|(board, _)| board)
     }
 }
 
@@ -284,6 +324,45 @@ mod tests {
             br.results.iter().map(|r| &r.net).collect::<Vec<_>>(),
             br2.results.iter().map(|r| &r.net).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn contention_executes_real_displacement_and_preserves_priority() {
+        let dims = Dims::new(5, 3);
+        let mut b = GridBuilder::new(dims, 1);
+        b.mark_rect(0, 0, 4, 0);
+        b.mark_rect(0, 2, 4, 2);
+        let grid = b.build();
+        let nets = vec![
+            net("a", dims.idx(0, 1), dims.idx(4, 1)),
+            net("b", dims.idx(2, 1), dims.idx(4, 1)),
+        ];
+        let (board, rips) = RipUpRouter.route_with_stats(&grid, &nets).unwrap();
+        assert!(rips >= 1, "the higher-priority net must actually rip b up");
+        assert_eq!(
+            board
+                .results
+                .iter()
+                .map(|r| r.net.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(board.unrouted, vec!["b"]);
+    }
+
+    #[test]
+    fn repeated_contention_is_byte_deterministic() {
+        let dims = Dims::new(7, 5);
+        let grid = GridBuilder::new(dims, 1).mark_cell(3, 2).build();
+        let nets = vec![
+            net("a", dims.idx(0, 1), dims.idx(6, 3)),
+            net("b", dims.idx(0, 3), dims.idx(6, 1)),
+            net("c", dims.idx(1, 0), dims.idx(5, 4)),
+        ];
+        let first = RipUpRouter.route(&grid, &nets).unwrap();
+        for _ in 0..32 {
+            assert_eq!(RipUpRouter.route(&grid, &nets).unwrap(), first);
+        }
     }
 
     #[test]

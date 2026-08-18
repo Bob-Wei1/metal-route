@@ -26,3 +26,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mr-metal = { workspace = true }

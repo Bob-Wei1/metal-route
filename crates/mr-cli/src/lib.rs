@@ -24,10 +24,17 @@ mod drc_board;
 use std::collections::HashMap;
 
 use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
-use serde::{Deserialize, Serialize};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
 use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
 use mr_srj::{rasterize_with_layers, to_solution_layered, Mapping, RoutePoint, SimpleRouteJson};
+use serde::{Deserialize, Serialize};
+
+#[cfg(target_os = "macos")]
+use mr_core::RouterError;
+#[cfg(target_os = "macos")]
+use mr_cpu::{IsolatedRouteProvider, IsolatedRouteRequest};
+#[cfg(target_os = "macos")]
+use mr_metal::{MetalEdgeCosts, MetalIsolatedRoute, MetalWindow};
 
 /// The ~2× speedup threshold the M2 go/no-go gate uses.
 pub const GO_NO_GO_THRESHOLD: f32 = 2.0;
@@ -120,7 +127,7 @@ pub fn run_handoff(args: &HandoffArgs) -> Result<mr_bridge::RunOutput> {
     handoff_with(&mr_bridge::SystemRunner, args)
 }
 
-/// Which CPU router backend to use.
+/// Which router backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum RouterKind {
     /// Lee/Dijkstra single-source router; each net routed independently.
@@ -281,6 +288,152 @@ pub fn parse_srj(bytes: &[u8]) -> Result<SimpleRouteJson> {
     serde_json::from_slice(bytes).context("failed to parse SimpleRouteJson input")
 }
 
+/// Explicit opt-in for the experimental Metal isolated-net provider.
+///
+/// Targeted CPU A* remained faster on five of eight representative real boards,
+/// including the largest one measured. Keep the proven CPU path as the default
+/// until a request-aware crossover rule has broader evidence.
+#[cfg(target_os = "macos")]
+const METAL_ISOLATED_ENV: &str = "METALROUTE_EXPERIMENTAL_METAL_ISOLATED";
+
+/// Minimum aggregate independent-field work that can amortize Metal setup,
+/// packing, and readback after the user has explicitly opted in.
+#[cfg(target_os = "macos")]
+const METAL_ISOLATED_MIN_FIELD_WORK: usize = 1_000_000;
+
+/// Corpus routing can invoke `route_problem` concurrently. At most one isolated
+/// batch may use Metal; a contending board immediately takes the exact CPU fallback
+/// instead of waiting behind the GPU. This bounds combined GPU/shared-host working
+/// state to one mr-metal chunk (at most 16M field-cells).
+#[cfg(target_os = "macos")]
+static METAL_ISOLATED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "macos")]
+fn metal_isolated_opted_in() -> bool {
+    matches!(
+        std::env::var(METAL_ISOLATED_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn use_metal_isolated_provider(n_cells: usize, n_nets: usize, opted_in: bool) -> bool {
+    opted_in
+        && n_cells
+            .checked_mul(n_nets)
+            .is_none_or(|work| work >= METAL_ISOLATED_MIN_FIELD_WORK)
+}
+
+#[cfg(target_os = "macos")]
+trait MetalIsolatedBackend {
+    fn route_batch(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        windows: &[MetalWindow],
+        edges: MetalEdgeCosts<'_>,
+    ) -> std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError>;
+}
+
+#[cfg(target_os = "macos")]
+struct SystemMetalIsolatedBackend;
+
+#[cfg(target_os = "macos")]
+impl MetalIsolatedBackend for SystemMetalIsolatedBackend {
+    fn route_batch(
+        &self,
+        grid: &Grid,
+        nets: &[NetEndpoints],
+        windows: &[MetalWindow],
+        edges: MetalEdgeCosts<'_>,
+    ) -> std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+        mr_metal::metal_route_isolated_batch(grid, nets, windows, edges)
+    }
+}
+
+/// Adapt one CPU provider request to mr-metal. The first solve uses the CPU's
+/// normal windows; only its unreachable entries are cloned into a full-board
+/// retry. Any error or alignment mismatch aborts the entire provider result so
+/// NegotiatedRouter performs its documented whole-batch CPU fallback.
+#[cfg(target_os = "macos")]
+fn metal_isolated_paths_with(
+    backend: &impl MetalIsolatedBackend,
+    request: IsolatedRouteRequest<'_>,
+) -> std::result::Result<Vec<Option<Vec<CellIdx>>>, RouterError> {
+    if request.windows.len() != request.nets.len() {
+        return Err(RouterError::BackendUnavailable(
+            "Metal isolated request windows are not net-aligned".into(),
+        ));
+    }
+
+    let windows: Vec<MetalWindow> = request
+        .windows
+        .iter()
+        .map(|window| MetalWindow {
+            x0: window.x0,
+            y0: window.y0,
+            x1: window.x1,
+            y1: window.y1,
+        })
+        .collect();
+    let edges = MetalEdgeCosts {
+        x: request.x_edge_costs,
+        y: request.y_edge_costs,
+        vias: request.via_edge_costs,
+    };
+    let first = backend.route_batch(request.grid, request.nets, &windows, edges)?;
+    if first.len() != request.nets.len() {
+        return Err(RouterError::BackendUnavailable(
+            "Metal isolated result is not net-aligned".into(),
+        ));
+    }
+
+    let mut paths: Vec<Option<Vec<CellIdx>>> = first
+        .into_iter()
+        .map(|route| route.map(|route| route.path))
+        .collect();
+    let retry_indices: Vec<usize> = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| path.is_none().then_some(index))
+        .collect();
+    if retry_indices.is_empty() {
+        return Ok(paths);
+    }
+
+    let retry_nets: Vec<NetEndpoints> = retry_indices
+        .iter()
+        .map(|&index| request.nets[index].clone())
+        .collect();
+    let retry_windows = vec![MetalWindow::full(request.grid.dims); retry_nets.len()];
+    let retry = backend.route_batch(request.grid, &retry_nets, &retry_windows, edges)?;
+    if retry.len() != retry_indices.len() {
+        return Err(RouterError::BackendUnavailable(
+            "Metal isolated retry result is not net-aligned".into(),
+        ));
+    }
+    for (index, route) in retry_indices.into_iter().zip(retry) {
+        paths[index] = route.map(|route| route.path);
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "macos")]
+struct MetalIsolatedProvider;
+
+#[cfg(target_os = "macos")]
+impl IsolatedRouteProvider for MetalIsolatedProvider {
+    fn route_isolated_batch(
+        &self,
+        request: IsolatedRouteRequest<'_>,
+    ) -> std::result::Result<Vec<Option<Vec<CellIdx>>>, RouterError> {
+        let _guard = METAL_ISOLATED_MUTEX.try_lock().map_err(|_| {
+            RouterError::BackendUnavailable("Metal isolated batch is busy or unavailable".into())
+        })?;
+        metal_isolated_paths_with(&SystemMetalIsolatedBackend, request)
+    }
+}
+
 /// Core `route` logic operating on an already-parsed problem.
 ///
 /// Returns the routed solution soup as a serde JSON value alongside the
@@ -319,7 +472,11 @@ pub fn route_problem(
     } else {
         0
     };
-    let trace_halo_mm = if min_clearance > 0.0 { min_clearance + DEFAULT_TRACE_WIDTH } else { 0.0 };
+    let trace_halo_mm = if min_clearance > 0.0 {
+        min_clearance + DEFAULT_TRACE_WIDTH
+    } else {
+        0.0
+    };
     // D2: thread the real signal-via pad diameter so the rasteriser can reserve a
     // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
     let problem = rasterize_with_layers(
@@ -347,16 +504,40 @@ pub fn route_problem(
     // planar steps by their real length. On a uniform grid this is byte-identical to
     // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
     // the true pitch.
-    let coords =
-        GridCoords::from_lines(problem.mapping.x_lines.clone(), problem.mapping.y_lines.clone());
-    let board = match router {
-        RouterKind::Lee => LeeRouter::new().route(&problem.grid, &problem.nets),
-        RouterKind::Ripup => RipUpRouter::new().route(&problem.grid, &problem.nets),
-        RouterKind::Negotiated => NegotiatedRouter::new()
-            .with_via_model(via_model.clone())
-            .with_clearance_mm(trace_halo_mm)
-            .with_coords(coords.clone())
-            .route(&problem.grid, &problem.nets),
+    let coords = GridCoords::from_lines(
+        problem.mapping.x_lines.clone(),
+        problem.mapping.y_lines.clone(),
+    );
+    let (board, negotiated_alone) = match router {
+        RouterKind::Lee => LeeRouter::new()
+            .route(&problem.grid, &problem.nets)
+            .map(|board| (board, None)),
+        RouterKind::Ripup => RipUpRouter::new()
+            .route(&problem.grid, &problem.nets)
+            .map(|board| (board, None)),
+        RouterKind::Negotiated => {
+            let negotiated = NegotiatedRouter::new()
+                .with_via_model(via_model.clone())
+                .with_clearance_mm(trace_halo_mm)
+                .with_coords(coords.clone());
+            #[cfg(target_os = "macos")]
+            let outcome = if use_metal_isolated_provider(
+                problem.grid.dims.len(),
+                total,
+                metal_isolated_opted_in(),
+            ) {
+                negotiated.route_with_isolated_provider(
+                    &problem.grid,
+                    &problem.nets,
+                    &MetalIsolatedProvider,
+                )
+            } else {
+                negotiated.route_with_outcome(&problem.grid, &problem.nets)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let outcome = negotiated.route_with_outcome(&problem.grid, &problem.nets);
+            outcome.map(|outcome| (outcome.board, Some(outcome.alone_routable)))
+        }
     }
     .context("router failed")?;
 
@@ -422,9 +603,17 @@ pub fn route_problem(
     };
 
     // Diagnose every unrouted net: was it impossible at this resolution, or just
-    // lost to congestion? Cheap — re-routes only the failed nets, one at a time.
-    let unrouted =
-        classify_unrouted(router, &problem.grid, &problem.nets, &board.unrouted, &via_model, &coords);
+    // lost to congestion? Negotiated routing reuses the exact isolation result its
+    // legalization phase already computed; the other backends retain solo reroutes.
+    let unrouted = classify_unrouted(
+        router,
+        &problem.grid,
+        &problem.nets,
+        &board.unrouted,
+        &via_model,
+        &coords,
+        negotiated_alone.as_deref(),
+    );
 
     let summary = Summary {
         routed: board.results.len(),
@@ -454,8 +643,10 @@ pub fn route_problem(
 /// original failure was contention ([`UnroutedReason::Congested`]); if it still
 /// can't route, the grid itself blocks it ([`UnroutedReason::UnroutableAlone`]).
 ///
-/// Runs sequentially: the corpus harness already fans boards out across cores, so
-/// nesting rayon here would only oversubscribe. The per-net count is small.
+/// `negotiated_alone`, when present, is aligned with `nets` and is the exact result
+/// already computed by [`NegotiatedRouter`]. Other backends (and tests exercising
+/// the fallback) run sequentially: the corpus harness already fans boards out
+/// across cores, so nesting rayon here would only oversubscribe.
 fn classify_unrouted(
     router: RouterKind,
     grid: &Grid,
@@ -463,14 +654,24 @@ fn classify_unrouted(
     unrouted: &[String],
     via_model: &ViaModel,
     coords: &GridCoords,
+    negotiated_alone: Option<&[bool]>,
 ) -> Vec<(String, UnroutedReason)> {
-    let by_name: HashMap<&str, &NetEndpoints> = nets.iter().map(|n| (n.net.as_str(), n)).collect();
+    let by_name: HashMap<&str, (usize, &NetEndpoints)> = nets
+        .iter()
+        .enumerate()
+        .map(|(i, net)| (net.net.as_str(), (i, net)))
+        .collect();
 
     unrouted
         .iter()
         .map(|name| {
-            let routes_alone = by_name.get(name.as_str()).is_some_and(|net| {
-                let solo = std::slice::from_ref(*net);
+            let routes_alone = by_name.get(name.as_str()).is_some_and(|&(i, net)| {
+                if router == RouterKind::Negotiated {
+                    if let Some(cached) = negotiated_alone {
+                        return cached.get(i).copied().unwrap_or(false);
+                    }
+                }
+                let solo = std::slice::from_ref(net);
                 let res = match router {
                     RouterKind::Lee => LeeRouter::new().route(grid, solo),
                     RouterKind::Ripup => RipUpRouter::new().route(grid, solo),
@@ -941,8 +1142,10 @@ pub fn route_dsn_problem(
 
     // Continuous grid-line geometry: prices planar steps by real length (uniform-grid
     // byte-identical, Hanan-grid pitch-aware).
-    let coords =
-        GridCoords::from_lines(problem.mapping.x_lines.clone(), problem.mapping.y_lines.clone());
+    let coords = GridCoords::from_lines(
+        problem.mapping.x_lines.clone(),
+        problem.mapping.y_lines.clone(),
+    );
     let start = std::time::Instant::now();
     let board = NegotiatedRouter::new()
         .with_via_model(via_model)
@@ -1094,6 +1297,152 @@ pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+    };
+
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedMetalCall {
+        nets: Vec<String>,
+        windows: Vec<MetalWindow>,
+        x_edges: Vec<mr_core::Cost>,
+        y_edges: Vec<mr_core::Cost>,
+        via_edges: Vec<Option<mr_core::Cost>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct ScriptedMetalBackend {
+        responses:
+            RefCell<VecDeque<std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError>>>,
+        calls: RefCell<Vec<RecordedMetalCall>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ScriptedMetalBackend {
+        fn new(
+            responses: impl IntoIterator<
+                Item = std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError>,
+            >,
+        ) -> Self {
+            Self {
+                responses: RefCell::new(responses.into_iter().collect()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MetalIsolatedBackend for ScriptedMetalBackend {
+        fn route_batch(
+            &self,
+            _grid: &Grid,
+            nets: &[NetEndpoints],
+            windows: &[MetalWindow],
+            edges: MetalEdgeCosts<'_>,
+        ) -> std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+            self.calls.borrow_mut().push(RecordedMetalCall {
+                nets: nets.iter().map(|net| net.net.clone()).collect(),
+                windows: windows.to_vec(),
+                x_edges: edges.x.to_vec(),
+                y_edges: edges.y.to_vec(),
+                via_edges: edges.vias.to_vec(),
+            });
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .expect("one scripted response per Metal call")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct RecordingSystemMetalProvider {
+        calls: Cell<usize>,
+        succeeded: Cell<bool>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl IsolatedRouteProvider for RecordingSystemMetalProvider {
+        fn route_isolated_batch(
+            &self,
+            request: IsolatedRouteRequest<'_>,
+        ) -> std::result::Result<Vec<Option<Vec<CellIdx>>>, RouterError> {
+            self.calls.set(self.calls.get() + 1);
+            let result = MetalIsolatedProvider.route_isolated_batch(request);
+            self.succeeded.set(result.is_ok());
+            result
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct AdapterFixture {
+        grid: Grid,
+        nets: Vec<NetEndpoints>,
+        windows: Vec<mr_cpu::IsolatedRouteWindow>,
+        x_edges: Vec<mr_core::Cost>,
+        y_edges: Vec<mr_core::Cost>,
+        via_edges: Vec<Option<mr_core::Cost>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl AdapterFixture {
+        fn request(&self) -> IsolatedRouteRequest<'_> {
+            IsolatedRouteRequest {
+                grid: &self.grid,
+                nets: &self.nets,
+                windows: &self.windows,
+                x_edge_costs: &self.x_edges,
+                y_edge_costs: &self.y_edges,
+                via_edge_costs: &self.via_edges,
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn adapter_fixture() -> AdapterFixture {
+        let dims = mr_core::Dims::new(5, 3);
+        let grid = Grid::filled(dims, 1);
+        let nets = (0..3)
+            .map(|row| NetEndpoints {
+                net: format!("n{row}"),
+                src: dims.idx(0, row),
+                dst: dims.idx(4, row),
+                passable_pads: Vec::new(),
+            })
+            .collect();
+        let windows = vec![
+            mr_cpu::IsolatedRouteWindow {
+                x0: 0,
+                y0: 0,
+                x1: 4,
+                y1: 0,
+            },
+            mr_cpu::IsolatedRouteWindow {
+                x0: 0,
+                y0: 1,
+                x1: 4,
+                y1: 1,
+            },
+            mr_cpu::IsolatedRouteWindow {
+                x0: 0,
+                y0: 2,
+                x1: 4,
+                y1: 2,
+            },
+        ];
+        AdapterFixture {
+            grid,
+            nets,
+            windows,
+            x_edges: vec![11, 13, 17, 19],
+            y_edges: vec![23, 29],
+            via_edges: Vec::new(),
+        }
+    }
+
     const SAMPLE: &str = r#"{
         "layerCount": 2,
         "bounds": { "minX": 0, "maxX": 10, "minY": 0, "maxY": 10 },
@@ -1105,6 +1454,183 @@ mod tests {
             { "name": "GND", "pointsToConnect": [ {"x": 1, "y": 9}, {"x": 9, "y": 9} ] }
         ]
     }"#;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_field_work_gate_has_exact_boundary_and_overflow_policy() {
+        assert!(!use_metal_isolated_provider(usize::MAX, 2, false));
+        assert!(!use_metal_isolated_provider(999_999, 1, true));
+        assert!(use_metal_isolated_provider(1_000_000, 1, true));
+        assert!(use_metal_isolated_provider(2_000, 500, true));
+        assert!(!use_metal_isolated_provider(2_000, 499, true));
+        assert!(use_metal_isolated_provider(usize::MAX, 2, true));
+        assert!(!use_metal_isolated_provider(1_000_000, 0, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_provider_falls_back_instead_of_waiting_for_a_busy_gpu_lane() {
+        let _held = METAL_ISOLATED_MUTEX.lock().unwrap();
+        let dims = mr_core::Dims::new(1, 1);
+        let grid = Grid::filled(dims, 1);
+        let nets: [NetEndpoints; 0] = [];
+        let windows: [mr_cpu::IsolatedRouteWindow; 0] = [];
+        let edges: [mr_core::Cost; 0] = [];
+        let vias: [Option<mr_core::Cost>; 0] = [];
+
+        let result = MetalIsolatedProvider.route_isolated_batch(IsolatedRouteRequest {
+            grid: &grid,
+            nets: &nets,
+            windows: &windows,
+            x_edge_costs: &edges,
+            y_edge_costs: &edges,
+            via_edge_costs: &vias,
+        });
+        assert!(matches!(result, Err(RouterError::BackendUnavailable(_))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_adapter_retries_only_missing_entries_and_restores_input_alignment() {
+        let fixture = adapter_fixture();
+        let first = vec![
+            None,
+            Some(MetalIsolatedRoute {
+                path: vec![5, 6, 7, 8, 9],
+                search_cost: 2,
+            }),
+            None,
+        ];
+        let retry = vec![
+            Some(MetalIsolatedRoute {
+                path: vec![0, 1, 2, 3, 4],
+                search_cost: 1,
+            }),
+            Some(MetalIsolatedRoute {
+                path: vec![10, 11, 12, 13, 14],
+                search_cost: 3,
+            }),
+        ];
+        let backend = ScriptedMetalBackend::new([Ok(first), Ok(retry)]);
+        let got = metal_isolated_paths_with(&backend, fixture.request()).unwrap();
+
+        assert_eq!(
+            got,
+            [
+                Some(vec![0, 1, 2, 3, 4]),
+                Some(vec![5, 6, 7, 8, 9]),
+                Some(vec![10, 11, 12, 13, 14]),
+            ]
+        );
+        let calls = backend.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].nets, ["n0", "n1", "n2"]);
+        assert_eq!(calls[1].nets, ["n0", "n2"]);
+        assert_eq!(
+            calls[0].windows,
+            fixture
+                .windows
+                .iter()
+                .map(|window| MetalWindow {
+                    x0: window.x0,
+                    y0: window.y0,
+                    x1: window.x1,
+                    y1: window.y1,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(calls[1].windows, [MetalWindow::full(fixture.grid.dims); 2]);
+        for call in calls.iter() {
+            assert_eq!(call.x_edges, fixture.x_edges);
+            assert_eq!(call.y_edges, fixture.y_edges);
+            assert_eq!(call.via_edges, fixture.via_edges);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_adapter_rejects_misaligned_results() {
+        let fixture = adapter_fixture();
+        let backend = ScriptedMetalBackend::new([Ok(vec![None; fixture.nets.len() - 1])]);
+        let error = metal_isolated_paths_with(&backend, fixture.request()).unwrap_err();
+        assert!(matches!(error, RouterError::BackendUnavailable(_)));
+        assert_eq!(backend.calls.borrow().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_adapter_propagates_retry_error_without_partial_output() {
+        let fixture = adapter_fixture();
+        let backend = ScriptedMetalBackend::new([
+            Ok(vec![
+                Some(MetalIsolatedRoute {
+                    path: vec![0, 1, 2, 3, 4],
+                    search_cost: 1,
+                }),
+                None,
+                None,
+            ]),
+            Err(RouterError::BackendUnavailable(
+                "scripted retry failure".into(),
+            )),
+        ]);
+        let error = metal_isolated_paths_with(&backend, fixture.request()).unwrap_err();
+        assert!(error.to_string().contains("scripted retry failure"));
+        let calls = backend.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].nets, ["n1", "n2"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_adapter_preserves_exact_negotiated_output() {
+        let dims = mr_core::Dims::with_layers(9, 7, 3);
+        let coords = GridCoords::from_lines(
+            vec![0.0, 0.2, 0.7, 1.9, 2.0, 4.5, 4.7, 8.0, 8.1],
+            vec![0.0, 0.1, 1.0, 1.0, 2.7, 6.0, 6.2],
+        );
+        let mut grid = Grid::filled(dims, 1);
+        grid.set(dims.idx3(2, 3, 0), 0);
+        grid.set(dims.idx3(3, 3, 1), 7);
+        for (x, y, layer) in [(0, 0, 0), (8, 0, 2), (4, 3, 0), (4, 3, 1)] {
+            grid.set(dims.idx3(x, y, layer), mr_core::OBSTACLE);
+        }
+        let nets = vec![
+            NetEndpoints {
+                net: "weighted".into(),
+                src: dims.idx3(0, 3, 0),
+                dst: dims.idx3(8, 3, 2),
+                passable_pads: Vec::new(),
+            },
+            NetEndpoints {
+                net: "own-pads".into(),
+                src: dims.idx3(0, 0, 0),
+                dst: dims.idx3(8, 0, 2),
+                passable_pads: vec![dims.idx3(0, 0, 0), dims.idx3(8, 0, 2)],
+            },
+            NetEndpoints {
+                net: "zero-length".into(),
+                src: dims.idx3(2, 3, 0),
+                dst: dims.idx3(2, 3, 0),
+                passable_pads: Vec::new(),
+            },
+        ];
+        let via_model = ViaModel::with_allowed_steps(3, 37, vec![(0, 1), (1, 2)]);
+        let router = NegotiatedRouter::new()
+            .with_coords(coords)
+            .with_via_model(via_model);
+        let cpu = router.route_with_outcome(&grid, &nets).unwrap();
+        let provider = RecordingSystemMetalProvider::default();
+        let accelerated = router
+            .route_with_isolated_provider(&grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(provider.calls.get(), 1);
+        assert!(
+            provider.succeeded.get(),
+            "the exact-output comparison must exercise a successful Metal batch"
+        );
+        assert_eq!(accelerated, cpu);
+    }
 
     #[test]
     fn route_problem_routes_two_nets() {
@@ -1208,11 +1734,76 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_cached_unrouted_classification_matches_solo_routes() {
+        let dims = mr_core::Dims::new(5, 5);
+        let mut grid = Grid::filled(dims, 1);
+        for (x, y) in [(2, 1), (1, 2), (3, 2), (2, 3)] {
+            grid.set(dims.idx(x, y), mr_core::OBSTACLE);
+        }
+        let nets = vec![
+            NetEndpoints {
+                net: "open".into(),
+                src: dims.idx(0, 4),
+                dst: dims.idx(4, 4),
+                passable_pads: Vec::new(),
+            },
+            NetEndpoints {
+                net: "blocked".into(),
+                src: dims.idx(0, 0),
+                dst: dims.idx(2, 2),
+                passable_pads: Vec::new(),
+            },
+            NetEndpoints {
+                net: "zero".into(),
+                src: dims.idx(4, 0),
+                dst: dims.idx(4, 0),
+                passable_pads: Vec::new(),
+            },
+        ];
+        let coords = GridCoords::uniform(dims);
+        let via_model = ViaModel::through_hole(dims.layers);
+        let outcome = NegotiatedRouter::new()
+            .with_via_model(via_model.clone())
+            .with_coords(coords.clone())
+            .route_with_outcome(&grid, &nets)
+            .unwrap();
+        assert_eq!(outcome.alone_routable, [true, false, true]);
+
+        let names: Vec<String> = nets.iter().map(|net| net.net.clone()).collect();
+        let cached = classify_unrouted(
+            RouterKind::Negotiated,
+            &grid,
+            &nets,
+            &names,
+            &via_model,
+            &coords,
+            Some(&outcome.alone_routable),
+        );
+        let solo = classify_unrouted(
+            RouterKind::Negotiated,
+            &grid,
+            &nets,
+            &names,
+            &via_model,
+            &coords,
+            None,
+        );
+        assert_eq!(cached, solo);
+        assert_eq!(
+            cached,
+            vec![
+                ("open".into(), UnroutedReason::Congested),
+                ("blocked".into(), UnroutedReason::UnroutableAlone),
+                ("zero".into(), UnroutedReason::Congested),
+            ]
+        );
+    }
+
+    #[test]
     fn default_resolution_targets_reasonable_grid() {
         let srj = parse_srj(SAMPLE.as_bytes()).unwrap();
         // span 10 / 64 -> small cells; grid should be well-formed and non-trivial.
-        let (_traces, summary, _diag) =
-            route_problem(&srj, None, RouterKind::Ripup, None).unwrap();
+        let (_traces, summary, _diag) = route_problem(&srj, None, RouterKind::Ripup, None).unwrap();
         assert!(summary.grid_w >= 10 && summary.grid_h >= 10);
     }
 

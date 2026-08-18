@@ -23,7 +23,7 @@
 //! landings are fixed anchors and are never moved, so connectivity is preserved
 //! and the via count is unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mr_drc::{point_seg_dist, seg_rect_gap, seg_seg_dist};
 
@@ -55,7 +55,12 @@ const VIA_RADIUS: f64 = 0.225;
 /// *surface*, so the required threshold is uniformly `clearance + half_width`.
 enum Feature {
     /// Another trace's wire segment, modelled as a capsule of half-width `half_w`.
-    Seg { a: P, b: P, half_w: f64, trace: usize },
+    Seg {
+        a: P,
+        b: P,
+        half_w: f64,
+        trace: usize,
+    },
     /// A pad / keepout rectangle (axis-aligned, full width/height).
     Rect { c: P, w: f64, h: f64 },
     /// A via barrel, modelled as a circle of radius `r`.
@@ -102,8 +107,31 @@ impl Feature {
 /// and/or via landings. The first and last points are immovable anchors.
 struct Run {
     layer: String,
-    width: f64,
     pts: Vec<P>,
+    /// Width attached to each corresponding point in `pts`. Route widths are
+    /// vertex data; collapsing them to one run-wide value loses taper geometry.
+    widths: Vec<f64>,
+}
+
+impl Run {
+    fn max_width(&self) -> f64 {
+        self.widths.iter().copied().fold(0.0, f64::max)
+    }
+
+    fn segment_half_width(&self, a: usize, b: usize) -> f64 {
+        self.widths[a].max(self.widths[b]) / 2.0
+    }
+
+    /// Width shared exactly by every vertex, or `None` for a tapered/mixed run.
+    /// Beautification changes vertex cardinality, so mixed-width runs stay exact
+    /// until there is an explicit taper-aware simplifier.
+    fn uniform_width(&self) -> Option<f64> {
+        let first = *self.widths.first()?;
+        self.widths
+            .iter()
+            .all(|width| *width == first)
+            .then_some(first)
+    }
 }
 
 /// An element of a parsed trace, in original order.
@@ -136,12 +164,7 @@ pub fn beautify_traces(
 }
 
 /// Beautify a single trace against the precomputed feature context.
-fn beautify_one(
-    ti: usize,
-    trace: PcbTrace,
-    by_layer: &LayerFeatures,
-    clearance: f64,
-) -> PcbTrace {
+fn beautify_one(ti: usize, trace: PcbTrace, by_layer: &LayerFeatures, clearance: f64) -> PcbTrace {
     let mut items = parse_items(&trace);
     for item in &mut items {
         if let Item::Run(run) = item {
@@ -196,8 +219,7 @@ pub fn legalize_clearance(
     if clearance <= 0.0 || traces.is_empty() {
         return traces;
     }
-    let mut items_per_trace: Vec<Vec<Item>> =
-        traces.iter().map(parse_items).collect();
+    let mut items_per_trace: Vec<Vec<Item>> = traces.iter().map(parse_items).collect();
     let nets: Vec<Option<String>> = traces.iter().map(|t| t.net.clone()).collect();
 
     for _ in 0..LEGALIZE_SWEEPS {
@@ -278,10 +300,10 @@ fn count_foreign_violations(
         for item in items {
             match item {
                 Item::Run(run) => {
-                    let req = clearance + run.width / 2.0;
                     let feats = context.foreign_for_layer(ti, &run.layer);
-                    for w in run.pts.windows(2) {
+                    for (i, w) in run.pts.windows(2).enumerate() {
                         let (s0, s1) = (w[0], w[1]);
+                        let req = clearance + run.segment_half_width(i, i + 1);
                         let cb = seg_bbox(s0, s1, req);
                         for f in &feats {
                             if !bbox_overlap(cb, f.bbox()) {
@@ -293,7 +315,12 @@ fn count_foreign_violations(
                         }
                     }
                 }
-                Item::Via(RoutePoint::Via { x, y, from_layer, to_layer }) => {
+                Item::Via(RoutePoint::Via {
+                    x,
+                    y,
+                    from_layer,
+                    to_layer,
+                }) => {
                     // Count the barrel against foreign features on BOTH the layers it
                     // spans. The legaliser may move a via, so this term must be in the
                     // gate or a barrel could be pushed into a foreign feature unseen.
@@ -337,8 +364,8 @@ fn clone_items(items_per_trace: &[Vec<Item>]) -> Vec<Vec<Item>> {
                 .map(|it| match it {
                     Item::Run(r) => Item::Run(Run {
                         layer: r.layer.clone(),
-                        width: r.width,
                         pts: r.pts.clone(),
+                        widths: r.widths.clone(),
                     }),
                     Item::Via(v) => Item::Via(v.clone()),
                 })
@@ -372,7 +399,7 @@ fn legalize_run(ti: usize, run: &mut Run, by_layer: &LayerFeatures, clearance: f
     if run.pts.len() < 3 {
         return false; // only the two immovable anchors — nothing interior to move
     }
-    let half_w = run.width / 2.0;
+    let half_w = run.max_width() / 2.0;
     let req = clearance + half_w;
     let feats = by_layer.foreign_for_layer(ti, &run.layer);
     let mut moved = false;
@@ -504,14 +531,21 @@ fn legalize_vias(ti: usize, items: &mut [Item], by_layer: &LayerFeatures, cleara
         // incident segment on that side, so skip such degenerate vias entirely.
         let (in_neighbor, in_layer, in_req) = match &items[k - 1] {
             Item::Run(r) if r.pts.len() >= 2 => {
-                (r.pts[r.pts.len() - 2], r.layer.clone(), clearance + r.width / 2.0)
+                let last = r.pts.len() - 1;
+                (
+                    r.pts[last - 1],
+                    r.layer.clone(),
+                    clearance + r.segment_half_width(last - 1, last),
+                )
             }
             _ => continue,
         };
         let (out_neighbor, out_layer, out_req) = match &items[k + 1] {
-            Item::Run(r) if r.pts.len() >= 2 => {
-                (r.pts[1], r.layer.clone(), clearance + r.width / 2.0)
-            }
+            Item::Run(r) if r.pts.len() >= 2 => (
+                r.pts[1],
+                r.layer.clone(),
+                clearance + r.segment_half_width(0, 1),
+            ),
             _ => continue,
         };
         let in_feats = by_layer.foreign_for_layer(ti, &in_layer);
@@ -521,7 +555,13 @@ fn legalize_vias(ti: usize, items: &mut [Item], by_layer: &LayerFeatures, cleara
         // each incident segment against its own layer's foreign features and the via
         // barrel (radius VIA_RADIUS) against the union — exactly the geometry that moves.
         let cur = via_min_gap(
-            v, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+            v,
+            in_neighbor,
+            &in_feats,
+            in_req,
+            out_neighbor,
+            &out_feats,
+            out_req,
         );
         if cur >= in_req.min(out_req) {
             continue; // already clear on both incident segments and the barrel — leave it
@@ -540,12 +580,25 @@ fn legalize_vias(ti: usize, items: &mut [Item], by_layer: &LayerFeatures, cleara
             for (dx, dy) in DIRS {
                 let cand = (v.0 + dx * step, v.1 + dy * step);
                 if !via_accepted(
-                    v, cand, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+                    v,
+                    cand,
+                    in_neighbor,
+                    &in_feats,
+                    in_req,
+                    out_neighbor,
+                    &out_feats,
+                    out_req,
                 ) {
                     continue; // would worsen some feature below min(req, original) — unsafe
                 }
                 let g = via_min_gap(
-                    cand, in_neighbor, &in_feats, in_req, out_neighbor, &out_feats, out_req,
+                    cand,
+                    in_neighbor,
+                    &in_feats,
+                    in_req,
+                    out_neighbor,
+                    &out_feats,
+                    out_req,
                 );
                 if g > cur + GAP_EPS {
                     match best {
@@ -652,7 +705,12 @@ fn via_accepted(
         return false;
     }
     // The outgoing incident segment, before and after.
-    if !accepted((to, out_neighbor), &[(from, out_neighbor)], out_feats, out_req) {
+    if !accepted(
+        (to, out_neighbor),
+        &[(from, out_neighbor)],
+        out_feats,
+        out_req,
+    ) {
         return false;
     }
     // The via barrel (a degenerate point inflated by VIA_RADIUS). Reuse the same
@@ -747,15 +805,16 @@ fn incident_min_gap(p: P, a: P, b: P, feats: &[&Feature], req: f64) -> f64 {
 }
 
 /// The 8 unit nudge directions (4 axis-aligned + 4 diagonal), deterministic order.
+const DIAGONAL_UNIT: f64 = std::f64::consts::FRAC_1_SQRT_2;
 const DIRS: [(f64, f64); 8] = [
     (1.0, 0.0),
     (-1.0, 0.0),
     (0.0, 1.0),
     (0.0, -1.0),
-    (0.70710678, 0.70710678),
-    (0.70710678, -0.70710678),
-    (-0.70710678, 0.70710678),
-    (-0.70710678, -0.70710678),
+    (DIAGONAL_UNIT, DIAGONAL_UNIT),
+    (DIAGONAL_UNIT, -DIAGONAL_UNIT),
+    (-DIAGONAL_UNIT, DIAGONAL_UNIT),
+    (-DIAGONAL_UNIT, -DIAGONAL_UNIT),
 ];
 
 /// Split a trace's route into single-layer wire runs separated by via anchors.
@@ -764,12 +823,7 @@ fn parse_items(trace: &PcbTrace) -> Vec<Item> {
     let mut cur: Option<Run> = None;
     for rp in &trace.route {
         match rp {
-            RoutePoint::Wire {
-                x,
-                y,
-                width,
-                layer,
-            } => {
+            RoutePoint::Wire { x, y, width, layer } => {
                 // A layer change without an intervening via still closes the run.
                 if let Some(run) = &cur {
                     if &run.layer != layer {
@@ -778,10 +832,11 @@ fn parse_items(trace: &PcbTrace) -> Vec<Item> {
                 }
                 let run = cur.get_or_insert_with(|| Run {
                     layer: layer.clone(),
-                    width: *width,
                     pts: Vec::new(),
+                    widths: Vec::new(),
                 });
                 run.pts.push((*x, *y));
+                run.widths.push(*width);
             }
             via @ RoutePoint::Via { .. } => {
                 if let Some(run) = cur.take() {
@@ -804,11 +859,12 @@ fn flatten_items_ref(items: &[Item]) -> Vec<RoutePoint> {
     for item in items {
         match item {
             Item::Run(run) => {
-                for (x, y) in &run.pts {
+                debug_assert_eq!(run.pts.len(), run.widths.len());
+                for ((x, y), width) in run.pts.iter().zip(&run.widths) {
                     route.push(RoutePoint::Wire {
                         x: *x,
                         y: *y,
-                        width: run.width,
+                        width: *width,
                         layer: run.layer.clone(),
                     });
                 }
@@ -825,11 +881,12 @@ fn flatten_items(items: Vec<Item>) -> Vec<RoutePoint> {
     for item in items {
         match item {
             Item::Run(run) => {
-                for (x, y) in run.pts {
+                debug_assert_eq!(run.pts.len(), run.widths.len());
+                for ((x, y), width) in run.pts.into_iter().zip(run.widths) {
                     route.push(RoutePoint::Wire {
                         x,
                         y,
-                        width: run.width,
+                        width,
                         layer: run.layer.clone(),
                     });
                 }
@@ -847,12 +904,16 @@ fn beautify_run(ti: usize, run: &mut Run, by_layer: &LayerFeatures, clearance: f
     if run.pts.len() < 3 {
         return; // no interior vertices to touch
     }
-    let half_w = run.width / 2.0;
+    let Some(width) = run.uniform_width() else {
+        return; // preserve tapered/per-vertex widths and their exact vertices
+    };
+    let half_w = width / 2.0;
     let feats = by_layer.for_layer(ti, &run.layer);
 
     collapse_collinear(&mut run.pts);
     chamfer_corners(&mut run.pts, &feats, half_w, clearance);
     collapse_collinear(&mut run.pts);
+    run.widths = vec![width; run.pts.len()];
 }
 
 /// Drop interior vertices that are collinear with their neighbours. Always safe
@@ -988,16 +1049,28 @@ impl LayerFeatures {
     fn foreign_for_layer(&self, ti: usize, layer: &str) -> Vec<&Feature> {
         let my_net = self.nets.get(ti).and_then(|n| n.as_deref());
         let same_net = |f: &Feature| -> bool {
-            match (my_net, f.trace().and_then(|t| self.nets.get(t)).and_then(|n| n.as_deref())) {
+            match (
+                my_net,
+                f.trace()
+                    .and_then(|t| self.nets.get(t))
+                    .and_then(|n| n.as_deref()),
+            ) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
             }
         };
         let mut v: Vec<&Feature> = Vec::new();
         if let Some(segs) = self.segs.get(layer) {
-            v.extend(segs.iter().filter(|f| f.trace() != Some(ti) && !same_net(f)));
+            v.extend(
+                segs.iter()
+                    .filter(|f| f.trace() != Some(ti) && !same_net(f)),
+            );
         }
-        v.extend(self.vias.iter().filter(|f| f.trace() != Some(ti) && !same_net(f)));
+        v.extend(
+            self.vias
+                .iter()
+                .filter(|f| f.trace() != Some(ti) && !same_net(f)),
+        );
         for (layers, pad) in &self.pads {
             if layers.is_empty() || layers.iter().any(|l| l == layer) {
                 v.push(pad);
@@ -1011,18 +1084,15 @@ impl LayerFeatures {
 fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatures {
     let mut segs: HashMap<String, Vec<Feature>> = HashMap::new();
     let mut vias: Vec<Feature> = Vec::new();
+    let mut routed_layers: HashSet<String> = HashSet::new();
 
     for (ti, trace) in traces.iter().enumerate() {
         // Wire segments: consecutive same-layer wire vertices.
         let mut prev: Option<(P, f64, String)> = None;
         for rp in &trace.route {
             match rp {
-                RoutePoint::Wire {
-                    x,
-                    y,
-                    width,
-                    layer,
-                } => {
+                RoutePoint::Wire { x, y, width, layer } => {
+                    routed_layers.insert(layer.clone());
                     if let Some((pp, pw, pl)) = &prev {
                         if pl == layer {
                             segs.entry(layer.clone()).or_default().push(Feature::Seg {
@@ -1035,7 +1105,14 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
                     }
                     prev = Some(((*x, *y), *width, layer.clone()));
                 }
-                RoutePoint::Via { x, y, .. } => {
+                RoutePoint::Via {
+                    x,
+                    y,
+                    from_layer,
+                    to_layer,
+                } => {
+                    routed_layers.insert(from_layer.clone());
+                    routed_layers.insert(to_layer.clone());
                     vias.push(Feature::Circle {
                         c: (*x, *y),
                         r: VIA_RADIUS,
@@ -1050,8 +1127,23 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
     let pads = obstacles
         .iter()
         .map(|o| {
+            // Match rasterisation's conservative fallback: an empty layer list,
+            // or one containing no layer known to the routed geometry, means all
+            // layers. If at least one name is known, retain only those recognized
+            // names and ignore unknown aliases.
+            let layers = if o.layers.is_empty()
+                || !o.layers.iter().any(|layer| routed_layers.contains(layer))
+            {
+                Vec::new()
+            } else {
+                o.layers
+                    .iter()
+                    .filter(|layer| routed_layers.contains(*layer))
+                    .cloned()
+                    .collect()
+            };
             (
-                o.layers.clone(),
+                layers,
                 Feature::Rect {
                     c: (o.center.x, o.center.y),
                     w: o.width,
@@ -1062,7 +1154,12 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
         .collect();
 
     let nets = traces.iter().map(|t| t.net.clone()).collect();
-    LayerFeatures { segs, pads, vias, nets }
+    LayerFeatures {
+        segs,
+        pads,
+        vias,
+        nets,
+    }
 }
 
 // --- small geometry helpers -------------------------------------------------
@@ -1145,10 +1242,16 @@ mod tests {
         let p = pts_of(&out[0]);
         assert!(approx(p[0], (0.0, 0.0)) && approx(*p.last().unwrap(), (3.0, 3.0)));
         assert!(p.len() < 7, "staircase should be simplified, got {p:?}");
-        assert!(has_diagonal(&p), "result should contain a 45° diagonal: {p:?}");
+        assert!(
+            has_diagonal(&p),
+            "result should contain a 45° diagonal: {p:?}"
+        );
         // The interior 90° step vertices are gone.
         for v in [(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (3.0, 2.0)] {
-            assert!(!p.iter().any(|q| approx(*q, v)), "step vertex {v:?} survived");
+            assert!(
+                !p.iter().any(|q| approx(*q, v)),
+                "step vertex {v:?} survived"
+            );
         }
     }
 
@@ -1159,9 +1262,15 @@ mod tests {
         let route = vec![wire(0.0, 0.0), wire(2.0, 0.0), wire(2.0, 2.0)];
         let out = beautify_traces(vec![PcbTrace::new(route)], &[], 0.0);
         let p = pts_of(&out[0]);
-        assert!(!p.iter().any(|q| approx(*q, (2.0, 0.0))), "square corner should be cut");
+        assert!(
+            !p.iter().any(|q| approx(*q, (2.0, 0.0))),
+            "square corner should be cut"
+        );
         assert!(approx(p[0], (0.0, 0.0)) && approx(*p.last().unwrap(), (2.0, 2.0)));
-        assert!(has_diagonal(&p), "chamfer should introduce a 45° segment: {p:?}");
+        assert!(
+            has_diagonal(&p),
+            "chamfer should introduce a 45° segment: {p:?}"
+        );
     }
 
     /// Endpoints and vias are immovable; via count is unchanged.
@@ -1217,7 +1326,11 @@ mod tests {
         // (y=0 and x=2) sit 0.5 away, comfortably clear.
         let pad = Obstacle {
             kind: "rect".to_string(),
-            center: Point { x: 1.5, y: 0.5, layer: None },
+            center: Point {
+                x: 1.5,
+                y: 0.5,
+                layer: None,
+            },
             width: 0.2,
             height: 0.2,
             layers: vec!["top".to_string()],
@@ -1237,13 +1350,99 @@ mod tests {
         }
     }
 
+    /// Rasterisation treats an obstacle whose layer names are all unknown as an
+    /// all-layer keepout. Smoothing must use the same conservative fallback rather
+    /// than silently chamfering through it.
+    #[test]
+    fn unknown_layer_pad_blocks_smoothing_on_every_layer() {
+        let clearance = 0.2;
+        let route = vec![wire(0.0, 0.0), wire(2.0, 0.0), wire(2.0, 2.0)];
+        let pad = Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 1.5,
+                y: 0.5,
+                layer: None,
+            },
+            width: 0.2,
+            height: 0.2,
+            layers: vec!["unknown-copper-layer".into()],
+            connected_to: vec![],
+        };
+
+        let out = beautify_traces(vec![PcbTrace::new(route)], &[pad], clearance);
+        let pts = pts_of(&out[0]);
+        for edge in pts.windows(2) {
+            let gap = seg_rect_gap(edge[0], edge[1], (1.5, 0.5), 0.2, 0.2);
+            assert!(
+                gap + GAP_EPS >= clearance + 0.05,
+                "unknown-layer pad must conservatively block top smoothing: {edge:?}, gap={gap}"
+            );
+        }
+    }
+
+    fn wire_with_width(x: f64, y: f64, width: f64, layer: &str) -> RoutePoint {
+        RoutePoint::Wire {
+            x,
+            y,
+            width,
+            layer: layer.into(),
+        }
+    }
+
+    /// Varying widths are vertex data, not a run-wide style. Until a taper-aware
+    /// simplifier exists, beautification must retain such a run exactly; otherwise
+    /// it silently rewrites copper geometry and can disconnect a via landing.
+    #[test]
+    fn beautify_preserves_nonuniform_widths_and_via_connectivity() {
+        let route = vec![
+            wire_with_width(0.0, 0.0, 0.10, "top"),
+            wire_with_width(1.0, 0.0, 0.15, "top"),
+            wire_with_width(1.0, 1.0, 0.20, "top"),
+            via_at(1.0, 1.0),
+            wire_with_width(1.0, 1.0, 0.25, "bottom"),
+            wire_with_width(2.0, 1.0, 0.30, "bottom"),
+            wire_with_width(2.0, 2.0, 0.35, "bottom"),
+        ];
+        let trace = PcbTrace::new(route.clone()).with_net("N");
+        let out = beautify_traces(vec![trace], &[], 0.1);
+        assert_eq!(
+            out[0].route, route,
+            "nonuniform-width route must round-trip exactly"
+        );
+        assert_eq!(out[0].net.as_deref(), Some("N"));
+    }
+
+    /// The legaliser may move coordinates, but it must never collapse all widths in
+    /// a run to the first vertex's width. With no foreign features this is an exact
+    /// round trip, including the two wire anchors coincident with the via.
+    #[test]
+    fn legalize_preserves_per_vertex_widths_and_via_connectivity() {
+        let route = vec![
+            wire_with_width(0.0, 0.0, 0.10, "top"),
+            wire_with_width(1.0, 1.0, 0.15, "top"),
+            via_at(1.0, 1.0),
+            wire_with_width(1.0, 1.0, 0.25, "bottom"),
+            wire_with_width(2.0, 2.0, 0.30, "bottom"),
+        ];
+        let trace = PcbTrace::new(route.clone()).with_net("N");
+        let out = legalize_clearance(vec![trace], &[], 0.2);
+        assert_eq!(
+            out[0].route, route,
+            "widths and via anchors must round-trip exactly"
+        );
+        assert_eq!(out[0].net.as_deref(), Some("N"));
+    }
+
     /// Worst foreign clearance gap between two traces (different nets) over their
     /// wire segments, measured exactly (centre-line to centre-line minus both
     /// half-widths). Used by the legalisation tests below.
     fn min_track_gap(a: &PcbTrace, b: &PcbTrace, half_w: f64) -> f64 {
         let segs = |t: &PcbTrace| -> Vec<(P, P)> {
             let pts = pts_of(t);
-            (0..pts.len().saturating_sub(1)).map(|i| (pts[i], pts[i + 1])).collect()
+            (0..pts.len().saturating_sub(1))
+                .map(|i| (pts[i], pts[i + 1]))
+                .collect()
         };
         let mut worst = f64::INFINITY;
         for (a0, a1) in segs(a) {
@@ -1261,26 +1460,29 @@ mod tests {
     fn legalize_opens_sub_clearance_track() {
         let clearance = 0.2;
         let half_w = 0.05; // width 0.1
-        // Trace A: straight horizontal reference at y = 0.
+                           // Trace A: straight horizontal reference at y = 0.
         let a = PcbTrace::new(vec![wire(0.0, 0.0), wire(4.0, 0.0)]).with_net("A");
         // Trace B: runs parallel only 0.12 above A through an interior vertex (copper
         // gap 0.12 - 0.10 = 0.02 << clearance 0.2), with endpoints far from A so the
         // anchors themselves are clear and the interior vertex is free to move up.
-        let b = PcbTrace::new(vec![
-            wire(0.0, 1.0),
-            wire(2.0, 0.12),
-            wire(4.0, 1.0),
-        ])
-        .with_net("B");
+        let b = PcbTrace::new(vec![wire(0.0, 1.0), wire(2.0, 0.12), wire(4.0, 1.0)]).with_net("B");
         let before = min_track_gap(&a, &b, half_w);
-        assert!(before < clearance, "fixture must start in violation: {before}");
+        assert!(
+            before < clearance,
+            "fixture must start in violation: {before}"
+        );
         let out = legalize_clearance(vec![a.clone(), b], &[], clearance);
         let after = min_track_gap(&out[0], &out[1], half_w);
-        assert!(after > before + 1e-6, "legalise must increase the gap: {before} -> {after}");
+        assert!(
+            after > before + 1e-6,
+            "legalise must increase the gap: {before} -> {after}"
+        );
         // Endpoint anchors are immovable.
         let bp = pts_of(&out[1]);
-        assert!(approx(bp[0], (0.0, 1.0)) && approx(*bp.last().unwrap(), (4.0, 1.0)),
-            "endpoint anchors must not move: {bp:?}");
+        assert!(
+            approx(bp[0], (0.0, 1.0)) && approx(*bp.last().unwrap(), (4.0, 1.0)),
+            "endpoint anchors must not move: {bp:?}"
+        );
     }
 
     /// Clearance off (== 0) is a no-op: the geometry round-trips byte-for-byte.
@@ -1288,7 +1490,11 @@ mod tests {
     fn legalize_noop_when_clearance_off() {
         let t = PcbTrace::new(vec![wire(0.0, 0.0), wire(1.0, 0.5), wire(2.0, 0.0)]).with_net("A");
         let out = legalize_clearance(vec![t.clone()], &[], 0.0);
-        assert_eq!(pts_of(&out[0]), pts_of(&t), "clearance-off must not move anything");
+        assert_eq!(
+            pts_of(&out[0]),
+            pts_of(&t),
+            "clearance-off must not move anything"
+        );
     }
 
     /// Same-net sub-traces meeting at a junction are immune: the legaliser must not
@@ -1301,7 +1507,11 @@ mod tests {
         let a = PcbTrace::new(vec![wire(0.0, 0.0), wire(2.0, 0.0)]).with_net("A");
         let b = PcbTrace::new(vec![wire(0.0, 0.1), wire(1.0, 0.1), wire(2.0, 0.1)]).with_net("A");
         let out = legalize_clearance(vec![a.clone(), b.clone()], &[], clearance);
-        assert_eq!(pts_of(&out[1]), pts_of(&b), "same-net copper must not be nudged");
+        assert_eq!(
+            pts_of(&out[1]),
+            pts_of(&b),
+            "same-net copper must not be nudged"
+        );
     }
 
     /// (D3) A via landing that grazes a foreign track is nudged — together with its two
@@ -1317,18 +1527,20 @@ mod tests {
         }
     }
     fn wire_on(x: f64, y: f64, layer: &str) -> RoutePoint {
-        RoutePoint::Wire { x, y, width: 0.1, layer: layer.to_string() }
+        RoutePoint::Wire {
+            x,
+            y,
+            width: 0.1,
+            layer: layer.to_string(),
+        }
     }
 
     #[test]
     fn legalize_nudges_via_landing() {
         let clearance = 0.2;
         // Trace B (the obstacle): a straight horizontal foreign track on `top` at y = 0.
-        let b = PcbTrace::new(vec![
-            wire_on(0.0, 0.0, "top"),
-            wire_on(4.0, 0.0, "top"),
-        ])
-        .with_net("B");
+        let b =
+            PcbTrace::new(vec![wire_on(0.0, 0.0, "top"), wire_on(4.0, 0.0, "top")]).with_net("B");
         // Trace A: arrives on `top` from far above, drops a via at (2, 0.12) — only
         // 0.12 from B (copper gap 0.12 - 0.10 = 0.02 << clearance 0.2) — then departs on
         // `bottom`. The via landing on `top` is the LAST point of the first run; the
@@ -1344,13 +1556,19 @@ mod tests {
         .with_net("A");
 
         let via_xy = |t: &PcbTrace| -> P {
-            t.route.iter().find_map(|rp| match rp {
-                RoutePoint::Via { x, y, .. } => Some((*x, *y)),
-                _ => None,
-            }).unwrap()
+            t.route
+                .iter()
+                .find_map(|rp| match rp {
+                    RoutePoint::Via { x, y, .. } => Some((*x, *y)),
+                    _ => None,
+                })
+                .unwrap()
         };
         let via_count = |t: &PcbTrace| -> usize {
-            t.route.iter().filter(|rp| matches!(rp, RoutePoint::Via { .. })).count()
+            t.route
+                .iter()
+                .filter(|rp| matches!(rp, RoutePoint::Via { .. }))
+                .count()
         };
 
         let out = legalize_clearance(vec![a.clone(), b.clone()], &[], clearance);
@@ -1369,11 +1587,20 @@ mod tests {
         );
         // Connectivity preserved: via barrel still coincides with both incident anchors.
         let pa = pts_of(oa);
-        assert!(approx(pa[1], (vx, vy)), "landing anchor must track the via: {pa:?}");
-        assert!(approx(pa[2], (vx, vy)), "departing anchor must track the via: {pa:?}");
+        assert!(
+            approx(pa[1], (vx, vy)),
+            "landing anchor must track the via: {pa:?}"
+        );
+        assert!(
+            approx(pa[2], (vx, vy)),
+            "departing anchor must track the via: {pa:?}"
+        );
         // Real endpoints (far run ends) are immovable.
         assert!(approx(pa[0], (2.0, 2.0)), "start endpoint moved: {pa:?}");
-        assert!(approx(*pa.last().unwrap(), (2.0, -2.0)), "end endpoint moved: {pa:?}");
+        assert!(
+            approx(*pa.last().unwrap(), (2.0, -2.0)),
+            "end endpoint moved: {pa:?}"
+        );
         // The obstacle trace B is left alone (it was already clear of itself).
         assert_eq!(pts_of(ob), pts_of(&b), "obstacle track must not move");
 
@@ -1385,6 +1612,9 @@ mod tests {
         };
         let before = 0.12 - 0.10;
         let after = gap_to_b(oa);
-        assert!(after > before + 1e-6, "via nudge must increase the foreign gap: {before} -> {after}");
+        assert!(
+            after > before + 1e-6,
+            "via nudge must increase the foreign gap: {before} -> {after}"
+        );
     }
 }

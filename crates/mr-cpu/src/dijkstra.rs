@@ -1,16 +1,17 @@
 //! Shared Dijkstra single-source machinery used by [`crate::LeeRouter`],
 //! [`crate::AStarRouter`], and the BFS reference field in [`crate::sweep`].
 //!
-//! All routers in this crate share one deterministic tie-break
-//! ([`mr_core::TieBreak::LowerCellIdx`]): equal-cost expansions are resolved in
-//! favour of the lower [`CellIdx`]. Two mechanisms enforce it:
+//! All routers in this crate share deterministic shortest-path labels. Plain
+//! [`dijkstra`] uses the historical first-writer rule; targeted [`astar_buf`]
+//! orders equal-cost alternatives by fewer hops and then lower predecessor cell.
+//! The latter is necessary because A* can encounter equal-cost predecessors in a
+//! different order, and because zero-cost edges make predecessor-only rewrites
+//! cyclic without a strictly decreasing secondary label. The common mechanics are:
 //!
 //! 1. The priority queue is keyed by `(dist, cell)` so that among entries of equal
 //!    distance the lower cell index is popped first.
-//! 2. Predecessors are **first-writer-wins**: once a cell has a predecessor it is
-//!    never overwritten, even by a later equal-distance relaxation. Because the
-//!    first writer is always reached along the lowest-index frontier, the
-//!    reconstructed path is the canonical one.
+//! 2. `astar_buf` minimizes `(cost, hops)` and only then lowers the predecessor;
+//!    predecessor chains therefore strictly decrease in hops.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -56,6 +57,7 @@ pub(crate) struct DijkstraField {
     /// path excluding the source). `Cost::MAX` for unreachable cells.
     pub dist: Vec<Cost>,
     /// First-writer-wins predecessor of each cell; [`NO_PRED`] when none.
+    #[allow(dead_code)]
     pub pred: Vec<CellIdx>,
 }
 
@@ -119,6 +121,10 @@ where
 /// searches over a 500k-cell board without re-clearing the board each time.
 pub(crate) struct SearchBuf {
     dist: Vec<Cost>,
+    /// Fewest edges among paths attaining `dist`. This secondary label makes the
+    /// zero-cost shortest-path subgraph acyclic: every predecessor has one fewer
+    /// hop, even when predecessor and child have identical cost.
+    hops: Vec<u32>,
     pred: Vec<CellIdx>,
     stamp: Vec<u32>,
     gen: u32,
@@ -129,6 +135,7 @@ impl SearchBuf {
     pub(crate) fn new(n: usize) -> Self {
         Self {
             dist: vec![Cost::MAX; n],
+            hops: vec![u32::MAX; n],
             pred: vec![NO_PRED; n],
             stamp: vec![0; n],
             gen: 0,
@@ -160,11 +167,22 @@ impl SearchBuf {
         }
     }
 
-    /// Record an improved distance/predecessor for `c`, marking it current.
+    /// Current minimum hop count of `c`, or `u32::MAX` when stale/unreached.
     #[inline]
-    fn set(&mut self, c: CellIdx, d: Cost, p: CellIdx) {
+    fn hops_of(&self, c: CellIdx) -> u32 {
+        if self.stamp[c as usize] == self.gen {
+            self.hops[c as usize]
+        } else {
+            u32::MAX
+        }
+    }
+
+    /// Record an improved `(distance, hops)` label and predecessor for `c`.
+    #[inline]
+    fn set(&mut self, c: CellIdx, d: Cost, hops: u32, p: CellIdx) {
         let ci = c as usize;
         self.dist[ci] = d;
+        self.hops[ci] = hops;
         self.pred[ci] = p;
         self.stamp[ci] = self.gen;
     }
@@ -206,11 +224,18 @@ impl SearchBuf {
 /// grid `via_neighbors` is empty, so the search is byte-identical to the planar
 /// case regardless of `via_step`.
 ///
-/// Tie-break matches [`dijkstra`] exactly: the heap is keyed `(Reverse(prio),
-/// Reverse(cell))` (lowest priority then lowest cell index first), and
-/// predecessors are first-writer-wins on strict improvement. Returns the path
-/// `src..=dst` and its summed enter-cost, or `None` when `dst` is unreachable.
-/// Work is O(explored), not O(n).
+/// Canonical labels are ordered by `(cost, hop_count, predecessor_cell)`. A* may
+/// discover an equal-cost route through a higher-index predecessor first, so ties
+/// explicitly prefer fewer hops and then the lower predecessor. Hop count is a
+/// load-bearing secondary key: on zero-cost edges it guarantees every predecessor
+/// chain strictly decreases in hops and therefore cannot cycle. Once the target is
+/// popped we keep consuming entries whose `f` score is no greater than the optimal
+/// target cost; this settles every label that can participate in an optimal path.
+/// Search stops as soon as the remaining heap is provably irrelevant, rather than
+/// exhausting the whole connected component.
+///
+/// Returns the path `src..=dst` and its summed enter-cost, or `None` when `dst` is
+/// unreachable. Work is O(explored), not O(n).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn astar_buf<C, B, H, V>(
     buf: &mut SearchBuf,
@@ -235,18 +260,28 @@ where
         return None;
     }
 
-    buf.set(src, 0, NO_PRED);
+    buf.set(src, 0, 0, NO_PRED);
     let mut heap: BinaryHeap<(Reverse<Cost>, Reverse<CellIdx>)> = BinaryHeap::new();
     heap.push((Reverse(heuristic(src)), Reverse(src)));
+    let mut goal_cost: Option<Cost> = None;
 
     while let Some((Reverse(prio), Reverse(u))) = heap.pop() {
+        // With an admissible heuristic, no entry whose lower bound exceeds the
+        // settled goal cost can improve the goal or any predecessor on an optimal
+        // path.  Continuing through the equal-f frontier is required for the
+        // canonical LowerCellIdx predecessor tie-break.
+        if goal_cost.is_some_and(|goal| prio > goal) {
+            break;
+        }
         let du = buf.dist_of(u);
+        let hu = buf.hops_of(u);
         // Stale entry: a better distance was already committed.
         if prio.saturating_sub(heuristic(u)) > du {
             continue;
         }
         if u == dst {
-            break;
+            goal_cost = Some(du);
+            continue;
         }
         // Inline the 4-neighbour enumeration in ascending CellIdx order (up, left,
         // right, down) to avoid allocating + sorting a Vec on every expansion — the
@@ -261,11 +296,23 @@ where
             // Edge-aware: price the move `u -> v`, not just entering `v`.
             let step = cost_fn(u, v);
             let nd = du.saturating_add(step);
-            if nd < buf.dist_of(v) {
-                // First-writer-wins: only set predecessor on a strict improvement.
-                buf.set(v, nd, u);
+            let nh = hu.saturating_add(1);
+            let old = buf.dist_of(v);
+            if nd < old {
+                buf.set(v, nd, nh, u);
                 let np = nd.saturating_add(heuristic(v));
                 heap.push((Reverse(np), Reverse(v)));
+            } else if nd == old && v != src {
+                let old_hops = buf.hops_of(v);
+                if nh < old_hops {
+                    // Requeue so the improved hop label propagates across a
+                    // zero-cost plateau even though its cost/f-score is unchanged.
+                    buf.set(v, nd, nh, u);
+                    let np = nd.saturating_add(heuristic(v));
+                    heap.push((Reverse(np), Reverse(v)));
+                } else if nh == old_hops && u < buf.pred_of(v) {
+                    buf.set(v, nd, nh, u);
+                }
             }
         };
         if y > 0 {
@@ -293,10 +340,21 @@ where
             }
             if let Some(step) = via_step(u, v) {
                 let nd = du.saturating_add(step);
-                if nd < buf.dist_of(v) {
-                    buf.set(v, nd, u);
+                let nh = hu.saturating_add(1);
+                let old = buf.dist_of(v);
+                if nd < old {
+                    buf.set(v, nd, nh, u);
                     let np = nd.saturating_add(heuristic(v));
                     heap.push((Reverse(np), Reverse(v)));
+                } else if nd == old && v != src {
+                    let old_hops = buf.hops_of(v);
+                    if nh < old_hops {
+                        buf.set(v, nd, nh, u);
+                        let np = nd.saturating_add(heuristic(v));
+                        heap.push((Reverse(np), Reverse(v)));
+                    } else if nh == old_hops && u < buf.pred_of(v) {
+                        buf.set(v, nd, nh, u);
+                    }
                 }
             }
         }
@@ -310,6 +368,12 @@ where
     let mut path = vec![dst];
     let mut cur = dst;
     while cur != src {
+        // Defensive guard: the `(cost, hops)` label invariant already makes a
+        // cycle impossible, but malformed future predecessor logic must return a
+        // routing failure rather than hanging a public Router call.
+        if path.len() > dims.len() {
+            return None;
+        }
         let p = buf.pred_of(cur);
         if p == NO_PRED {
             return None;
@@ -323,6 +387,7 @@ where
 
 /// Reconstruct the path `src..=dst` from a predecessor array, or `None` when
 /// `dst` is unreachable. The returned path starts at `src` and ends at `dst`.
+#[allow(dead_code)]
 pub(crate) fn reconstruct_path(
     pred: &[CellIdx],
     src: CellIdx,
@@ -335,6 +400,10 @@ pub(crate) fn reconstruct_path(
     let mut path = vec![dst];
     let mut cur = dst;
     while cur != src {
+        if path.len() > pred.len() {
+            // A predecessor cycle is malformed input, not a reason to hang.
+            return None;
+        }
         let p = pred[cur as usize];
         if p == NO_PRED {
             // src unreachable from dst chain (shouldn't happen if dist finite).
@@ -352,6 +421,7 @@ mod tests {
     use super::*;
     use mr_core::Dims;
     use mr_grid::GridBuilder;
+    use std::cell::Cell;
 
     /// `astar_buf` must return the same cost as `dijkstra`+`reconstruct_path`, and
     /// a valid shortest path, across several src/dst pairs on an obstacle grid.
@@ -422,5 +492,83 @@ mod tests {
                 (a, b) => panic!("reachability mismatch {src}->{dst}: {a:?} vs {b:?}"),
             }
         }
+    }
+
+    #[test]
+    fn targeted_astar_stops_before_exhausting_connected_component() {
+        let dims = Dims::new(64, 64);
+        let grid = GridBuilder::new(dims, 1).build();
+        let src = dims.idx(0, 0);
+        let dst = dims.idx(10, 0);
+        let calls = Cell::new(0usize);
+        let mut buf = SearchBuf::new(dims.len());
+        let got = astar_buf(
+            &mut buf,
+            dims,
+            src,
+            dst,
+            |_u, v| grid.cost_at(v),
+            |c| grid.is_obstacle(c),
+            |c| {
+                calls.set(calls.get() + 1);
+                let (x, y) = dims.xy(c);
+                x.abs_diff(10) + y
+            },
+            |_, _| None,
+        )
+        .unwrap();
+        assert_eq!(got.1, 10);
+        assert_eq!(got.0, (0..=10).collect::<Vec<_>>());
+        assert!(
+            calls.get() < 256,
+            "targeted A* should prune a 4096-cell board; heuristic calls={}",
+            calls.get()
+        );
+    }
+
+    #[test]
+    fn search_buffer_generation_wrap_cannot_resurrect_stale_state() {
+        let dims = Dims::new(4, 1);
+        let grid = GridBuilder::new(dims, 1).build();
+        let mut buf = SearchBuf::new(dims.len());
+        buf.gen = u32::MAX;
+        buf.stamp.fill(1);
+        buf.dist.fill(0);
+        buf.hops.fill(0);
+        buf.pred.fill(0);
+        let got = astar_buf(
+            &mut buf,
+            dims,
+            0,
+            3,
+            |_u, v| grid.cost_at(v),
+            |_| false,
+            |_| 0,
+            |_, _| None,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![0, 1, 2, 3], 3));
+        assert_eq!(buf.gen, 1);
+    }
+
+    #[test]
+    fn astar_buf_handles_zero_cost_edges_without_heuristic_overestimate() {
+        let dims = Dims::new(3, 2);
+        let mut grid = GridBuilder::new(dims, 1).build();
+        grid.set(1, 0);
+        grid.set(2, 0);
+        let mut buf = SearchBuf::new(dims.len());
+        let got = astar_buf(
+            &mut buf,
+            dims,
+            0,
+            2,
+            |_u, v| grid.cost_at(v),
+            |_| false,
+            |_| 0,
+            |_, _| None,
+        )
+        .unwrap();
+        assert_eq!(got, (vec![0, 1, 2], 0));
     }
 }

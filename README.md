@@ -25,8 +25,8 @@ ownable and swappable behind one `Router` trait.
 | `mr-core` | Contract: `Dims`/`Grid` (canonical row-major mapping), `NetEndpoints`, `BoardRoute`, `TieBreak`, `RouterError`, the `Router` trait. |
 | `mr-grid` | Cost-grid construction: obstacle marking + Chebyshev clearance inflation. |
 | `mr-fixtures` | Shared golden test cases: ASCII grid format, the 32×32 hand case, the M0 obstacle battery, the tie-break conformance case. |
-| `mr-cpu` | **CPU routers:** Lee/Dijkstra (M1), A\* baseline, the separable prefix-min sweep (M0), and bounded rip-up (M2). |
-| `mr-metal` | **Metal GPU kernels (macOS):** M3 wavefront + M4 row/column prefix-min sweep, and `MetalRouter`. |
+| `mr-cpu` | **CPU routers:** Lee/Dijkstra, targeted A\*, separable prefix-min sweep, live bounded rip-up, and deterministic PathFinder-style negotiated routing with multilayer vias and physical clearance. |
+| `mr-metal` | **Metal GPU kernels (macOS):** batched row/column/via prefix-min sweeps, canonical weighted/zero-cost paths, exact Hanan-edge isolated batches, and `MetalRouter`. |
 | `mr-srj` | tscircuit **SimpleRouteJson** I/O: rasterize problems → grid, de-rasterize routes → `pcb_trace` solution soup. |
 | `mr-ingest` | KiCad ingest via the `kicad-cruncher` CLI (shell-out + JSON). |
 | `mr-oracle` | Route equivalence: equal cost + equal congestion (not bit-identical paths). |
@@ -47,7 +47,7 @@ metalroute route --input problem.srj.json --out solution.json
 # Project the M2 batch-GPU go/no-go for a given board
 metalroute project --width 256 --height 256 --nets 500
 
-# Run the local tscircuit-style benchmark and write the CPU baseline report
+# Run the local tscircuit-style benchmark and write a negotiated-router report
 metalroute bench --out benchmarks/cpu_baseline.json
 
 # Route the vendored real-board corpus + render an SVG gallery (see below)
@@ -66,11 +66,22 @@ metalroute handoff --pcb board.kicad_pcb
 
 The CPU router is the correctness oracle. The Metal kernels are graded against it
 on the shared fixture battery via `mr-oracle` (equal total cost + equal per-cell
-congestion + equal unrouted set, under the `LowerCellIdx` tie-break):
+congestion + equal unrouted set, under the shared canonical tie-break):
 
 - M3 GPU wavefront field == CPU BFS field — **pass** (incl. the 32×32 wall, cost 93).
 - M4 GPU prefix-min sweep field == CPU sweep field == CPU BFS field — **pass**.
-- `MetalRouter` ≡ `LeeRouter` on the battery + multi-net boards — **pass**.
+- `MetalRouter` = `LeeRouter` on committed weighted/zero/obstacle cases,
+  deterministic stress grids, multilayer batches, passable-pad overrides, chunk
+  boundaries, and concurrent calls — **pass**.
+
+The Rust source suite now contains **349 test cases** (348 passing, one explicitly
+ignored live-tool test), up from 243, plus two passing doctests. The added cases
+targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
+physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
+layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
+memory caps, cached isolation diagnoses, and parallel scheduling determinism.
+`research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
+regression-gate tests for benchmark reports.
 
 ### M0 finding (the de-risk gate)
 
@@ -78,40 +89,47 @@ The single largest assumption was that GAMER's separable H-then-V prefix-min swe
 transfers to the PCB obstacle model. It does — **for distances**: the converged
 sweep cost field is bit-identical to Lee's BFS across the whole obstacle battery.
 The subtlety: a converged *cost* field does **not** carry the canonical *path* for
-free — backward greedy descent can pick a different equal-cost path. The fix used
-in both CPU and GPU is to descend by **lowest `CellIdx` valid predecessor** under
-the same `(dist, idx)` ordering the sweep relaxes with, which reproduces the
-tie-break path. (See `crates/mr-cpu/src/sweep.rs`.)
+free — backward greedy descent can choose a longer equal-cost path or cycle on a
+zero-cost plateau. CPU search and weighted Metal sweeps therefore label states by
+`(cost, hop_count, lower_predecessor)`. Every reconstructed predecessor strictly
+decreases hop count. Unit-cost Metal grids use the equivalent distance-only fast
+path. (See `crates/mr-cpu/src/sweep.rs` and `crates/mr-metal/src/gpu.rs`.)
 
 ### Speed (honest)
 
-D3 batch benchmark, 128×128 grid, 64 independent nets, like-for-like (each net
-routed as an independent shortest-path field):
+Release benchmark on an M4, 128×128 grid, 64 independent nets. The route outputs
+are comparable, while the implementations deliberately do different work: Lee is
+target-directed and the field implementations compute every cell.
 
-| Router | nets/sec | wall |
-|--------|---------:|-----:|
-| CPU `LeeRouter` | ~133 | ~481 ms |
-| Metal `MetalRouter` | ~185 | ~345 ms |
+| Implementation | warm p50 |
+|----------------|---------:|
+| CPU `LeeRouter` targeted paths | 14.95–18.22 ms |
+| CPU full distance fields | 26.28–27.67 ms |
+| Metal batched fields + paths | **3.42–3.75 ms** |
 
-**Metal is ~1.39× faster than CPU Lee at this scale** — modest, and dominated by
-per-net GPU dispatch overhead (a synchronous command buffer per sweep round per
-net, no cross-net batching). This is exactly the PCB-scale caveat the design
-predicted: PCB grids are small relative to VLSI, so launch/transfer latency eats
-most of the parallel win. A real speedup needs batching many nets into one
-dispatch — future work.
+The batched Metal path is **4.0–5.3× faster than Lee** and **7.1–8.1× faster than
+CPU full fields**. Cold runtime shader/pipeline setup remains 22.5–26.5 ms, then a
+process-global context amortizes it. Unit/obstacle grids avoid the weighted hop
+plane; weighted and zero-cost grids retain it for exact canonical equivalence.
 
-### tscircuit-style benchmark (CPU baseline)
+Metal also exposes an exact weighted Hanan-edge isolated-route batch (including
+vias, windows, and passable pads) behind a dependency-inverted CPU provider. Its
+256×192×2, 48-net warm p50 is 16.7–18.9 ms. Real-board A/Bs did **not** establish a
+reliable automatic crossover—five of eight representative boards were slower—so
+the production negotiated router keeps targeted CPU A* by default. Experimental
+offload is explicit with `METALROUTE_EXPERIMENTAL_METAL_ISOLATED=1`; GPU contention
+or any command failure immediately takes the exact whole-batch CPU fallback.
 
-`metalroute bench` generates a deterministic SimpleRouteJson suite and scores the
-CPU router on completion rate, mean trace length, and throughput. Checked-in
-baseline ([`benchmarks/cpu_baseline.json`](benchmarks/cpu_baseline.json)):
-10 boards, **56% completion**, **357 nets/sec**, M2 **GO** (2.43×).
+### tscircuit-style synthetic benchmark
 
-The honest tension this exposes: **sparse** boards route ~96–100% but are M2
-**NO-GO** (too few nets to beat GPU dispatch), while **dense batch** boards are M2
-**GO** but the single-layer rip-up router only completes ~40–56% — the regime that
-favors the GPU is the regime where CPU completion is hardest. Better net ordering
-/ multi-layer routing would lift completion (future work).
+`metalroute bench` generates ten deterministic 30-net SimpleRouteJson boards.
+Against the exact pre-change run, negotiated routing moves from **206/300 (68.7%)
+to 216/300 (72.0%)**, with mean routed cost 74.84. Finished-code report time ranged
+from 0.68–1.11 s (1.05–1.39 s external) across thermally different runs, versus the
+exact 1.68 s baseline. The deterministic quality result is the primary gate.
+Counted self-halo snapshots make clearance-active negotiation parallel and
+byte-identical across 1/2/4 Rayon threads; one bounded single-layer coordination
+pass recovers the serial router's completion.
 
 > The official `autorouting-dataset benchmark --solver-url` harness drives
 > `mr-server`'s `/solve` endpoint directly; when its npm package is available, point
@@ -134,13 +152,28 @@ scripts/bench-corpus.sh srj15      # just one sub-corpus
 scripts/vendor-corpus.sh           # refresh the fixtures from upstream
 ```
 
-Current baseline (`negotiated` router, per-board declared layers):
+Exact 2026-08-17 before/after run (`negotiated`, identical 112 boards and settings):
 
-| corpus | boards | net completion | fully routed |
-|--------|-------:|---------------:|-------------:|
-| `srj15` | 55 | **73.8%** (531/720) | 8/55 |
-| `bug-reports` | 57 | **73.8%** (1806/2447) | 24/57 |
-| **total** | **112** | **73.8%** (2337/3167) | 32/112 |
+| corpus | before | after | fully routed before → after |
+|--------|-------:|------:|----------------------------:|
+| `srj15` | 705/720 (97.9%) | **718/720 (99.7%)** | 46 → **53** |
+| `bug-reports` | 1996/2447 (81.6%) | **2011/2447 (82.2%)** | 32 → **38** |
+| **total** | 2701/3167 (85.3%) | **2729/3167 (86.2%)** | 78 → **91** |
+
+Total exact-geometry DRC findings fall **1493 → 1419**, algorithmic route cost
+falls **340,055 → 332,354**, clean boards rise **40 → 41**, and fully-routed-clean
+boards hold at 38. The hardened scorer returns **`KEEP`**: completion and full-board
+counts improve in both corpus groups without any workload, DRC, error, clean-board,
+or full-clean regression.
+
+The exact finished-code run improves the entire latency distribution: standard
+median **1.392 s → 0.135 s** (10.3×), nearest-rank p95 **339.9 s → 134.6 s** (2.53×),
+sum of overlapping board timers **4715 s → 1531 s** (3.08×), and external elapsed
+**715.55 s → 218.48 s** (3.28×). Peak per-board time falls 679.5 s → 210.5 s.
+A matched isolated `bugreport05` run fell **564.226 s → 35.411 s** (15.9×) with
+every non-timing result identical. The principal wins are unique-cell SRJ pad-halo
+filtering and O(1) exact Hanan-distance heuristics; the DRC exact-gap fast reject
+adds a smaller measured 10.8% microbenchmark improvement.
 
 The run writes a self-contained SVG gallery (`benchmarks/runs/<ts>-corpus/index.html`,
 gitignored) rendering obstacles, routed traces, and vias per board — failures
@@ -157,11 +190,17 @@ Rust (no Node), so it reproduces from a clean checkout.
 
 ## Status vs. milestones
 
-M0 (sweep de-risk) ✅ · M1 (CPU Lee) ✅ · M2 (rip-up + go/no-go) ✅ · M3 (Metal
-wavefront) ✅ · M4 (Metal prefix-min sweep) ✅ · M5 (Freerouting handoff seam) ✅.
+M0 (sweep de-risk) ✅ · M1 (CPU Lee) ✅ · M2 (live rip-up + negotiated congestion)
+✅ · M3 (Metal wavefront) ✅ · M4 (batched Metal prefix-min sweep) ✅ · M5
+(Freerouting handoff seam) ✅. Multilayer vias, non-uniform physical costs,
+clearance halos, 45° output beautification, exact DRC, and deterministic corpus
+gates are implemented.
 
-Explicitly out of scope so far: multi-layer + vias, 45°/any-angle routing,
-cost-based congestion-aware global routing, a GUI.
+The next architectural step is a shared global candidate portfolio: coarse
+hypergraph/corridor planning and fanout, GPU-batched detailed candidate scoring,
+then exact DRC acceptance/repair. The production negotiated router is still CPU;
+Metal currently accelerates independent shortest-path batches rather than the
+dynamic congestion loop itself.
 
 ## License
 
