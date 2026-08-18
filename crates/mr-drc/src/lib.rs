@@ -166,6 +166,22 @@ impl DrcSummary {
     }
 }
 
+/// Return the inclusive portion of a via span that lies on the physical stack.
+///
+/// Clamp the upper endpoint before constructing an inclusive range: checking the
+/// bound inside `lo..=hi` would still walk billions of nonexistent layers for a
+/// malformed span ending at `u32::MAX`. An empty stack, or a span wholly above the
+/// stack, has no physical layers to stamp.
+fn in_stack_via_span(via: &Via, layer_count: u32) -> Option<(u32, u32)> {
+    let last_layer = layer_count.checked_sub(1)?;
+    let lo = via.from_layer.min(via.to_layer);
+    if lo > last_layer {
+        return None;
+    }
+    let hi = via.from_layer.max(via.to_layer).min(last_layer);
+    Some((lo, hi))
+}
+
 impl DrcBoard {
     /// Run every check and return all violations in deterministic order.
     ///
@@ -199,11 +215,8 @@ impl DrcBoard {
             by_layer.entry(p.layer).or_default().push(Feature::pad(p));
         }
         for v in &self.vias {
-            let (lo, hi) = (v.from_layer.min(v.to_layer), v.from_layer.max(v.to_layer));
-            for layer in lo..=hi {
-                // Only stamp the via pad on physical layers that actually exist; if
-                // the stack is unknown (empty), trust the span as given.
-                if layer_count == 0 || layer < layer_count {
+            if let Some((lo, hi)) = in_stack_via_span(v, layer_count) {
+                for layer in lo..=hi {
                     by_layer.entry(layer).or_default().push(Feature::via(v));
                 }
             }
@@ -323,29 +336,27 @@ impl DrcBoard {
         let layer_count = self.layers.len() as u32;
         let required = |v: &Via| v.drill_diameter / 2.0 + self.rules.plane_antipad;
         for v in &self.vias {
-            let (lo, hi) = (v.from_layer.min(v.to_layer), v.from_layer.max(v.to_layer));
-            for layer in lo..=hi {
-                if layer_count != 0 && layer >= layer_count {
-                    continue;
-                }
-                let Some(LayerKind::Plane { net }) = self.layers.get(layer as usize) else {
-                    continue;
-                };
-                if *net == v.net {
-                    continue;
-                }
-                let req = required(v);
-                let antipad = v.antipad_radius.unwrap_or(0.0);
-                let clean = v.antipad_radius.is_some_and(|r| r >= req - EPS);
-                if !clean {
-                    out.push(Violation {
-                        class: ViolationClass::ViaThroughPlane,
-                        layer,
-                        location: v.center,
-                        nets: (v.net.clone(), net.clone()),
-                        measured: antipad,
-                        required: req,
-                    });
+            if let Some((lo, hi)) = in_stack_via_span(v, layer_count) {
+                for layer in lo..=hi {
+                    let Some(LayerKind::Plane { net }) = self.layers.get(layer as usize) else {
+                        continue;
+                    };
+                    if *net == v.net {
+                        continue;
+                    }
+                    let req = required(v);
+                    let antipad = v.antipad_radius.unwrap_or(0.0);
+                    let clean = v.antipad_radius.is_some_and(|r| r >= req - EPS);
+                    if !clean {
+                        out.push(Violation {
+                            class: ViolationClass::ViaThroughPlane,
+                            layer,
+                            location: v.center,
+                            nets: (v.net.clone(), net.clone()),
+                            measured: antipad,
+                            required: req,
+                        });
+                    }
                 }
             }
         }
@@ -358,7 +369,7 @@ impl DrcBoard {
             if measured < self.rules.min_annular_ring - EPS {
                 out.push(Violation {
                     class: ViolationClass::AnnularRing,
-                    layer: v.from_layer,
+                    layer: v.from_layer.min(v.to_layer),
                     location: v.center,
                     nets: (v.net.clone(), String::new()),
                     measured,
@@ -971,6 +982,90 @@ mod tests {
             .collect();
         assert_eq!(tp.len(), 1);
         assert_eq!(tp[0].layer, 0, "endpoint plane on layer 0 shorts");
+    }
+
+    #[test]
+    fn oversized_reversed_via_span_stamps_only_in_stack_layers() {
+        // The reversed span deliberately reaches u32::MAX. The checker must clamp
+        // it before iteration, stamp the via on physical layers 0 and 1, and never
+        // manufacture a via feature beside the deliberately out-of-stack L2 pad.
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal, LayerKind::Signal],
+            segments: vec![],
+            pads: (0..=2)
+                .map(|layer| Pad {
+                    net: Some("PAD".to_string()),
+                    layer,
+                    center: (1.0, 1.0),
+                    width: 0.2,
+                    height: 0.2,
+                })
+                .collect(),
+            vias: vec![Via {
+                net: "VIA".to_string(),
+                center: (1.0, 1.0),
+                pad_diameter: 0.6,
+                drill_diameter: 0.3,
+                from_layer: u32::MAX,
+                to_layer: 0,
+                antipad_radius: None,
+            }],
+            rules: rules(),
+        };
+
+        assert_eq!(in_stack_via_span(&board.vias[0], 2), Some((0, 1)));
+        assert_eq!(in_stack_via_span(&board.vias[0], 0), None);
+        let findings = board.check();
+        assert_eq!(findings.len(), 2, "one via-pad finding per real layer");
+        assert!(findings
+            .iter()
+            .all(|v| v.class == ViolationClass::Clearance));
+        assert_eq!(
+            findings.iter().map(|v| v.layer).collect::<Vec<_>>(),
+            [0, 1],
+            "the out-of-stack L2 pad must not see a phantom via pad"
+        );
+    }
+
+    #[test]
+    fn reversing_via_span_preserves_exact_drc_output() {
+        // Include both a plane short and an annular-ring failure so every
+        // span-sensitive stream is covered by the direction-invariance assertion.
+        let forward = DrcBoard {
+            layers: vec![
+                LayerKind::Signal,
+                LayerKind::Plane {
+                    net: "GND".to_string(),
+                },
+                LayerKind::Signal,
+            ],
+            segments: vec![],
+            pads: vec![],
+            vias: vec![Via {
+                net: "NET1".to_string(),
+                center: (1.0, 1.0),
+                pad_diameter: 0.30,
+                drill_diameter: 0.25,
+                from_layer: 0,
+                to_layer: 2,
+                antipad_radius: None,
+            }],
+            rules: rules(),
+        };
+        let mut reversed = forward.clone();
+        let via = &mut reversed.vias[0];
+        std::mem::swap(&mut via.from_layer, &mut via.to_layer);
+
+        let expected = forward.check();
+        assert_eq!(reversed.check(), expected);
+        let annular = expected
+            .iter()
+            .find(|v| v.class == ViolationClass::AnnularRing)
+            .expect("fixture must exercise annular reporting");
+        assert_eq!(
+            annular.layer, 0,
+            "annular reports the canonical lower layer"
+        );
     }
 
     #[test]
