@@ -271,6 +271,61 @@ const LINE_EPSILON: f64 = 1e-6;
 /// Mirrors the authoritative clearance comparison tolerance in `mr-drc`.
 const DRC_CLEARANCE_EPSILON: f64 = 1e-9;
 
+/// Clearance rasterisation model selected by the risk-bounded rollout.
+///
+/// The legacy model is intentionally the exact pre-physical-clearance behaviour:
+/// pad inflation and fill lanes use `clearance_cells * resolution`, and no static
+/// via mask or via-pad exemptions are emitted. The exact model uses the caller's
+/// physical rule and reserves circular via annuli around static copper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearanceRasterModel {
+    LegacyRounded,
+    ExactPhysical,
+}
+
+/// Select the exact physical model only when cell rounding overstates the real
+/// clearance by at least one complete via-pad diameter. That is the point at which
+/// the rounded model can erase a via-sized routing lane; below it we preserve the
+/// established raster input byte-for-byte. The comparison carries the same 1e-9 mm
+/// tolerance as the authoritative DRC so a mathematically exact boundary is not
+/// changed by binary floating-point representation.
+///
+/// A zero-clearance problem with a real via diameter is the sole safety exception:
+/// its planar raster remains unchanged, but the exact model supplies the static
+/// via-radius mask needed to prevent annular copper overlap. Invalid physical inputs
+/// fail back to the established legacy model.
+fn select_clearance_raster_model(
+    resolution: f64,
+    clearance_cells: u32,
+    min_clearance_mm: f64,
+    via_pad_mm: f64,
+) -> ClearanceRasterModel {
+    if !resolution.is_finite()
+        || resolution <= 0.0
+        || !min_clearance_mm.is_finite()
+        || min_clearance_mm < 0.0
+        || !via_pad_mm.is_finite()
+        || via_pad_mm < 0.0
+    {
+        return ClearanceRasterModel::LegacyRounded;
+    }
+
+    if min_clearance_mm == 0.0 {
+        return if via_pad_mm > 0.0 {
+            ClearanceRasterModel::ExactPhysical
+        } else {
+            ClearanceRasterModel::LegacyRounded
+        };
+    }
+
+    let rounded_clearance = clearance_cells as f64 * resolution;
+    if rounded_clearance + DRC_CLEARANCE_EPSILON >= min_clearance_mm + via_pad_mm {
+        ClearanceRasterModel::ExactPhysical
+    } else {
+        ClearanceRasterModel::LegacyRounded
+    }
+}
+
 /// Default soft ceiling on the planar cell count (`x_lines.len() · y_lines.len()`).
 /// This is the historical fixed budget and remains the **default** (lever C1 is
 /// tunable, not on-by-default): a subset sweep found that raising it strands no extra
@@ -386,15 +441,14 @@ const VIA_RESERVE_FRAC: f64 = 0.0;
 /// have lanes between them — the classic "track between pins" line. Finally the set
 /// is sorted and deduped (lines within [`LINE_EPSILON`] collapse).
 ///
-/// `track_w` / `clearance` are the design-rule track width and the clearance the
-/// rasteriser actually inflates by (`clearance_cells · resolution`, a `ceil`-rounded
-/// value that can be coarser than the true rule). `escape_clearance` is the TRUE
-/// copper-to-copper rule the DRC checks (`srj.min_clearance`); it is used only to
-/// size **sub-pitch BGA/LGA escape lanes** — narrow inter-pad gaps that the regular
-/// fill (sized against the coarse `clearance`) skips but where a lane sized against
-/// the true clearance still keeps copper legal. Those lanes are reachable only via a
-/// net's own-pad escape halo (the base grid blocks them for foreign nets at the
-/// coarse inflation), giving inner pins of a dense regular pad array an escape path.
+/// `track_w` / `clearance` are the design-rule track width and the effective clearance
+/// selected by the rollout: the historical ceil-rounded value on ordinary boards or
+/// the exact physical rule when quantisation is severe. `escape_clearance` is the true
+/// copper-to-copper rule the DRC checks (`srj.min_clearance`); it is used only to size
+/// **sub-pitch BGA/LGA escape lanes** when the selected clearance is coarser — narrow
+/// inter-pad gaps that regular fill skips but where a lane sized against the true rule
+/// still keeps copper legal. Those lanes are reachable only via a net's own-pad escape
+/// halo, giving inner pins of a dense regular pad array an escape path.
 /// `_layers` is accepted for symmetry with the rasteriser (the planar line set is
 /// layer-independent) but unused. The fill spacing and resulting cell count are
 /// capped against [`cell_budget`]; an over-budget result is logged but still
@@ -454,17 +508,15 @@ fn build_grid_lines(
     let budget = cell_budget(xs.len(), ys.len());
     enforce_budget(&xs, &ys, &mut x_fill, &mut y_fill, budget);
 
-    // BGA/LGA escape lanes (lever C2). Dense regular pad arrays leave inter-pad gaps
-    // that are too tight for a regular fill lane sized against the (coarse, ceil-
-    // rounded) `clearance`, so inner pins have no node to route into and become
-    // unroutable-alone. When the TRUE rule (`escape_clearance`) is finer than that
-    // coarse `clearance`, a centred lane sized against the true rule still fits and
-    // keeps copper legal; it is reachable only through a net's own-pad escape halo
-    // (the base grid blocks it for foreign nets at the coarse inflation), which is
-    // exactly the per-pin escape path we want. Only meaningful when the true rule is
-    // strictly finer than the coarse one — otherwise `fill_lines` already covers the
-    // gap. Gated behind clearance-active so the clearance-off byte-identical fast path
-    // (and the rounding that produces it) is untouched.
+    // BGA/LGA escape lanes (lever C2). Dense regular pad arrays can leave inter-pad
+    // gaps too tight for a regular fill lane sized against the selected `clearance`,
+    // so inner pins have no node to route into and become unroutable-alone. When the
+    // TRUE rule (`escape_clearance`) is finer, a centred lane sized against that rule
+    // still fits and keeps copper legal; it is reachable only through a net's own-pad
+    // escape halo (foreign nets still see the selected inflation), which is exactly
+    // the per-pin escape path we want. The pass is inert under the exact model because
+    // both values match. It is also gated behind clearance-active so the no-clearance
+    // byte-identical fast path is untouched.
     if escape_clearance.is_finite()
         && escape_clearance > 0.0
         && escape_clearance + LINE_EPSILON < clearance
@@ -903,23 +955,20 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// `build_grid_lines` and `trace_route`). `resolution` no longer sizes the cells;
 /// it is the fill-channel spacing fallback when the problem omits a track width.
 ///
-/// `clearance_cells` reserves a copper-to-copper clearance halo around every pad.
-/// The caller passes it as a count of the *old uniform* cells
-/// (`ceil(min_clearance / resolution)`), so its continuous width is
-/// `clearance_cells · resolution`; because the Hanan cells are non-uniform, the base
-/// grid is grown by that **geometric** distance (see
-/// [`mr_grid::GridBuilder::inflate_clearance`]) so a track of another net cannot
-/// enter the halo. To preserve own-pad access through that now-inflated region, each
-/// net's `passable_pads` is correspondingly expanded to the same geometric halo
-/// (line-distance ≤ `clearance_mm` on both axes, on the endpoint's layer) of its own
-/// pad cells, so the net can still escape its own pads. `clearance_cells == 0` is a
-/// no-op: no inflation, no halo expansion.
+/// `clearance_cells` is the caller's old-uniform-grid clearance count, normally
+/// `ceil(min_clearance_mm / resolution)`. The default risk-bounded rollout preserves
+/// the historical rounded geometric halo (`clearance_cells * resolution`) while its
+/// rounding error is smaller than one complete `via_pad_mm`. Once the rounded halo is
+/// at least `min_clearance_mm + via_pad_mm`, it can erase a whole via-sized routing
+/// lane, so the rasteriser switches to the exact physical clearance and emits a
+/// via-only static obstacle mask. This policy is board-agnostic and uses physical
+/// dimensions only.
 ///
-/// `min_clearance_mm` is the caller's TRUE copper-to-copper clearance rule (the same
-/// value the DRC checks), used only to size the own-pad escape corridor's foreign-pad
-/// clip. It is passed separately from `clearance_cells` because the latter is
-/// `ceil`-rounded to the grid and can overstate the rule on coarse boards; `0.0` means
-/// "use the rounded grid clearance" (the historical behaviour).
+/// `min_clearance_mm` is the caller's true copper-to-copper clearance rule (the same
+/// value the DRC checks). With zero clearance, a positive `via_pad_mm` still enables
+/// only the static via-radius mask so annular copper cannot overlap an obstacle; zero
+/// for both retains the compact no-mask legacy representation. Invalid physical
+/// inputs fall back to the legacy rounded model.
 pub fn rasterize_with_layers(
     srj: &SimpleRouteJson,
     resolution: f64,
@@ -927,6 +976,28 @@ pub fn rasterize_with_layers(
     clearance_cells: u32,
     min_clearance_mm: f64,
     via_pad_mm: f64,
+) -> RasterizedProblem {
+    let model =
+        select_clearance_raster_model(resolution, clearance_cells, min_clearance_mm, via_pad_mm);
+    rasterize_with_layers_model(
+        srj,
+        resolution,
+        layers,
+        clearance_cells,
+        min_clearance_mm,
+        via_pad_mm,
+        model,
+    )
+}
+
+fn rasterize_with_layers_model(
+    srj: &SimpleRouteJson,
+    resolution: f64,
+    layers: LayerMap,
+    clearance_cells: u32,
+    min_clearance_mm: f64,
+    via_pad_mm: f64,
+    model: ClearanceRasterModel,
 ) -> RasterizedProblem {
     let layer_count = layers.len();
     // Non-uniform / Hanan grid: build per-axis lines through every pad endpoint and
@@ -939,20 +1010,24 @@ pub fn rasterize_with_layers(
         .min_trace_width
         .filter(|w| *w > 0.0)
         .unwrap_or(resolution);
-    // Effective copper clearance the rasteriser will actually enforce. A Hanan grid
-    // measures inflation in continuous board units, so prefer the caller's exact rule;
-    // rounding it to `clearance_cells · resolution` would turn one coarse fill interval
-    // into a many-times-too-wide physical keepout. The rounded value remains the legacy
-    // fallback for callers that do not provide the exact rule.
+    // Effective copper clearance the rasteriser will actually enforce. The bounded
+    // rollout retains the historical ceil-rounded distance for ordinary boards and
+    // chooses the exact physical rule only when the quantisation error is large enough
+    // to erase a complete via-sized lane (see `select_clearance_raster_model`).
     // The fill-channel policy MUST use this same value, otherwise it would size routing
     // lanes against a clearance the inflation does not match (e.g. when the problem
     // omits a clearance rule but the server still inflates by one trace width), placing
     // "channels" that the inflated pad halos then swallow — a pure-disconnect regression.
     let rounded_clearance = (clearance_cells as f64 * resolution).max(0.0);
-    let clearance = if min_clearance_mm.is_finite() && min_clearance_mm > 0.0 {
-        min_clearance_mm
-    } else {
-        rounded_clearance
+    let clearance = match model {
+        ClearanceRasterModel::ExactPhysical
+            if min_clearance_mm.is_finite() && min_clearance_mm > 0.0 =>
+        {
+            min_clearance_mm
+        }
+        ClearanceRasterModel::LegacyRounded | ClearanceRasterModel::ExactPhysical => {
+            rounded_clearance
+        }
     };
     // Foreign-copper blocking margin = the **track centreline rule**. A node may host
     // the *centre* of a `track_w`-wide trace; that trace keeps `clearance` to foreign
@@ -1018,14 +1093,14 @@ pub fn rasterize_with_layers(
     // declared width), preserving the byte-identical base grid.
     let block_margin_mm = clearance + pad_band_mm;
     // Foreign-pad clip margin for the own-pad ESCAPE halo (see `pad_cells_for_point`).
-    // The base grid is inflated by `block_margin_mm`, but `clearance_cells` is a
-    // `ceil`-rounded count so on coarse grids `clearance` (and hence `block_margin_mm`)
-    // can exceed the rule the DRC actually enforces — clipping the escape corridor by
-    // that inflated value needlessly strands nets. The corridor only has to keep a
-    // centred track's copper `min_clearance` from a foreign pad edge, i.e. the TRUE
-    // geometric `min_clearance + pad_band`. Prefer the declared `min_clearance`
-    // (what the DRC checks); fall back to the rounded `clearance` when the problem
-    // states none, and never exceed `block_margin_mm`. Zero when nothing is reserved.
+    // The base grid is inflated by `block_margin_mm`. Under the legacy rollout branch,
+    // `clearance` is ceil-rounded and can exceed the rule the DRC actually enforces —
+    // clipping the escape corridor by that inflated value needlessly strands nets. The
+    // corridor only has to keep a centred track's copper `min_clearance` from a foreign
+    // pad edge, i.e. the TRUE geometric `min_clearance + pad_band`. Prefer the declared
+    // `min_clearance` (what the DRC checks); fall back to the selected `clearance` when
+    // the problem states none, and never exceed `block_margin_mm`. Zero when nothing is
+    // reserved.
     //
     // D1 CONSISTENCY: the half-width term here is the SAME widened `pad_band_mm` the
     // foreign-pad halo above grew by — not the bare `track_w/2`. The base grid now
@@ -1048,8 +1123,9 @@ pub fn rasterize_with_layers(
     };
     // The TRUE copper-to-copper rule the DRC enforces (the caller's `min_clearance_mm`,
     // else the problem's declaration). Used to size sub-pitch BGA/LGA escape lanes in
-    // gaps the coarse `clearance` (a ceil-rounded inflation) would skip — see
-    // `build_grid_lines`. Zero (clearance-off) leaves the escape pass inert.
+    // gaps a coarser legacy `clearance` would skip — see `build_grid_lines`. It equals
+    // the selected value under the exact branch, making the escape pass inert there.
+    // Zero (clearance-off) also leaves the pass inert.
     let escape_clearance = if min_clearance_mm > 0.0 {
         min_clearance_mm
     } else {
@@ -1062,7 +1138,11 @@ pub fn rasterize_with_layers(
     // A via annular pad is wider than a trace, so its legal landing set is a strict
     // subset of the planar grid. Keep a via-only mask instead of widening the base
     // grid and needlessly removing legal trace channels.
-    let via_margin_mm = if layer_count > 1 && via_pad_mm.is_finite() && via_pad_mm > 0.0 {
+    let via_margin_mm = if model == ClearanceRasterModel::ExactPhysical
+        && layer_count > 1
+        && via_pad_mm.is_finite()
+        && via_pad_mm > 0.0
+    {
         clearance.max(0.0) + via_pad_mm / 2.0
     } else {
         0.0
@@ -2679,6 +2759,178 @@ mod tests {
             { "name": "b", "pointsToConnect": [ {"x": 4.5, "y": 3.5}, {"x": 4.5, "y": 0.5} ] }
         ]
     }"#;
+
+    #[test]
+    fn clearance_rollout_trigger_has_physical_boundary_and_safe_zero_rule() {
+        let true_clearance = 0.15;
+        let via_pad = 0.45;
+        let threshold = true_clearance + via_pad;
+
+        assert_eq!(
+            select_clearance_raster_model(threshold - 2.0e-9, 1, true_clearance, via_pad),
+            ClearanceRasterModel::LegacyRounded,
+            "more than one DRC epsilon below the physical boundary stays legacy"
+        );
+        assert_eq!(
+            select_clearance_raster_model(threshold - 0.5e-9, 1, true_clearance, via_pad),
+            ClearanceRasterModel::ExactPhysical,
+            "a floating-point representation within DRC epsilon of the boundary is exact"
+        );
+        assert_eq!(
+            select_clearance_raster_model(threshold, 1, true_clearance, via_pad),
+            ClearanceRasterModel::ExactPhysical,
+            "the physical boundary is inclusive"
+        );
+        assert_eq!(
+            select_clearance_raster_model(0.15, 1, true_clearance, via_pad),
+            ClearanceRasterModel::LegacyRounded,
+            "an ordinary one-cell rounding must preserve the established raster"
+        );
+        assert_eq!(
+            select_clearance_raster_model(1.0, 0, 0.0, via_pad),
+            ClearanceRasterModel::ExactPhysical,
+            "zero clearance still needs a via-radius overlap mask"
+        );
+        assert_eq!(
+            select_clearance_raster_model(1.0, 0, 0.0, 0.0),
+            ClearanceRasterModel::LegacyRounded,
+            "zero clearance and no via diameter retain the compact legacy raster"
+        );
+        assert_eq!(
+            select_clearance_raster_model(0.15, 1, true_clearance, 0.0),
+            ClearanceRasterModel::ExactPhysical,
+            "without a via pad, the physical overstatement threshold is zero"
+        );
+        assert_eq!(
+            select_clearance_raster_model(1.0, 1, f64::NAN, via_pad),
+            ClearanceRasterModel::LegacyRounded,
+            "invalid physical inputs fail back to legacy"
+        );
+    }
+
+    fn assert_rasterized_problem_identical(
+        automatic: &RasterizedProblem,
+        legacy: &RasterizedProblem,
+        label: &str,
+    ) {
+        assert_eq!(automatic.grid, legacy.grid, "{label}: grid");
+        assert_eq!(automatic.nets, legacy.nets, "{label}: nets");
+        assert_eq!(automatic.mapping, legacy.mapping, "{label}: mapping");
+        assert_eq!(automatic.layers, legacy.layers, "{label}: layer map");
+        assert_eq!(automatic.pin_points, legacy.pin_points, "{label}: pin map");
+    }
+
+    #[test]
+    fn low_quantization_raster_is_identical_to_forced_legacy_model() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -2.0, "maxX": 2.0, "minY": -2.0, "maxY": 2.0 },
+            "obstacles": [{
+                "type": "rect",
+                "center": {"x": 0.0, "y": 0.0},
+                "width": 0.2,
+                "height": 0.2,
+                "layers": ["top"],
+                "connectedTo": ["connectivity_net_foreign"]
+            }],
+            "connections": [{
+                "name": "probe",
+                "pointsToConnect": [
+                    {"x": 0.4, "y": 0.0, "layer": "top"},
+                    {"x": 1.5, "y": 0.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let resolution = 0.2;
+        let layers = LayerMap::standard(2);
+        let automatic = rasterize_with_layers(&srj, resolution, layers.clone(), 1, 0.15, 0.45);
+        let legacy = rasterize_with_layers_model(
+            &srj,
+            resolution,
+            layers.clone(),
+            1,
+            0.15,
+            0.45,
+            ClearanceRasterModel::LegacyRounded,
+        );
+        let exact = rasterize_with_layers_model(
+            &srj,
+            resolution,
+            layers,
+            1,
+            0.15,
+            0.45,
+            ClearanceRasterModel::ExactPhysical,
+        );
+
+        assert_rasterized_problem_identical(&automatic, &legacy, "synthetic low-quant board");
+        assert!(automatic.grid.via_forbidden.is_empty());
+        assert!(
+            automatic
+                .nets
+                .iter()
+                .all(|net| net.via_passable_pads.is_empty()),
+            "the legacy representation must not emit via-mask exemptions"
+        );
+        assert!(
+            !exact.grid.via_forbidden.is_empty(),
+            "the control must distinguish the exact model from the legacy model"
+        );
+    }
+
+    #[test]
+    fn low_quantization_real_boards_are_identical_to_forced_legacy_model() {
+        const DEFAULT_CLEARANCE_MM: f64 = 0.15;
+        const VIA_PAD_MM: f64 = 0.45;
+        for fixture in [
+            "sample21-region-reroute.srj.json",
+            "sample22-region-reroute.srj.json",
+        ] {
+            let path = format!(
+                "{}/../../benchmarks/corpus/srj15/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+            let srj: SimpleRouteJson = serde_json::from_slice(&bytes).unwrap();
+            let span =
+                (srj.bounds.max_x - srj.bounds.min_x).max(srj.bounds.max_y - srj.bounds.min_y);
+            let resolution = span / 64.0;
+            let clearance_cells = (DEFAULT_CLEARANCE_MM / resolution).ceil() as u32;
+            assert_eq!(
+                select_clearance_raster_model(
+                    resolution,
+                    clearance_cells,
+                    DEFAULT_CLEARANCE_MM,
+                    VIA_PAD_MM,
+                ),
+                ClearanceRasterModel::LegacyRounded,
+                "{fixture} must stay below the rollout boundary"
+            );
+
+            let layers = LayerMap::standard(srj.layer_count);
+            let automatic = rasterize_with_layers(
+                &srj,
+                resolution,
+                layers.clone(),
+                clearance_cells,
+                DEFAULT_CLEARANCE_MM,
+                VIA_PAD_MM,
+            );
+            let legacy = rasterize_with_layers_model(
+                &srj,
+                resolution,
+                layers,
+                clearance_cells,
+                DEFAULT_CLEARANCE_MM,
+                VIA_PAD_MM,
+                ClearanceRasterModel::LegacyRounded,
+            );
+            assert_rasterized_problem_identical(&automatic, &legacy, fixture);
+        }
+    }
 
     /// `clearance_cells = 1` (→ `clearance_mm = 1·resolution = 1.0` on the Hanan
     /// grid): each pad reserves a geometric clearance halo (foreign tracks can't
