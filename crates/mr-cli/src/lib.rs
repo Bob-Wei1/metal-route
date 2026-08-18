@@ -1662,6 +1662,30 @@ mod tests {
         }
     }
 
+    /// Real-board regression for pad-aware exact-geometry repair. The two vias in
+    /// bugreport01 initially sit 0.125 mm from foreign pads under a 0.150 mm rule;
+    /// each can clear them by moving farther into its own connectivity-labelled pad.
+    #[test]
+    fn bugreport01_own_pad_vias_legalize_drc_clean() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport01-be84eb.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport01 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport01");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route bugreport01");
+
+        assert_eq!((summary.routed, summary.total), (12, 12));
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert!(
+            violations.is_empty(),
+            "bugreport01 must be DRC-clean after own-pad-aware via repair: {violations:#?}"
+        );
+    }
+
     /// A net whose only corridor is walled off on the top layer. The wall sits on
     /// `"top"` only, so on a single layer the net cannot route; granting a second
     /// layer lets the negotiated router via down, cross, and via back up.

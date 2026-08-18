@@ -61,8 +61,15 @@ enum Feature {
         half_w: f64,
         trace: usize,
     },
-    /// A pad / keepout rectangle (axis-aligned, full width/height).
-    Rect { c: P, w: f64, h: f64 },
+    /// A pad / keepout rectangle (axis-aligned, full width/height). Connected pads
+    /// carry the same authoritative electrical-net label as routed traces so legal
+    /// own-pad overlap is excluded from foreign-clearance repair.
+    Rect {
+        c: P,
+        w: f64,
+        h: f64,
+        net: Option<String>,
+    },
     /// A via barrel, modelled as a circle of radius `r`.
     Circle { c: P, r: f64, trace: usize },
 }
@@ -97,7 +104,7 @@ impl Feature {
     fn gap(&self, s0: P, s1: P) -> f64 {
         match self {
             Feature::Seg { a, b, half_w, .. } => seg_seg_dist(s0, s1, *a, *b) - half_w,
-            Feature::Rect { c, w, h } => seg_rect_gap(s0, s1, *c, *w, *h),
+            Feature::Rect { c, w, h, .. } => seg_rect_gap(s0, s1, *c, *w, *h),
             Feature::Circle { c, r, .. } => point_seg_dist(*c, s0, s1) - r,
         }
     }
@@ -1049,12 +1056,14 @@ impl LayerFeatures {
     fn foreign_for_layer(&self, ti: usize, layer: &str) -> Vec<&Feature> {
         let my_net = self.nets.get(ti).and_then(|n| n.as_deref());
         let same_net = |f: &Feature| -> bool {
-            match (
-                my_net,
-                f.trace()
+            let feature_net = match f {
+                Feature::Rect { net, .. } => net.as_deref(),
+                _ => f
+                    .trace()
                     .and_then(|t| self.nets.get(t))
                     .and_then(|n| n.as_deref()),
-            ) {
+            };
+            match (my_net, feature_net) {
                 (Some(a), Some(b)) => a == b,
                 _ => false,
             }
@@ -1072,7 +1081,7 @@ impl LayerFeatures {
                 .filter(|f| f.trace() != Some(ti) && !same_net(f)),
         );
         for (layers, pad) in &self.pads {
-            if layers.is_empty() || layers.iter().any(|l| l == layer) {
+            if (layers.is_empty() || layers.iter().any(|l| l == layer)) && !same_net(pad) {
                 v.push(pad);
             }
         }
@@ -1142,12 +1151,36 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
                     .cloned()
                     .collect()
             };
+            let net = crate::obstacle_connectivity_net(o)
+                .map(|declared| format!("c{declared}"))
+                .or_else(|| {
+                    // Match the authoritative DRC fallback for legacy pads without a
+                    // connectivity id: the first labelled trace vertex contained by
+                    // the pad owns it. Untagged traces remain conservative/foreign.
+                    let (cx, cy) = (o.center.x, o.center.y);
+                    let (hw, hh) = (o.width / 2.0, o.height / 2.0);
+                    traces.iter().find_map(|trace| {
+                        let net = trace.net.as_ref()?;
+                        trace
+                            .route
+                            .iter()
+                            .any(|point| {
+                                let (x, y) = match point {
+                                    RoutePoint::Wire { x, y, .. }
+                                    | RoutePoint::Via { x, y, .. } => (*x, *y),
+                                };
+                                (x - cx).abs() <= hw && (y - cy).abs() <= hh
+                            })
+                            .then(|| net.clone())
+                    })
+                });
             (
                 layers,
                 Feature::Rect {
                     c: (o.center.x, o.center.y),
                     w: o.width,
                     h: o.height,
+                    net,
                 },
             )
         })
@@ -1615,6 +1648,91 @@ mod tests {
         assert!(
             after > before + 1e-6,
             "via nudge must increase the foreign gap: {before} -> {after}"
+        );
+    }
+
+    /// A connected pad is same-net copper, not a clearance obstacle. This is the
+    /// minimal geometry behind bugreport01: the via needs to move at least 0.025 mm
+    /// farther into its own upper pad to clear the foreign pad immediately below it.
+    #[test]
+    fn legalize_via_can_move_into_own_connectivity_pad() {
+        let trace = PcbTrace::new(vec![
+            wire_on(0.0, 0.95, "top"),
+            wire_on(0.0, 0.65, "top"),
+            via_at(0.0, 0.65),
+            wire_on(0.0, 0.65, "bottom"),
+            wire_on(0.0, 0.33, "bottom"),
+            wire_on(0.0, -1.0, "bottom"),
+        ])
+        .with_net("cconnectivity_net29");
+        let pad = |y, net: &str| Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 0.0,
+                y,
+                layer: None,
+            },
+            width: 1.1,
+            height: 0.6,
+            layers: vec!["top".into()],
+            connected_to: vec![net.into()],
+        };
+        let own_pad = pad(0.95, "connectivity_net29");
+        let foreign_pad = pad(0.0, "connectivity_net27");
+        let unknown_keepout = Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 10.0,
+                y: 0.0,
+                layer: None,
+            },
+            width: 0.2,
+            height: 0.2,
+            layers: vec!["top".into()],
+            connected_to: Vec::new(),
+        };
+
+        let context = features_by_layer(
+            std::slice::from_ref(&trace),
+            &[
+                own_pad.clone(),
+                foreign_pad.clone(),
+                unknown_keepout.clone(),
+            ],
+        );
+        assert_eq!(
+            context.foreign_for_layer(0, "top").len(),
+            2,
+            "the own pad must be immune while foreign and unowned pads remain blocking"
+        );
+
+        let out = legalize_clearance(vec![trace], &[own_pad, foreign_pad, unknown_keepout], 0.15);
+        let before_via = (0.0, 0.65);
+        let after_via = out[0]
+            .route
+            .iter()
+            .find_map(|point| match point {
+                RoutePoint::Via { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            })
+            .expect("via must remain present");
+
+        assert!(
+            after_via.1 > before_via.1,
+            "via must be allowed to move into its own pad: {before_via:?} -> {after_via:?}"
+        );
+        let foreign_gap = seg_rect_gap(after_via, after_via, (0.0, 0.0), 1.1, 0.6) - VIA_RADIUS;
+        assert!(
+            foreign_gap + GAP_EPS >= 0.15,
+            "via still violates the foreign pad: gap={foreign_gap}"
+        );
+        let pts = pts_of(&out[0]);
+        assert!(approx(pts[1], after_via));
+        assert!(approx(pts[2], after_via));
+        assert!(approx(pts[0], (0.0, 0.95)), "real endpoint moved");
+        assert!(
+            approx(*pts.last().unwrap(), (0.0, -1.0)),
+            "real endpoint moved"
         );
     }
 }
