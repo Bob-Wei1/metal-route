@@ -130,7 +130,7 @@ const PORTFOLIO_MAX_NETS: usize = 179;
 const PORTFOLIO_CELL_CAP: usize = 250_000;
 
 /// Completion-only legalization-order fallback. Three independent hard bounds keep
-/// two extra legalization passes from becoming a latency multiplier on large boards.
+/// up to four extra legalization passes from multiplying latency on large boards.
 const ORDER_PORTFOLIO_MIN_GROUPS: usize = 6;
 const ORDER_PORTFOLIO_MAX_GROUPS: usize = 16;
 const ORDER_PORTFOLIO_MAX_NETS: usize = 32;
@@ -993,6 +993,36 @@ fn should_try_diversified_orders(
         && n_nets <= ORDER_PORTFOLIO_MAX_NETS
         && n_cells <= ORDER_PORTFOLIO_CELL_CAP
         && original_best_routed < alone_routable
+}
+
+/// Four deterministic samples from the cyclic/dihedral order family. They change
+/// both the first claimant and traversal direction without paying for every rotation.
+/// Orders already covered by the primary portfolio, or duplicated within this
+/// fallback, are omitted while preserving proposal order.
+fn diversified_fallback_orders(
+    base_order: &[usize],
+    primary_orders: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
+    if base_order.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut left = base_order.to_vec();
+    left.rotate_left(1);
+    let mut right = base_order.to_vec();
+    right.rotate_right(1);
+    let mut reverse = base_order.to_vec();
+    reverse.reverse();
+    let mut opposite_reverse = reverse.clone();
+    opposite_reverse.rotate_left(base_order.len() / 2);
+
+    let mut fallback = Vec::with_capacity(4);
+    for order in [left, right, reverse, opposite_reverse] {
+        if !primary_orders.contains(&order) && !fallback.contains(&order) {
+            fallback.push(order);
+        }
+    }
+    fallback
 }
 
 /// More routed nets wins; for equal completion, lower caller-grid cost wins. An
@@ -2199,14 +2229,7 @@ impl NegotiatedRouter {
             original_best_routed,
             alone_routable,
         ) {
-            let mut fallback_orders = Vec::with_capacity(2);
-            let mut rotated = base_order.clone();
-            rotated.rotate_left(1);
-            fallback_orders.push(rotated);
-            let mut reversed = base_order.clone();
-            reversed.reverse();
-            fallback_orders.push(reversed);
-            fallback_orders.retain(|order| !candidates.contains(order));
+            let fallback_orders = diversified_fallback_orders(&base_order, &candidates);
 
             let offset = candidates.len();
             evaluated.extend(evaluate_orders(&fallback_orders, offset));
@@ -4527,6 +4550,38 @@ mod tests {
     }
 
     #[test]
+    fn diversified_fallback_orders_are_bounded_unique_dihedral_samples() {
+        let base: Vec<usize> = (0..8).collect();
+        let primary = vec![base.clone()];
+        let expected = vec![
+            vec![1, 2, 3, 4, 5, 6, 7, 0],
+            vec![7, 0, 1, 2, 3, 4, 5, 6],
+            vec![7, 6, 5, 4, 3, 2, 1, 0],
+            vec![3, 2, 1, 0, 7, 6, 5, 4],
+        ];
+        assert_eq!(diversified_fallback_orders(&base, &primary), expected);
+
+        for n_groups in ORDER_PORTFOLIO_MIN_GROUPS..=ORDER_PORTFOLIO_MAX_GROUPS {
+            let base: Vec<usize> = (0..n_groups).collect();
+            let orders = diversified_fallback_orders(&base, std::slice::from_ref(&base));
+            assert!(orders.len() <= 4);
+            for (i, order) in orders.iter().enumerate() {
+                assert!(
+                    !orders[..i].contains(order),
+                    "fallback orders must be unique"
+                );
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, base, "every fallback must remain a permutation");
+            }
+        }
+
+        assert!(diversified_fallback_orders(&[], &[]).is_empty());
+        assert!(diversified_fallback_orders(&[0], &[vec![0]]).is_empty());
+        assert!(diversified_fallback_orders(&base, &expected).is_empty());
+    }
+
+    #[test]
     fn dependency_graph_deduplicates_edges_and_rejects_cycles() {
         let mut dependencies = vec![Vec::new(); 4];
         assert_eq!(
@@ -6584,9 +6639,10 @@ mod tests {
     fn multilayer_parallel_clearance_preserves_better_jacobi_seed() {
         // This two-layer, 17-net fixture crosses the parallel threshold. The exact
         // Jacobi result legalizes five nets, while running the former unconditional
-        // one-pass Gauss-Seidel polish first legalizes only four. Pin both the
-        // better outcome and cross-pool determinism: multilayer routing must pass
-        // the Jacobi seed directly to legalization instead of applying that polish.
+        // one-pass Gauss-Seidel polish first legalizes only four; the bounded order
+        // portfolio now retains a sixth. Pin both the better outcome and cross-pool
+        // determinism: multilayer routing must pass the Jacobi seed directly to
+        // legalization instead of applying that polish.
         let dims = Dims::with_layers(14, 14, 2);
         let grid = GridBuilder::new(dims, 1).build();
         let nets = multilayer_portfolio_nets(dims, false);
@@ -6619,8 +6675,8 @@ mod tests {
                 .iter()
                 .map(|result| result.net.as_str())
                 .collect::<Vec<_>>(),
-            ["n0", "n1", "n2", "n3", "n15"],
-            "the unpolished multilayer Jacobi seed must retain its fifth legal net"
+            ["n0", "n1", "n2", "n3", "n15", "n16"],
+            "the unpolished Jacobi seed plus bounded order portfolio must retain six nets"
         );
         assert_eq!(route_in(2), one);
         assert_eq!(route_in(4), one);
@@ -6664,13 +6720,14 @@ mod tests {
     }
 
     #[test]
-    fn serial_portfolio_selects_lower_cost_candidate_with_identical_trace() {
+    fn serial_portfolio_prefers_more_complete_primary_with_identical_trace() {
         let dims = Dims::with_layers(14, 14, 2);
         let grid = GridBuilder::new(dims, 1).build();
         let nets = multilayer_portfolio_nets(dims, true);
         let group_ids = connection_group_ids(&nets);
         let router = NegotiatedRouter::new().with_clearance_cells(1);
 
+        let mut primary_trace = empty_route_trace(dims);
         let primary = router
             .route_variant(
                 &grid,
@@ -6678,11 +6735,10 @@ mod tests {
                 &group_ids,
                 NegotiationMode::Adaptive,
                 None,
-                None,
+                Some(&mut primary_trace),
             )
             .unwrap()
             .board;
-        let mut serial_trace = empty_route_trace(dims);
         let serial = router
             .route_variant(
                 &grid,
@@ -6690,14 +6746,14 @@ mod tests {
                 &group_ids,
                 NegotiationMode::ForceSerial,
                 None,
-                Some(&mut serial_trace),
+                None,
             )
             .unwrap()
             .board;
-        assert_eq!((primary.results.len(), primary.total_cost()), (5, 108));
+        assert_eq!((primary.results.len(), primary.total_cost()), (6, 129));
         assert_eq!((serial.results.len(), serial.total_cost()), (5, 88));
-        assert!(serial_candidate_is_better(&primary, &serial));
-        assert_eq!(router.route(&grid, &nets).unwrap(), serial);
+        assert!(!serial_candidate_is_better(&primary, &serial));
+        assert_eq!(router.route(&grid, &nets).unwrap(), primary);
 
         let route_in = |threads| {
             rayon::ThreadPoolBuilder::new()
@@ -6707,8 +6763,8 @@ mod tests {
                 .install(|| router.route_traced(&grid, &nets).unwrap())
         };
         let one = route_in(1);
-        assert_eq!(one.0, serial);
-        assert_trace_eq(&one.1, &serial_trace);
+        assert_eq!(one.0, primary);
+        assert_trace_eq(&one.1, &primary_trace);
         for threads in [2, 4] {
             let got = route_in(threads);
             assert_eq!(got.0, one.0);
@@ -6723,12 +6779,12 @@ mod tests {
         let nets = multilayer_portfolio_nets(dims, true);
         let router = NegotiatedRouter::new().with_clearance_cells(1);
 
-        // This is the serial-winner fixture, so route_impl necessarily evaluates
-        // both the adaptive primary and ForceSerial alternate before selection.
+        // This bounded-portfolio fixture evaluates both the adaptive primary and
+        // ForceSerial alternate before selecting the more complete primary.
         let (expected_board, expected_trace) = router.route_traced(&grid, &nets).unwrap();
         assert_eq!(
             (expected_board.results.len(), expected_board.total_cost()),
-            (5, 88)
+            (6, 129)
         );
         let provider = MockProvider::paths(provider_paths_from_trace(&expected_trace));
         let (board, trace) = router

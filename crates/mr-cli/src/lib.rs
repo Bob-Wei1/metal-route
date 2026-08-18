@@ -2331,6 +2331,70 @@ mod tests {
         );
     }
 
+    fn assert_dihedral_order_fixture(
+        relative_path: &str,
+        expected_routed: usize,
+        expected_total: usize,
+        expected_drc: usize,
+    ) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative_path);
+        let bytes = std::fs::read(path).expect("read checked-in order fixture");
+        let srj = parse_srj(&bytes).expect("parse order fixture");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route order fixture");
+        assert_eq!(
+            (summary.routed, summary.total),
+            (expected_routed, expected_total)
+        );
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert_eq!(
+            violations.len(),
+            expected_drc,
+            "the retained route must preserve exact DRC: {violations:#?}"
+        );
+    }
+
+    /// Starting the reversed traversal at the opposite claimant recovers one more
+    /// route without changing this board's fixed exact-clearance findings.
+    #[test]
+    fn bug27_dihedral_order_recovers_one_route_without_drc_regression() {
+        assert_dihedral_order_fixture(
+            "benchmarks/corpus/bug-reports/bugreport27-dd3734.srj.json",
+            12,
+            14,
+            18,
+        );
+    }
+
+    /// The opposite reversed traversal closes the final congestion gap while
+    /// retaining the board's accepted exact-clearance count.
+    #[test]
+    fn bug30_dihedral_order_routes_full_without_drc_regression() {
+        assert_dihedral_order_fixture(
+            "benchmarks/corpus/bug-reports/bugreport30-2174c8.srj.json",
+            12,
+            12,
+            18,
+        );
+    }
+
+    /// Trying the opposite cyclic claimant recovers another route and keeps the
+    /// previously clean board free of exact DRC findings.
+    #[test]
+    fn bug36_dihedral_order_recovers_one_route_and_stays_clean() {
+        assert_dihedral_order_fixture(
+            "benchmarks/corpus/bug-reports/bugreport36-d4c6c2.srj.json",
+            7,
+            8,
+            0,
+        );
+    }
+
     /// A net whose only corridor is walled off on the top layer. The wall sits on
     /// `"top"` only, so on a single layer the net cannot route; granting a second
     /// layer lets the negotiated router via down, cross, and via back up.
