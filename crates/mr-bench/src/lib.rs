@@ -255,6 +255,7 @@ mod tests {
             src: grid.dims.idx(0, 0),
             dst: grid.dims.idx(7, 7),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }];
 
         let t = time_router(&TrivialRouter, &grid, &nets);
@@ -289,6 +290,7 @@ mod tests {
             src: 0,
             dst: 15,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }];
         let t = time_router(&FailRouter, &grid, &nets);
         assert_eq!(t.routed, 0);

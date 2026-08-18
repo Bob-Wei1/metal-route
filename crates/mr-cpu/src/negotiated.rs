@@ -815,6 +815,7 @@ fn provider_path_is_valid(
     // contain many thousands of cells, so validating every obstacle step with a
     // linear `Vec::contains` would make this defense-in-depth pass quadratic.
     let passable_pads: HashSet<CellIdx> = net.passable_pads.iter().copied().collect();
+    let via_passable_pads: HashSet<CellIdx> = net.via_passable_pads.iter().copied().collect();
     let mut seen = HashSet::with_capacity(path.len());
     for &cell in path {
         if !dims.contains(cell)
@@ -831,9 +832,34 @@ fn provider_path_is_valid(
         if al == bl {
             (ax.abs_diff(bx) == 1 && ay == by) || (ay.abs_diff(by) == 1 && ax == bx)
         } else {
-            ax == bx && ay == by && via_model.is_step_legal(al, bl)
+            ax == bx
+                && ay == by
+                && via_model.is_step_legal(al, bl)
+                && (!grid.is_via_forbidden(step[0]) || via_passable_pads.contains(&step[0]))
+                && (!grid.is_via_forbidden(step[1]) || via_passable_pads.contains(&step[1]))
         }
     })
+}
+
+/// Validate the public pad lists without imposing an ordering contract on serde or
+/// manually constructed inputs. Via exemptions must be an in-bounds subset of the
+/// ordinary own-pad cells, so they can never bypass base obstacle ownership.
+fn net_pad_lists_are_valid(dims: Dims, net: &NetEndpoints) -> bool {
+    if net.passable_pads.iter().any(|&cell| !dims.contains(cell))
+        || net
+            .via_passable_pads
+            .iter()
+            .any(|&cell| !dims.contains(cell))
+    {
+        return false;
+    }
+    if net.via_passable_pads.is_empty() {
+        return true;
+    }
+    let passable: HashSet<CellIdx> = net.passable_pads.iter().copied().collect();
+    net.via_passable_pads
+        .iter()
+        .all(|cell| passable.contains(cell))
 }
 
 /// Invoke one trusted provider batch and defensively validate its shape and paths.
@@ -850,7 +876,7 @@ fn provider_alone_paths(
     }
     let dims = grid.dims;
     for net in nets {
-        if net.passable_pads.iter().any(|&cell| !dims.contains(cell))
+        if !net_pad_lists_are_valid(dims, net)
             || !dims.contains(net.src)
             || !dims.contains(net.dst)
             || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
@@ -927,7 +953,7 @@ impl NegotiatedRouter {
             return Err(RouterError::MalformedGrid);
         }
         for net in nets {
-            if net.passable_pads.iter().any(|&c| !grid.dims.contains(c)) {
+            if !net_pad_lists_are_valid(grid.dims, net) {
                 return Err(RouterError::InvalidEndpoint {
                     net: net.net.clone(),
                 });
@@ -1170,6 +1196,7 @@ impl NegotiatedRouter {
                                     coords_ref,
                                     &heuristic_costs,
                                     pad_set,
+                                    &net.via_passable_pads,
                                     own_path_ref,
                                     Some(own_halo),
                                     shared_congestion_ref,
@@ -1190,6 +1217,7 @@ impl NegotiatedRouter {
                                         coords_ref,
                                         &heuristic_costs,
                                         pad_set,
+                                        &net.via_passable_pads,
                                         own_path_ref,
                                         Some(own_halo),
                                         shared_congestion_ref,
@@ -1307,6 +1335,7 @@ impl NegotiatedRouter {
                         &coords,
                         &heuristic_costs,
                         &pad_set,
+                        &net.via_passable_pads,
                         None,
                         None,
                         None,
@@ -1327,6 +1356,7 @@ impl NegotiatedRouter {
                             &coords,
                             &heuristic_costs,
                             &pad_set,
+                            &net.via_passable_pads,
                             None,
                             None,
                             None,
@@ -1472,6 +1502,7 @@ impl NegotiatedRouter {
                     &coords,
                     &heuristic_costs,
                     &pad_set,
+                    &net.via_passable_pads,
                     None,
                     None,
                     None,
@@ -1492,6 +1523,7 @@ impl NegotiatedRouter {
                         &coords,
                         &heuristic_costs,
                         &pad_set,
+                        &net.via_passable_pads,
                         None,
                         None,
                         None,
@@ -1578,6 +1610,7 @@ impl NegotiatedRouter {
                             &coords,
                             &heuristic_costs,
                             pad_set,
+                            &net.via_passable_pads,
                             &no_owner,
                             &no_halo,
                             -1,
@@ -1595,6 +1628,7 @@ impl NegotiatedRouter {
                                 &coords,
                                 &heuristic_costs,
                                 pad_set,
+                                &net.via_passable_pads,
                                 &no_owner,
                                 &no_halo,
                                 -1,
@@ -1980,6 +2014,7 @@ fn route_negotiated(
     coords: &GridCoords,
     heuristic_costs: &ManhattanCosts,
     pads: &PadSet,
+    via_passable_pads: &[CellIdx],
     own_path: Option<&PadSet>,
     own_halo: Option<&CountedCellSet>,
     shared_congestion: Option<&[u64]>,
@@ -2055,7 +2090,10 @@ fn route_negotiated(
     // applied to `v` by `astar_buf` first, so an out-of-window / foreign-pad target
     // already blocks the via.
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
-        if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v)) {
+        if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v))
+            && (!base.is_via_forbidden(u) || via_passable_pads.contains(&u))
+            && (!base.is_via_forbidden(v) || via_passable_pads.contains(&v))
+        {
             Some(priced_with_base(
                 v,
                 (via_model.step_cost as u64).saturating_mul(enter_weight(v) as u64),
@@ -2103,6 +2141,7 @@ fn route_legal(
     coords: &GridCoords,
     heuristic_costs: &ManhattanCosts,
     pads: &PadSet,
+    via_passable_pads: &[CellIdx],
     owner: &[i64],
     halo: &[i64],
     own_group: i64,
@@ -2174,8 +2213,9 @@ fn route_legal(
     let ring_guard = has_halo && via_r > 0.0;
     // True iff a via landing at `(cx, cy)` on `layer` would put its annular ring over
     // foreign copper or a foreign halo cell — in which case the via step is rejected.
-    // The endpoint cells (src/dst) are exempt so a via may still land on the net's own
-    // pad. Scans the geometric `geom_box` band of radius `via_r` over `coords`.
+    // Scans the geometric `geom_box` band of radius `via_r` over `coords`. Endpoint
+    // identity is not an exemption here: a dynamic foreign owner/halo must win even
+    // when the scanned ring happens to cover this net's terminal cell.
     let ring_conflict = |cx: u32, cy: u32, layer: u32| -> bool {
         let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, via_r);
         let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, via_r);
@@ -2188,9 +2228,6 @@ fn route_legal(
                     continue;
                 }
                 let n = dims.idx3(nx, ny, layer);
-                if n == src || n == dst {
-                    continue;
-                }
                 let ni = n as usize;
                 let o = if has_owner { owner[ni] } else { -1 };
                 if o >= 0 && o != own_group {
@@ -2211,6 +2248,11 @@ fn route_legal(
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
         let (lu, lv) = (dims.layer_of(u), dims.layer_of(v));
         if !via_model.is_step_legal(lu, lv) {
+            return None;
+        }
+        if (base.is_via_forbidden(u) && !via_passable_pads.contains(&u))
+            || (base.is_via_forbidden(v) && !via_passable_pads.contains(&v))
+        {
             return None;
         }
         if ring_guard {
@@ -2675,6 +2717,7 @@ fn legalize_in_order(
                             coords_ref,
                             heuristic_costs,
                             ps,
+                            &net.via_passable_pads,
                             owner_ref,
                             halo_ref,
                             gi,
@@ -2707,6 +2750,7 @@ fn legalize_in_order(
                             coords,
                             heuristic_costs,
                             pad_set,
+                            &nets[i].via_passable_pads,
                             &owner,
                             &halo,
                             gi,
@@ -2922,6 +2966,7 @@ fn ripup_legalize(
             coords,
             heuristic_costs,
             pad_set,
+            &net.via_passable_pads,
             &owner,
             &halo,
             gi,
@@ -2940,6 +2985,7 @@ fn ripup_legalize(
                     coords,
                     heuristic_costs,
                     pad_set,
+                    &net.via_passable_pads,
                     &owner,
                     &halo,
                     gi,
@@ -3019,6 +3065,7 @@ fn ripup_legalize(
             coords,
             heuristic_costs,
             pad_set,
+            &net.via_passable_pads,
             &owner,
             &halo,
             gi,
@@ -3037,6 +3084,7 @@ fn ripup_legalize(
                     coords,
                     heuristic_costs,
                     pad_set,
+                    &net.via_passable_pads,
                     &owner,
                     &halo,
                     gi,
@@ -3154,6 +3202,7 @@ mod tests {
             src,
             dst,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }
     }
 
@@ -3322,6 +3371,31 @@ mod tests {
             &via_net,
             &forbidden,
             &[via_net.src, via_net.dst]
+        ));
+
+        let mut masked_grid = via_grid.clone();
+        masked_grid.via_forbidden = vec![true; via_dims.len()];
+        let owned_via = NetEndpoints {
+            passable_pads: vec![via_net.dst, via_net.src],
+            // Deliberately unsorted to pin the public input contract.
+            via_passable_pads: vec![via_net.dst, via_net.src],
+            ..via_net.clone()
+        };
+        assert!(provider_path_is_valid(
+            &masked_grid,
+            &owned_via,
+            &ViaModel::through_hole(2),
+            &[owned_via.src, owned_via.dst]
+        ));
+        let layer_local_only = NetEndpoints {
+            via_passable_pads: vec![via_net.src],
+            ..owned_via
+        };
+        assert!(!provider_path_is_valid(
+            &masked_grid,
+            &layer_local_only,
+            &ViaModel::through_hole(2),
+            &[layer_local_only.src, layer_local_only.dst]
         ));
     }
 
@@ -3565,12 +3639,14 @@ mod tests {
             src: dims.idx(3, 0),
             dst: dims.idx(3, 1),
             passable_pads: a_pad.clone(),
+            via_passable_pads: Vec::new(),
         };
         let net_b = NetEndpoints {
             net: "b".into(),
             src: dims.idx(0, 1),
             dst: dims.idx(6, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
 
         let br = NegotiatedRouter::new()
@@ -4200,6 +4276,7 @@ mod tests {
             src: dims.idx(1, 0),
             dst: dims.idx(1, 3),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         let grid = GridBuilder::new(dims, 1).build();
         let b = net("b", dims.idx(0, 2), dims.idx(2, 2));
@@ -4244,6 +4321,7 @@ mod tests {
             src: dims.idx(1, 0),
             dst: dims.idx(1, 3),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         let grid = GridBuilder::new(dims, 1).build();
         let b = net("b", dims.idx(0, 2), dims.idx(2, 2));
@@ -4265,6 +4343,68 @@ mod tests {
             disjoint(&ra.path, &rb.path),
             "distinct nets must never overlap copper: {ra:?} {rb:?}"
         );
+    }
+
+    /// A top-layer SMD endpoint may own the top cell without owning coincident
+    /// bottom copper. Via-forbidden exemptions are layer-local pad membership, not
+    /// a blanket exemption merely because one side of the transition is a terminal.
+    #[test]
+    fn via_forbidden_endpoint_exemption_is_layer_local() {
+        let dims = Dims::with_layers(2, 1, 2);
+        let mut gb = GridBuilder::new(dims, 1);
+        // Force the only possible layer change to occur at x=0: top x=1 is closed.
+        gb.mark_cell_layer(1, 0, 0);
+        let mut grid = gb.build();
+        let top_src = dims.idx3(0, 0, 0);
+        let bottom_under_src = dims.idx3(0, 0, 1);
+        let bottom_dst = dims.idx3(1, 0, 1);
+        grid.via_forbidden = vec![false; dims.len()];
+        grid.via_forbidden[top_src as usize] = true;
+        grid.via_forbidden[bottom_under_src as usize] = true;
+
+        let top_smd = NetEndpoints {
+            net: "top_smd".into(),
+            src: top_src,
+            dst: bottom_dst,
+            passable_pads: vec![top_src],
+            via_passable_pads: vec![top_src],
+        };
+        let blocked = NegotiatedRouter::new()
+            .route(&grid, std::slice::from_ref(&top_smd))
+            .unwrap();
+        assert_eq!(blocked.unrouted, ["top_smd"]);
+
+        let through_pad = NetEndpoints {
+            net: "through".into(),
+            passable_pads: vec![top_src, bottom_under_src],
+            // Deliberately unsorted: public/serde input has no ordering contract.
+            via_passable_pads: vec![bottom_under_src, top_src],
+            ..top_smd
+        };
+        let allowed = NegotiatedRouter::new()
+            .route(&grid, std::slice::from_ref(&through_pad))
+            .unwrap();
+        assert!(allowed.unrouted.is_empty());
+
+        let invalid_subset = NetEndpoints {
+            net: "bad-subset".into(),
+            passable_pads: vec![top_src],
+            via_passable_pads: vec![bottom_under_src],
+            ..through_pad.clone()
+        };
+        assert!(matches!(
+            NegotiatedRouter::new().route(&grid, &[invalid_subset]),
+            Err(RouterError::InvalidEndpoint { .. })
+        ));
+        let invalid_index = NetEndpoints {
+            net: "bad-index".into(),
+            via_passable_pads: vec![dims.len() as CellIdx],
+            ..through_pad
+        };
+        assert!(matches!(
+            NegotiatedRouter::new().route(&grid, &[invalid_index]),
+            Err(RouterError::InvalidEndpoint { .. })
+        ));
     }
 
     /// Via keepout: a placed via reserves an annular ring around itself. Soft pressure
@@ -4439,6 +4579,7 @@ mod tests {
             &coords,
             &heuristic_costs,
             &pads,
+            &[],
             Some(&own_path),
             Some(&own_halo),
             None,
@@ -4480,6 +4621,7 @@ mod tests {
             &coords,
             &heuristic_costs,
             &pads,
+            &[],
             None,
             Some(&combined_self),
             Some(&shared_congestion),
@@ -4502,6 +4644,7 @@ mod tests {
             &coords,
             &heuristic_costs,
             &pads,
+            &[],
             None,
             None,
             None,
@@ -4724,6 +4867,7 @@ mod tests {
                 &coords,
                 &heuristic_costs,
                 &pads,
+                &[],
                 Some(&own_path),
                 Some(&own_halo),
                 None,
@@ -4744,6 +4888,7 @@ mod tests {
                 &coords,
                 &heuristic_costs,
                 &pads,
+                &[],
                 None,
                 Some(&combined_self),
                 Some(&shared_congestion),
@@ -5275,6 +5420,7 @@ mod tests {
             &coords,
             &heuristic_costs,
             &pads,
+            &[],
             &[],
             &[],
             -1,

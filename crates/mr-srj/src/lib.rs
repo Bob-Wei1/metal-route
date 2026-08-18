@@ -936,13 +936,21 @@ pub fn rasterize_with_layers(
         .min_trace_width
         .filter(|w| *w > 0.0)
         .unwrap_or(resolution);
-    // Effective copper clearance the rasteriser will actually enforce: the halo width
-    // applied below (`clearance_cells · resolution`) — NOT the raw `srj.min_clearance`.
+    // Effective copper clearance the rasteriser will actually enforce. A Hanan grid
+    // measures inflation in continuous board units, so prefer the caller's exact rule;
+    // rounding it to `clearance_cells · resolution` would turn one coarse fill interval
+    // into a many-times-too-wide physical keepout. The rounded value remains the legacy
+    // fallback for callers that do not provide the exact rule.
     // The fill-channel policy MUST use this same value, otherwise it would size routing
     // lanes against a clearance the inflation does not match (e.g. when the problem
     // omits a clearance rule but the server still inflates by one trace width), placing
     // "channels" that the inflated pad halos then swallow — a pure-disconnect regression.
-    let clearance = (clearance_cells as f64 * resolution).max(0.0);
+    let rounded_clearance = (clearance_cells as f64 * resolution).max(0.0);
+    let clearance = if min_clearance_mm.is_finite() && min_clearance_mm > 0.0 {
+        min_clearance_mm
+    } else {
+        rounded_clearance
+    };
     // Foreign-copper blocking margin = the **track centreline rule**. A node may host
     // the *centre* of a `track_w`-wide trace; that trace keeps `clearance` to foreign
     // copper only if its centre is at least `clearance + track_w/2` from the foreign
@@ -1048,6 +1056,14 @@ pub fn rasterize_with_layers(
         build_grid_lines(srj, layer_count, track_w, clearance, escape_clearance);
     let mapping = Mapping::from_lines(x_lines, y_lines, layer_count);
     let mut builder = GridBuilder::new(mapping.dims, 1);
+    // A via annular pad is wider than a trace, so its legal landing set is a strict
+    // subset of the planar grid. Keep a via-only mask instead of widening the base
+    // grid and needlessly removing legal trace channels.
+    let via_margin_mm = if layer_count > 1 && via_pad_mm.is_finite() && via_pad_mm > 0.0 {
+        clearance.max(0.0) + via_pad_mm / 2.0
+    } else {
+        0.0
+    };
 
     // Collect every connection endpoint as `(x, y, layer)`. These are the pad
     // centres we must connect; the resolved layer is the named `Point.layer`
@@ -1126,7 +1142,34 @@ pub fn rasterize_with_layers(
         builder.inflate_clearance(block_margin_mm, &coords);
     }
 
-    let grid = builder.build();
+    let mut grid = builder.build();
+    if via_margin_mm > 0.0 {
+        let mut via_forbidden = vec![false; mapping.dims.len()];
+        for obstacle in &srj.obstacles {
+            let x_range = line_range_inclusive(
+                &mapping.x_lines,
+                obstacle.center.x - obstacle.width / 2.0 - via_margin_mm,
+                obstacle.center.x + obstacle.width / 2.0 + via_margin_mm,
+            );
+            let y_range = line_range_inclusive(
+                &mapping.y_lines,
+                obstacle.center.y - obstacle.height / 2.0 - via_margin_mm,
+                obstacle.center.y + obstacle.height / 2.0 + via_margin_mm,
+            );
+            for layer in obstacle_layers(obstacle, &layers) {
+                for y in y_range.clone() {
+                    for x in x_range.clone() {
+                        via_forbidden[mapping.dims.idx3(x, y, layer) as usize] = true;
+                    }
+                }
+            }
+        }
+        // Preserve the compact legacy representation when no obstacle actually
+        // contributes a via keepout cell.
+        if via_forbidden.contains(&true) {
+            grid.via_forbidden = via_forbidden;
+        }
+    }
     let nets = decompose_connections(
         &srj.connections,
         &mapping,
@@ -1134,6 +1177,7 @@ pub fn rasterize_with_layers(
         &layers,
         block_margin_mm,
         foreign_margin_mm,
+        via_margin_mm,
     );
 
     RasterizedProblem {
@@ -1309,6 +1353,88 @@ fn pad_cells_for_point(
     cells
 }
 
+/// Raw layer-local cells of endpoint-owned pad cores where a via may override the
+/// global static via mask. Ownership is geometric (the endpoint lies in the pad on
+/// its declared layer), matching [`pad_cells_for_point`]. Each endpoint contributes
+/// only cells on its own declared layer: a through-pad is represented by matching
+/// endpoints on both layers, rather than inferring plating from obstacle layer
+/// metadata. Any candidate lying in the via halo of a different obstacle is removed;
+/// foreign clearance always wins when an own pad core and a foreign halo overlap.
+fn via_pad_cells_for_point(
+    point: (f64, f64),
+    endpoint_layer: u32,
+    mapping: &Mapping,
+    obstacles: &[Obstacle],
+    layers: &LayerMap,
+    via_margin_mm: f64,
+) -> Vec<CellIdx> {
+    if via_margin_mm <= 0.0 {
+        return Vec::new();
+    }
+    let (px, py) = point;
+    let occupied_layers: Vec<Vec<u32>> = obstacles
+        .iter()
+        .map(|obstacle| obstacle_layers(obstacle, layers))
+        .collect();
+    let owned: std::collections::HashSet<usize> = obstacles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, obstacle)| {
+            let owns_layer = occupied_layers[index].contains(&endpoint_layer);
+            let owns_point = (px - obstacle.center.x).abs() <= obstacle.width / 2.0
+                && (py - obstacle.center.y).abs() <= obstacle.height / 2.0;
+            (owns_layer && owns_point).then_some(index)
+        })
+        .collect();
+
+    let mut candidates = Vec::new();
+    for &index in &owned {
+        let obstacle = &obstacles[index];
+        let x_range = line_range_inclusive(
+            &mapping.x_lines,
+            obstacle.center.x - obstacle.width / 2.0,
+            obstacle.center.x + obstacle.width / 2.0,
+        );
+        let y_range = line_range_inclusive(
+            &mapping.y_lines,
+            obstacle.center.y - obstacle.height / 2.0,
+            obstacle.center.y + obstacle.height / 2.0,
+        );
+        for y in y_range.clone() {
+            for x in x_range.clone() {
+                candidates.push(mapping.dims.idx3(x, y, endpoint_layer));
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.retain(|&cell| {
+        let (x, y, layer) = mapping.dims.xyz(cell);
+        let (lx, ly) = (mapping.x_lines[x as usize], mapping.y_lines[y as usize]);
+        !obstacles.iter().enumerate().any(|(index, obstacle)| {
+            !owned.contains(&index)
+                && occupied_layers[index].contains(&layer)
+                && lx >= obstacle.center.x - obstacle.width / 2.0 - via_margin_mm
+                && lx <= obstacle.center.x + obstacle.width / 2.0 + via_margin_mm
+                && ly >= obstacle.center.y - obstacle.height / 2.0 - via_margin_mm
+                && ly <= obstacle.center.y + obstacle.height / 2.0 + via_margin_mm
+        })
+    });
+    candidates
+}
+
+/// Half-open index range of sorted finite line coordinates within the inclusive
+/// continuous interval. Invalid bounds conservatively cover the whole axis.
+fn line_range_inclusive(lines: &[f64], lo: f64, hi: f64) -> std::ops::Range<u32> {
+    if !lo.is_finite() || !hi.is_finite() {
+        return 0..lines.len() as u32;
+    }
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    let start = lines.partition_point(|&line| line < lo);
+    let end = lines.partition_point(|&line| line <= hi);
+    start as u32..end as u32
+}
+
 /// Inclusive `[lo, hi]` range of indices in sorted `lines` whose position is within
 /// `clearance` continuous units of the line at index `seed`. With `clearance == 0`
 /// this is just `[seed, seed]`. The in-clearance indices form a contiguous band
@@ -1373,6 +1499,7 @@ fn decompose_connections(
     layers: &LayerMap,
     clearance_mm: f64,
     foreign_margin_mm: f64,
+    via_margin_mm: f64,
 ) -> Vec<NetEndpoints> {
     let mut nets = Vec::new();
     for conn in connections {
@@ -1425,11 +1552,34 @@ fn decompose_connections(
             ));
             passable_pads.sort_unstable();
             passable_pads.dedup();
+            let mut via_passable_pads = via_pad_cells_for_point(
+                (win[0].x, win[0].y),
+                src_layer,
+                mapping,
+                obstacles,
+                layers,
+                via_margin_mm,
+            );
+            via_passable_pads.extend(via_pad_cells_for_point(
+                (win[1].x, win[1].y),
+                dst_layer,
+                mapping,
+                obstacles,
+                layers,
+                via_margin_mm,
+            ));
+            via_passable_pads.sort_unstable();
+            via_passable_pads.dedup();
+            // Via exemptions are deliberately narrower than ordinary own-pad
+            // traversal. Keeping this explicit subset invariant prevents a via
+            // permission from bypassing the base-grid obstacle ownership check.
+            via_passable_pads.retain(|cell| passable_pads.binary_search(cell).is_ok());
             nets.push(NetEndpoints {
                 net,
                 src,
                 dst,
                 passable_pads,
+                via_passable_pads,
             });
         }
     }
@@ -2560,6 +2710,233 @@ mod tests {
             !net_a.passable_pads.contains(&pad_b),
             "net a must not be allowed through foreign pad b"
         );
+    }
+
+    /// A Hanan grid expresses clearance in board units, so a coarse fill pitch must
+    /// not quantise a 0.15 mm rule up to one whole 1.0 mm fill interval. The probe
+    /// node is 0.30 mm from the foreign pad edge: enough for a 0.15 mm trace plus
+    /// the router's 0.1125 mm track-centre band, but not enough for a 0.225 mm via
+    /// radius. Planar routing must retain it while via placement reserves it.
+    fn coarse_exact_clearance_probe() -> (RasterizedProblem, CellIdx) {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -2.0, "maxX": 2.0, "minY": -2.0, "maxY": 2.0 },
+            "obstacles": [{
+                "type": "rect",
+                "center": {"x": 0.0, "y": 0.0},
+                "width": 0.2,
+                "height": 0.2,
+                "layers": ["top"],
+                "connectedTo": ["connectivity_net_foreign"]
+            }],
+            "connections": [{
+                "name": "probe",
+                "pointsToConnect": [
+                    {"x": 0.4, "y": 0.0, "layer": "top"},
+                    {"x": 1.5, "y": 0.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 1, 0.15, 0.45);
+        let probe = prob.mapping.point_to_cell_layer((0.4, 0.0), 0);
+        (prob, probe)
+    }
+
+    #[test]
+    fn true_clearance_does_not_round_up_to_coarse_fill_pitch() {
+        let (prob, probe) = coarse_exact_clearance_probe();
+        assert!(
+            !prob.grid.is_obstacle(probe),
+            "a legal trace node 0.30 mm from the pad edge must survive the exact 0.2625 mm band"
+        );
+    }
+
+    #[test]
+    fn via_pad_reservation_is_distinct_from_planar_pad_reservation() {
+        let (prob, probe) = coarse_exact_clearance_probe();
+        assert!(!prob.grid.is_obstacle(probe), "planar trace remains legal");
+        assert!(
+            prob.grid.is_via_forbidden(probe),
+            "0.225 mm via radius + 0.15 mm clearance must reserve this landing"
+        );
+    }
+
+    #[test]
+    fn foreign_via_halo_wins_when_it_overlaps_another_pad_core() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -2.0, "maxX": 2.0, "minY": -2.0, "maxY": 2.0 },
+            "obstacles": [
+                {
+                    "type": "rect",
+                    "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.2,
+                    "height": 0.2,
+                    "layers": ["top"],
+                    "connectedTo": ["connectivity_net_foreign"]
+                },
+                {
+                    "type": "rect",
+                    "center": {"x": 0.4, "y": 0.0},
+                    "width": 0.1,
+                    "height": 0.1,
+                    "layers": ["top"],
+                    "connectedTo": ["connectivity_net_own"]
+                }
+            ],
+            "connections": [{
+                "name": "own",
+                "pointsToConnect": [
+                    {"x": 0.4, "y": 0.0, "layer": "top"},
+                    {"x": 1.5, "y": 0.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 1, 0.15, 0.45);
+        let own_core = prob.mapping.point_to_cell_layer((0.4, 0.0), 0);
+        assert!(
+            prob.grid.is_via_forbidden(own_core),
+            "a coincident own core must not erase the neighbouring foreign pad's via halo"
+        );
+        let own = prob.nets.iter().find(|net| net.net == "own").unwrap();
+        assert!(own.passable_pads.contains(&own_core));
+        assert!(
+            !own.via_passable_pads.contains(&own_core),
+            "foreign halo clipping must win over the raw own-pad core"
+        );
+        assert!(
+            own.via_passable_pads
+                .iter()
+                .all(|cell| own.passable_pads.contains(cell)),
+            "via exemptions must remain a subset of ordinary own-pad traversal"
+        );
+    }
+
+    #[test]
+    fn via_pad_permissions_are_layer_local_for_real_rasterized_smd_pads() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -1.0, "maxX": 2.0, "minY": -1.0, "maxY": 1.0 },
+            "obstacles": [
+                {
+                    "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.3, "height": 0.3, "layers": ["top"]
+                },
+                {
+                    "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                    "width": 0.3, "height": 0.3, "layers": ["bottom"]
+                },
+                {
+                    "type": "rect", "center": {"x": 1.0, "y": 0.0},
+                    "width": 0.3, "height": 0.3, "layers": ["bottom"]
+                }
+            ],
+            "connections": [{
+                "name": "smd",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.0, "layer": "top"},
+                    {"x": 1.0, "y": 0.0, "layer": "bottom"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 1, 0.15, 0.45);
+        let top = prob.mapping.point_to_cell_layer((0.0, 0.0), 0);
+        let bottom_foreign = prob.mapping.point_to_cell_layer((0.0, 0.0), 1);
+        let net = &prob.nets[0];
+        assert!(net.via_passable_pads.contains(&top));
+        assert!(!net.passable_pads.contains(&bottom_foreign));
+        assert!(!net.via_passable_pads.contains(&bottom_foreign));
+        assert!(prob.grid.is_via_forbidden(top));
+        assert!(prob.grid.is_via_forbidden(bottom_foreign));
+    }
+
+    #[test]
+    fn matching_layer_endpoints_authorize_a_real_through_pad_via() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0 },
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.4, "height": 0.4, "layers": ["top", "bottom"]
+            }],
+            "connections": [{
+                "name": "through",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.0, "layer": "top"},
+                    {"x": 0.0, "y": 0.0, "layer": "bottom"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let prob = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 1, 0.15, 0.45);
+        let net = &prob.nets[0];
+        assert_ne!(net.src, net.dst);
+        for cell in [net.src, net.dst] {
+            assert!(prob.grid.is_via_forbidden(cell));
+            assert!(net.passable_pads.contains(&cell));
+            assert!(net.via_passable_pads.contains(&cell));
+        }
+    }
+
+    #[test]
+    fn zero_clearance_still_reserves_via_radius_and_exempts_only_own_core() {
+        let foreign: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.0,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -1.0, "maxX": 2.0, "minY": -1.0, "maxY": 1.0 },
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.2, "height": 0.2, "layers": ["top"]
+            }],
+            "connections": [{
+                "name": "probe",
+                "pointsToConnect": [
+                    {"x": 0.3, "y": 0.0, "layer": "top"},
+                    {"x": 1.0, "y": 0.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let foreign_prob =
+            rasterize_with_layers(&foreign, 1.0, LayerMap::standard(2), 0, 0.0, 0.45);
+        let probe = foreign_prob.mapping.point_to_cell_layer((0.3, 0.0), 0);
+        assert!(foreign_prob.grid.is_via_forbidden(probe));
+        assert!(!foreign_prob.nets[0].via_passable_pads.contains(&probe));
+
+        let own: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.0,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -1.0, "maxX": 2.0, "minY": -1.0, "maxY": 1.0 },
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.2, "height": 0.2, "layers": ["top"]
+            }],
+            "connections": [{
+                "name": "own",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.0, "layer": "top"},
+                    {"x": 1.0, "y": 0.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let own_prob = rasterize_with_layers(&own, 1.0, LayerMap::standard(2), 0, 0.0, 0.45);
+        let own_core = own_prob.mapping.point_to_cell_layer((0.0, 0.0), 0);
+        assert!(own_prob.grid.is_via_forbidden(own_core));
+        assert!(own_prob.nets[0].via_passable_pads.contains(&own_core));
     }
 
     /// `clearance_cells = 0`: the no-clearance build. Grid + nets match `rasterize`

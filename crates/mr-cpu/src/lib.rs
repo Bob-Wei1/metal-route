@@ -54,6 +54,7 @@ mod contract_tests {
             src,
             dst,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }
     }
 
@@ -75,6 +76,7 @@ mod contract_tests {
             src: 0,
             dst: 1,
             passable_pads: vec![0, 1],
+            via_passable_pads: Vec::new(),
         };
         for (name, router) in routers() {
             let board = router.route(&grid, std::slice::from_ref(&n)).unwrap();
@@ -93,6 +95,7 @@ mod contract_tests {
             src: 0,
             dst: 1,
             passable_pads: vec![dims.len() as u32 + 17],
+            via_passable_pads: Vec::new(),
         };
         for (name, router) in routers() {
             assert_eq!(
@@ -157,8 +160,27 @@ mod contract_tests {
         let malformed = Grid {
             dims,
             cost: vec![1],
+            via_forbidden: Vec::new(),
         };
         let n = net("n", 999, 1000);
+        for (name, router) in routers() {
+            assert_eq!(
+                router.route(&malformed, std::slice::from_ref(&n)),
+                Err(RouterError::MalformedGrid),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_router_rejects_malformed_via_mask_length() {
+        let dims = Dims::new(2, 2);
+        let malformed = Grid {
+            dims,
+            cost: vec![1; dims.len()],
+            via_forbidden: vec![false; dims.len() - 1],
+        };
+        let n = net("n", 0, 1);
         for (name, router) in routers() {
             assert_eq!(
                 router.route(&malformed, std::slice::from_ref(&n)),

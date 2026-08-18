@@ -65,6 +65,7 @@ pub fn parse_ascii(name: &'static str, s: &str, expected_total_cost: Option<u64>
             src,
             dst,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }],
         _ => Vec::new(),
     };
@@ -95,6 +96,7 @@ pub fn hand_32x32_wall() -> Fixture {
             src: dims.idx(0, 0),
             dst: dims.idx(31, 0),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }],
         expected_total_cost: Some(93),
         expected_path: None,
@@ -115,6 +117,7 @@ pub fn tie_break_2x2() -> Fixture {
             src: dims.idx(0, 0),
             dst: dims.idx(1, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }],
         expected_total_cost: Some(2),
         expected_path: Some(vec![dims.idx(0, 0), dims.idx(1, 0), dims.idx(1, 1)]),

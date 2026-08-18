@@ -173,6 +173,7 @@ mod tests {
             src: dims.idx(0, 1),
             dst: dims.idx(3, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         let lee = LeeRouter.route(&grid, std::slice::from_ref(&n)).unwrap();
         let astar = AStarRouter.route(&grid, std::slice::from_ref(&n)).unwrap();
@@ -205,6 +206,7 @@ mod tests {
                         src,
                         dst,
                         passable_pads: Vec::new(),
+                        via_passable_pads: Vec::new(),
                     };
                     let lee = LeeRouter.route(&grid, std::slice::from_ref(&n)).unwrap();
                     let astar = AStarRouter.route(&grid, std::slice::from_ref(&n)).unwrap();

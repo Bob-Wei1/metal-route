@@ -1618,6 +1618,7 @@ mod tests {
                 src: dims.idx(0, row),
                 dst: dims.idx(4, row),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             })
             .collect();
         let windows = vec![
@@ -1808,18 +1809,21 @@ mod tests {
                 src: dims.idx3(0, 3, 0),
                 dst: dims.idx3(8, 3, 2),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "own-pads".into(),
                 src: dims.idx3(0, 0, 0),
                 dst: dims.idx3(8, 0, 2),
                 passable_pads: vec![dims.idx3(0, 0, 0), dims.idx3(8, 0, 2)],
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "zero-length".into(),
                 src: dims.idx3(2, 3, 0),
                 dst: dims.idx3(2, 3, 0),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         let via_model = ViaModel::with_allowed_steps(3, 37, vec![(0, 1), (1, 2)]);
@@ -1891,6 +1895,77 @@ mod tests {
             violations.is_empty(),
             "bugreport01 must be DRC-clean after own-pad-aware via repair: {violations:#?}"
         );
+    }
+
+    /// Coarse bounds-derived fill spacing must not inflate the physical clearance
+    /// rule by fourfold. bugreport23's 0.15 mm rule previously became one 0.618 mm
+    /// fill interval, stranding 35 of 45 connections even in isolation. The exact
+    /// Hanan halo should recover useful routes without spending DRC correctness.
+    #[test]
+    fn bugreport23_exact_clearance_recovers_solo_routes_without_drc_regression() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport23-LGA15x4.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport23 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport23");
+        let (traces, summary, _) =
+            route_problem_impl(&srj, None, RouterKind::Negotiated, None, false)
+                .expect("route bugreport23 without via repair");
+
+        let solo_unroutable = summary
+            .unrouted
+            .iter()
+            .filter(|(_, reason)| *reason == UnroutedReason::UnroutableAlone)
+            .count();
+        assert!(
+            summary.routed >= 26,
+            "exact clearance should recover the observed 26/45 completion floor from the \
+             rounded-halo baseline 6/45; got {}/45",
+            summary.routed
+        );
+        assert_eq!(
+            solo_unroutable, 0,
+            "the rounded-halo baseline had 35 nets unable to route even in isolation"
+        );
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert!(
+            violations.is_empty(),
+            "completion recovery must retain bugreport23's zero-DRC baseline: {violations:#?}"
+        );
+    }
+
+    #[test]
+    fn rasterized_through_pad_routes_its_owned_masked_via_without_repair() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minClearance": 0.15,
+            "minTraceWidth": 0.15,
+            "bounds": { "minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0 },
+            "obstacles": [{
+                "type": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.4, "height": 0.4, "layers": ["top", "bottom"]
+            }],
+            "connections": [{
+                "name": "through",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.0, "layer": "top"},
+                    {"x": 0.0, "y": 0.0, "layer": "bottom"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let (traces, summary, _) =
+            route_problem_impl(&srj, Some(1.0), RouterKind::Negotiated, None, false)
+                .expect("route a real rasterized through pad");
+        assert_eq!((summary.routed, summary.total), (1, 1));
+        assert!(traces[0]
+            .route
+            .iter()
+            .any(|point| matches!(point, RoutePoint::Via { .. })));
     }
 
     type EndpointViaSignature = (
@@ -2069,18 +2144,21 @@ mod tests {
                 src: dims.idx(0, 4),
                 dst: dims.idx(4, 4),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "blocked".into(),
                 src: dims.idx(0, 0),
                 dst: dims.idx(2, 2),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "zero".into(),
                 src: dims.idx(4, 0),
                 dst: dims.idx(4, 0),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         let coords = GridCoords::uniform(dims);

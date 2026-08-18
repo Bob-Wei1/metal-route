@@ -192,6 +192,7 @@ impl GridBuilder {
         Grid {
             dims: self.dims,
             cost,
+            via_forbidden: Vec::new(),
         }
     }
 }

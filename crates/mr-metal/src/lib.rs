@@ -381,6 +381,15 @@ pub fn metal_route_isolated_batch(
     if !grid.is_well_formed() {
         return Err(RouterError::MalformedGrid);
     }
+    // The packed Metal request does not yet carry per-net via-pad exemptions, so
+    // accepting a static via mask here could return a path the CPU boundary must
+    // reject. Preserve the all-or-fallback contract until those permissions are
+    // represented in the kernel input.
+    if !grid.via_forbidden.is_empty() {
+        return Err(RouterError::BackendUnavailable(
+            "isolated Metal routing does not support static via masks".into(),
+        ));
+    }
     let dims = grid.dims;
     let expected_x = (dims.w as usize).saturating_sub(1);
     let expected_y = (dims.h as usize).saturating_sub(1);
@@ -402,6 +411,10 @@ pub fn metal_route_isolated_batch(
             )));
         }
         if net.passable_pads.iter().any(|&c| !dims.contains(c))
+            || net
+                .via_passable_pads
+                .iter()
+                .any(|c| !dims.contains(*c) || !net.passable_pads.contains(c))
             || !dims.contains(net.src)
             || !dims.contains(net.dst)
             || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
@@ -974,6 +987,7 @@ mod tests {
                 src: 0,
                 dst: 0,
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             })
             .collect();
         let routed = MetalRouter.route(&grid, &nets).unwrap();
@@ -1130,6 +1144,7 @@ mod tests {
                 src,
                 dst: sources[(i * 7 + 5) % sources.len()],
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             })
             .collect();
         let gpu_routes = MetalRouter.route(&grid, &nets).unwrap();
@@ -1159,30 +1174,35 @@ mod tests {
                 src: dims.idx(0, 3),
                 dst: dims.idx(8, 3),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "own-obstacle-pads".into(),
                 src: dims.idx(0, 0),
                 dst: dims.idx(8, 0),
                 passable_pads: vec![dims.idx(0, 0), dims.idx(8, 0)],
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "max-minus-one-enter".into(),
                 src: dims.idx(0, 6),
                 dst: dims.idx(1, 6),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "zero-length".into(),
                 src: dims.idx(2, 3),
                 dst: dims.idx(2, 3),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "enclosed".into(),
                 src: dims.idx(0, 4),
                 dst: dims.idx(4, 4),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         assert_isolated_matches_cpu(&grid, &coords, &mr_core::ViaModel::through_hole(1), &nets);
@@ -1204,18 +1224,21 @@ mod tests {
                 src: dims.idx3(0, 0, 0),
                 dst: dims.idx3(5, 4, 1),
                 passable_pads: vec![dims.idx3(5, 4, 1)],
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "upper-span".into(),
                 src: dims.idx3(5, 0, 2),
                 dst: dims.idx3(0, 4, 3),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "forbidden-middle-span".into(),
                 src: dims.idx3(2, 2, 0),
                 dst: dims.idx3(2, 2, 3),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         assert_isolated_matches_cpu(&grid, &coords, &restricted, &nets);
@@ -1232,6 +1255,7 @@ mod tests {
             src: dims.idx3(3, 1, 0),
             dst: dims.idx3(3, 1, 3),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }];
         assert_isolated_matches_cpu(&grid, &coords, &extreme, &extreme_net);
     }
@@ -1248,6 +1272,7 @@ mod tests {
             src: hop_dims.idx(0, 1),
             dst: hop_dims.idx(2, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }];
         let uniform_hop = mr_core::GridCoords::uniform(hop_dims);
         assert_isolated_matches_cpu(
@@ -1279,6 +1304,7 @@ mod tests {
             src: pred_dims.idx(0, 1),
             dst: pred_dims.idx(3, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }];
         let uniform_pred = mr_core::GridCoords::uniform(pred_dims);
         assert_isolated_matches_cpu(
@@ -1348,6 +1374,7 @@ mod tests {
                     src,
                     dst,
                     passable_pads: pads,
+                    via_passable_pads: Vec::new(),
                 });
             }
             let via_model = if case % 2 == 0 {
@@ -1373,6 +1400,7 @@ mod tests {
             src: dims.idx(20, 20),
             dst,
             passable_pads: vec![dst],
+            via_passable_pads: Vec::new(),
         };
         let coords = mr_core::GridCoords::from_lines(
             (0..dims.w).map(|x| x as f64 * 0.17).collect(),
@@ -1412,6 +1440,7 @@ mod tests {
             src: dims.idx(0, 1),
             dst: dims.idx(4, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         let x = vec![SCALE; dims.w as usize - 1];
         let y = vec![SCALE; dims.h as usize - 1];
@@ -1463,6 +1492,7 @@ mod tests {
                     dims.idx(4, 0)
                 },
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             })
             .collect();
         let x = vec![SCALE; dims.w as usize - 1];
@@ -1493,6 +1523,7 @@ mod tests {
             src: 0,
             dst: 5,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         assert!(matches!(
             metal_route_isolated_batch(
@@ -1506,6 +1537,34 @@ mod tests {
                 },
             ),
             Err(RouterError::BackendUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn isolated_batch_falls_back_before_gpu_for_static_via_mask() {
+        let dims = mr_core::Dims::with_layers(1, 1, 2);
+        let mut grid = Grid::filled(dims, 1);
+        grid.via_forbidden = vec![true; dims.len()];
+        let net = NetEndpoints {
+            net: "masked-via".into(),
+            src: dims.idx3(0, 0, 0),
+            dst: dims.idx3(0, 0, 1),
+            passable_pads: vec![dims.idx3(0, 0, 0), dims.idx3(0, 0, 1)],
+            via_passable_pads: vec![dims.idx3(0, 0, 0), dims.idx3(0, 0, 1)],
+        };
+        assert!(matches!(
+            metal_route_isolated_batch(
+                &grid,
+                std::slice::from_ref(&net),
+                &[MetalWindow::full(dims)],
+                MetalEdgeCosts {
+                    x: &[],
+                    y: &[],
+                    vias: &[Some(SCALE)],
+                },
+            ),
+            Err(RouterError::BackendUnavailable(message))
+                if message.contains("static via masks")
         ));
     }
 
@@ -1524,18 +1583,21 @@ mod tests {
                 src: dims.idx(0, 0),
                 dst: dims.idx(5, 0),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "b".into(),
                 src: dims.idx(0, 5),
                 dst: dims.idx(5, 5),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "c".into(),
                 src: dims.idx(0, 2),
                 dst: dims.idx(5, 3),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         (grid, nets)
@@ -1609,6 +1671,7 @@ mod tests {
             src,
             dst,
             passable_pads: vec![src, dst],
+            via_passable_pads: Vec::new(),
         };
         let gpu = MetalRouter
             .route(&grid, std::slice::from_ref(&net))
@@ -1649,12 +1712,14 @@ mod tests {
                 src: dims.idx3(0, 2, 0),
                 dst: dims.idx3(7, 2, 0),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "bottom".into(),
                 src: dims.idx3(7, 3, 1),
                 dst: dims.idx3(0, 3, 1),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         let gpu = MetalRouter.route(&grid, &nets).unwrap();
@@ -1674,12 +1739,14 @@ mod tests {
                 src: 5,
                 dst: 3,
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
             NetEndpoints {
                 net: "reverse".into(),
                 src: 3,
                 dst: 5,
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             },
         ];
         let cpu = LeeRouter.route(&grid, &nets).unwrap();
@@ -1704,6 +1771,7 @@ mod tests {
             src: 3,
             dst: 5,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
 
         let cpu = LeeRouter.route(&grid, std::slice::from_ref(&net)).unwrap();
@@ -1740,6 +1808,7 @@ mod tests {
                 src: dims.idx3(0, (i * 37) % dims.h, i % 2),
                 dst: dims.idx3(dims.w - 1, (i * 67 + 11) % dims.h, (i + 1) % 2),
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             })
             .collect();
         let windows: Vec<_> = nets.iter().map(|net| test_window(dims, net)).collect();
@@ -1808,6 +1877,7 @@ mod tests {
                 src,
                 dst,
                 passable_pads: Vec::new(),
+                via_passable_pads: Vec::new(),
             });
         }
         (grid, nets)

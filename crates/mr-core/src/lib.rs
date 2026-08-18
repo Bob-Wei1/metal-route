@@ -394,6 +394,11 @@ impl ViaModel {
 pub struct Grid {
     pub dims: Dims,
     pub cost: Vec<Cost>,
+    /// Layer-local cells where planar copper remains legal but a via annular pad
+    /// would violate a static obstacle's clearance. Empty is the legacy all-legal
+    /// representation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via_forbidden: Vec<bool>,
 }
 
 impl Grid {
@@ -402,6 +407,7 @@ impl Grid {
         Self {
             cost: vec![fill; dims.len()],
             dims,
+            via_forbidden: Vec::new(),
         }
     }
 
@@ -415,14 +421,22 @@ impl Grid {
         self.cost[i as usize] == OBSTACLE
     }
 
+    /// Whether a via annular pad may not occupy this layer-local cell. Planar
+    /// routing deliberately ignores this mask.
+    #[inline]
+    pub fn is_via_forbidden(&self, i: CellIdx) -> bool {
+        self.via_forbidden.get(i as usize).copied().unwrap_or(false)
+    }
+
     #[inline]
     pub fn set(&mut self, i: CellIdx, c: Cost) {
         self.cost[i as usize] = c;
     }
 
-    /// True when `cost.len()` matches `dims`.
+    /// True when `cost` and an optional via mask match `dims`.
     pub fn is_well_formed(&self) -> bool {
         self.cost.len() == self.dims.len()
+            && (self.via_forbidden.is_empty() || self.via_forbidden.len() == self.dims.len())
     }
 }
 
@@ -443,6 +457,11 @@ pub struct NetEndpoints {
     /// behaviour for every construction site that does not set it.
     #[serde(default)]
     pub passable_pads: Vec<CellIdx>,
+    /// Raw cells of this net's endpoint-owned pad cores where a via may override
+    /// the grid's static via halo. Unlike `passable_pads`, this excludes the broad
+    /// trace escape corridor and is clipped against every foreign via halo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via_passable_pads: Vec<CellIdx>,
 }
 
 /// A routed net: the ordered path of cells from src to dst and its total cost.
@@ -878,6 +897,31 @@ mod tests {
     fn serde_defaults_new_collection_fields() {
         let net: NetEndpoints = serde_json::from_str(r#"{"net":"n","src":1,"dst":2}"#).unwrap();
         assert!(net.passable_pads.is_empty());
+        assert!(net.via_passable_pads.is_empty());
+
+        let grid: Grid = serde_json::from_str(r#"{"dims":{"w":2,"h":1},"cost":[1,1]}"#).unwrap();
+        assert!(grid.via_forbidden.is_empty());
+
+        let net = NetEndpoints {
+            net: "roundtrip".into(),
+            src: 0,
+            dst: 1,
+            passable_pads: vec![1, 0],
+            via_passable_pads: vec![1],
+        };
+        assert_eq!(
+            serde_json::from_str::<NetEndpoints>(&serde_json::to_string(&net).unwrap()).unwrap(),
+            net
+        );
+        let grid = Grid {
+            dims: Dims::new(2, 1),
+            cost: vec![1, 1],
+            via_forbidden: vec![false, true],
+        };
+        assert_eq!(
+            serde_json::from_str::<Grid>(&serde_json::to_string(&grid).unwrap()).unwrap(),
+            grid
+        );
 
         let board: BoardRoute =
             serde_json::from_str(r#"{"results":[],"unrouted":[],"congestion":[0,0]}"#).unwrap();

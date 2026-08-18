@@ -258,6 +258,7 @@ mod tests {
             src,
             dst,
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         }
     }
 
@@ -405,6 +406,7 @@ mod tests {
             src: dims.idx(3, 0),
             dst: dims.idx(3, 1),
             passable_pads: a_pad.clone(),
+            via_passable_pads: Vec::new(),
         };
         // B runs across row 1; its straight path would cross A's pad cell (3,1),
         // but B does not own that pad so it must dip down to row 2 and around.
@@ -413,6 +415,7 @@ mod tests {
             src: dims.idx(0, 1),
             dst: dims.idx(6, 1),
             passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
         };
         let nets = vec![net_a, net_b];
 
