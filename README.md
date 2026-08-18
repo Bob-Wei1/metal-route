@@ -76,7 +76,7 @@ congestion + equal unrouted set, under the shared canonical tie-break):
   boundaries, and concurrent calls — **pass**. This is broad regression coverage,
   not an exhaustive proof over every cost grid.
 
-The Rust source suite now contains **364 test cases** (363 passing, one explicitly
+The Rust source suite now contains **385 test cases** (384 passing, one explicitly
 ignored live-tool test), up from 243, plus two passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
 physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
@@ -133,9 +133,9 @@ immediately takes the exact whole-batch CPU fallback.
 
 `metalroute bench` generates ten deterministic 30-net SimpleRouteJson boards.
 Against the exact pre-change run, negotiated routing moves from **206/300 (68.7%)
-to 216/300 (72.0%)**, with mean routed cost 74.84. Finished-code report time ranged
-from 0.68–1.11 s (1.05–1.39 s external) across thermally different runs, versus the
-exact 1.68 s baseline. The deterministic quality result is the primary gate.
+to 216/300 (72.0%)**, with mean routed cost 74.84. The final release sample took
+0.653 s in the report and 0.97 s externally, versus the exact 1.680 s baseline
+report timer. The deterministic quality result is the primary gate.
 Counted self-halo snapshots make clearance-active negotiation parallel and
 byte-identical across 1/2/4 Rayon threads; one bounded single-layer coordination
 pass recovers the serial router's completion.
@@ -161,7 +161,8 @@ scripts/bench-corpus.sh srj15      # just one sub-corpus
 scripts/vendor-corpus.sh           # refresh the fixtures from upstream
 ```
 
-Exact 2026-08-17 before/after run (`negotiated`, identical 112 boards and settings):
+Exact baseline run on 2026-08-17 and final/recheck on 2026-08-18 (`negotiated`,
+identical 112 boards and settings):
 
 | corpus | before | after | fully routed before → after |
 |--------|-------:|------:|----------------------------:|
@@ -169,23 +170,33 @@ Exact 2026-08-17 before/after run (`negotiated`, identical 112 boards and settin
 | `bug-reports` | 1996/2447 (81.6%) | **2011/2447 (82.2%)** | 32 → **38** |
 | **total** | 2701/3167 (85.3%) | **2729/3167 (86.2%)** | 78 → **91** |
 
-Total exact-geometry DRC findings fall **1493 → 977**, algorithmic route cost
-falls **340,055 → 332,354**, clean boards rise **40 → 57**, and
-fully-routed-clean boards rise **38 → 54**. The hardened scorer returns
-**`KEEP`**: completion and full-board counts improve in both corpus groups without
-any workload, DRC, error, clean-board, or full-clean regression.
+Using the same corrected DRC checker on both route sets, exact-geometry findings
+fall **1227 → 714**, algorithmic route cost falls **340,055 → 332,354**,
+clean boards rise **49 → 66**, and fully-routed-clean boards rise **46 → 63**.
+The hardened scorer returns **`KEEP`**: workload identity is exact,
+completion and full-board counts improve in both corpus groups, errors remain
+zero, and every aggregate DRC/clean-board gate improves. This is an aggregate
+claim: 43 boards improve and four worsen; 18 boards become clean and one becomes
+dirty; 19 become fully-routed-clean and two lose that status.
 
-The exact finished-code run improves the entire latency distribution: standard
-median **1.392 s → 0.050 s** (27.7×), nearest-rank p95 **339.9 s → 35.8 s**
-(9.49×), sum of overlapping board timers **4715 s → 658 s** (7.17×), and
-external elapsed **715.55 s → 89.64 s** (7.98×). With 112 boards, the reported
+The exact finished-code run improves the headline median and tail summaries:
+standard median **1.392 s → 0.080 s** (17.3×), nearest-rank p95
+**339.9 s → 41.7 s** (8.15×), sum of overlapping board timers
+**4715 s → 546 s** (8.63×), and
+external elapsed **715.55 s → 83.04 s** (8.62×). With 112 boards, the reported
 median is the arithmetic mean of sorted observations 56 and 57 (one-indexed), not
 a lower- or upper-middle value; nearest-rank p95 is observation 107. Peak per-board
-time falls 679.5 s → 88.0 s. The principal speed wins are unique-cell SRJ pad-halo
-filtering, O(1) exact Hanan-distance heuristics, and a fused allocation-free Jacobi
-A* hot path; exact A/Bs retained normalized route output. Pad-ownership-aware
-smoothing and one bounded, board-wide DRC-scored via move produce the separate
-physical quality gain. The DRC exact-gap fast reject adds a smaller measured 10.8%
+time falls 679.5 s → 83.0 s. The principal speed wins are unique-cell SRJ pad-halo
+filtering, O(1) exact Hanan-distance heuristics, and fused Jacobi pricing with
+planar/via neighbor enumeration that avoids per-expansion allocation; exact A/Bs
+retained normalized route output. Pad-ownership-aware smoothing and one bounded,
+board-wide DRC-scored via move contribute to the separate physical-quality work.
+Legacy unlabeled-pad ownership is inferred only from immutable trace endpoints,
+preventing a moved interior via from claiming a foreign pad during repair scoring.
+The DRC bridge now preserves the standard physical
+layer stack, uses endpoint-side ownership for terminal vias, propagates declared
+connectivity across each routed group, and resolves only unambiguous fixed-pad
+aliases. The DRC exact-gap fast reject adds a smaller measured 10.8%
 microbenchmark improvement.
 
 The run writes a self-contained SVG gallery (`benchmarks/runs/<ts>-corpus/index.html`,

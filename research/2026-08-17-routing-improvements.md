@@ -1,4 +1,4 @@
-# Autorouter improvement report — 2026-08-17
+# Autorouter improvement report — 2026-08-17 (finalized 2026-08-18)
 
 This report records the test expansion, exact before/after measurements, and the
 next architecture suggested by current tscircuit work. It deliberately separates
@@ -6,12 +6,22 @@ aggregate gains from remaining regression gates.
 
 ## Reproducible baseline
 
-Baseline revision: `325d44d`. Both corpus reports contain the same 112 board IDs
-and the same per-board net totals. The final routing candidate is `0f9d39b`; later
-documentation-only commits do not change the measured binary.
+Baseline revision: `325d44d`. The final measured candidate is `7aee642`. Both
+corpus reports contain the same 112 board IDs and the same per-board net totals.
+The archived baseline used the former first-seen layer checker, so its exact route
+traces (including all 2,701 retained net tags) were replayed through the corrected
+checker at `c6e08b1`. All non-DRC report fields are byte-for-byte identical. Thus
+routing and timing remain the original baseline measurement, while the DRC rows
+below compare the same checker semantics. The corrected baseline report SHA-256 is
+`880d54d4fa34ba26fa70fdb1c9a3172962e87104a4876726a298362fbbfb5e35`;
+the final report SHA-256 is
+`6543f29685c9cf4b97528b2156473da98ffbb07f7fc246da32f81cdbd01b662d`.
+The final synthetic and six-board preflight report hashes are respectively
+`4ca110b2b5f8fa14ba274e4c3b8cf0461a46dad4e9a4cd4b2bff34ec17920d65`
+and `5e08056ee706c0161db75eba6e6ea28c3d653d1d77a2cd0013e0b5119171fd03`.
 
 ```sh
-cargo build -p mr-cli --release
+cargo build --locked -p mr-cli --release
 time target/release/metalroute bench \
   --out /tmp/metalroute-before-synth.json
 # Repeat at the candidate revision with:
@@ -32,11 +42,15 @@ Corpus defaults include `--router negotiated --max-cells 12000000`.
 
 Corpus `total_wall_ms` is the sum of overlapping per-board route timers. External
 `time` is the end-to-end wall clock and is governed by the slowest parallel board.
+The commands reproduce the workload and deterministic routing outputs, and
+remeasure timing. A checker-comparable baseline DRC requires replaying the archived
+baseline traces through the corrected checker as described above; directly
+rerunning the baseline revision uses its legacy checker.
 
 ## Test expansion
 
-Rust test attributes increased from 243 to 364. The current workspace executes
-363 conventional tests, has one explicitly ignored live-tool test, and passes two
+Rust test attributes increased from 243 to 385. The current workspace executes
+384 conventional tests, has one explicitly ignored live-tool test, and passes two
 doctests. Thirteen Python tests cover the benchmark scorer. Important new families:
 
 - exact shared contracts across Lee, A*, RipUp, and Negotiated routers;
@@ -89,9 +103,10 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
 - Exact per-gap Hanan costs are prefix-summed once per board, making the admissible
   physical-distance heuristic O(1) per heap operation. A matched `bugreport11` A/B
   was byte-identical and reduced route time by 47.3%.
-- The Jacobi hot path uses flat allocation-free planar/via expansion and folds the
-  immutable congestion snapshot once when at least 32 dirty nets amortize the
-  board-wide pass. A 512-case randomized fused/unfused oracle covers weights,
+- The Jacobi hot path folds the immutable congestion snapshot once when at least
+  32 dirty nets amortize the board-wide pass, and flat planar/via neighbor
+  enumeration avoids per-expansion allocation. A 512-case randomized
+  fused/unfused oracle covers weights,
   zero-cost cells, obstacles, windows, pads, nonuniform coordinates, restricted
   vias, saturation, and 1–4 layers. Matched normalized outputs were identical;
   median route time fell 9.5% on `bugreport46`, while one tail `bugreport50` pair
@@ -130,9 +145,22 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
   from 564.226 s to 35.411 s end-to-end with identical normalized output.
 - DRC ordering is total and input-order independent; oracle comparison preserves
   duplicate net multiplicity and exact congestion-vector length.
-- The solution-to-DRC bridge models compressed via landing legs. The exact
-  legalizer's pad features carry connectivity ownership, so smoothing can move
-  copper into its own pad while unknown pads remain foreign.
+- The solution-to-DRC bridge models compressed via landing legs and seeds the
+  canonical physical stack before ingesting geometry. Unknown routed layers map
+  to top; empty/all-unknown obstacle layer lists expand to every effective layer;
+  mixed lists retain their known, deduplicated layers. Terminal vias own only the
+  source/destination endpoint side, while their barrels remain copper on the full
+  physical span.
+- The exact legalizer's pad features carry connectivity ownership, so smoothing
+  can move copper into its own pad while unknown pads remain foreign. Legacy
+  unlabeled-pad ownership is inferred only from immutable, layer-matched trace
+  endpoints, so an interior via cannot move into a foreign pad and then relabel it
+  as its own during scoring. Declared connectivity propagates across the entire
+  initial routed identity; fixed-pad aliases gain ownership only when they resolve
+  uniquely, and ambiguous aliases stay foreign.
+- DRC via traversal normalizes direction and clamps spans before constructing an
+  inclusive range. DSN conversion rejects missing or duplicate layer identities
+  instead of silently collapsing a via or aliasing it onto another plane.
 - Geometry candidates are accepted against every authoritative DRC finding. Fewer
   findings is primary; equal-count candidates must preserve stable finding
   multiplicity and strictly improve 1 nm-quantized severity without worsening a
@@ -140,8 +168,9 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
 - A final bounded repair considers at most eight implicated, nonterminal, unshared
   vias and eight one-clearance compass moves. It rigidly preserves anchors,
   endpoints, trace order, and via spans, then retains at most one candidate and
-  only when the full-board DRC count strictly falls. Checked-in regressions improve
-  sample11 from 38 to 36 findings and sample25 from 5 to 2.
+  only when the full-board DRC count strictly falls. Under the corrected checker,
+  checked-in regressions improve sample11 from 20 to 18 findings and sample25 from
+  3 to 0.
 - DRC rejects pairs whose copper AABBs already prove enough separation before the
   exact geometry gap calculation; randomized indexed-vs-naive tests preserve exact
   results and the focused microbenchmark improved 10.8%.
@@ -177,11 +206,11 @@ speedups.
 |--------|-------:|------:|
 | Routed | 206/300 | **216/300** |
 | Completion | 68.67% | **72.00%** |
-| Observed report time | 1.680 s | **0.644 s** |
+| Observed report time | 1.680 s | **0.653 s** |
 | Mean routed cost | 74.136 | 74.843 |
 
 The completion result and mean cost are deterministic. The final release sample
-took 0.95 s externally; report time excludes process startup.
+took 0.97 s externally; report time excludes process startup.
 
 ### Exact 112-board corpus
 
@@ -189,15 +218,15 @@ took 0.95 s externally; report time excludes process startup.
 |--------|-------:|------:|-------:|
 | Routed nets | 2701/3167 | **2729/3167** | +28 |
 | Fully routed boards | 78/112 | **91/112** | +13 |
-| DRC findings | 1493 | **977** | -516 |
-| Clean boards | 40 | **57** | +17 |
-| Fully routed + clean | 38 | **54** | +16 |
+| DRC findings | 1227 | **714** | -513 |
+| Clean boards | 49 | **66** | +17 |
+| Fully routed + clean | 46 | **63** | +17 |
 | Total route cost | 340,055 | **332,354** | -2.26% |
-| Median board time | 1.392 s | **0.050 s** | 27.72× faster |
-| Nearest-rank P95 | 339.922 s | **35.825 s** | 9.49× faster |
-| Maximum board time | 679.474 s | **88.010 s** | 7.72× faster |
-| Sum of board timers | 4715.180 s | **657.915 s** | 7.17× faster |
-| External elapsed | 715.55 s | **89.64 s** | 7.98× faster |
+| Median board time | 1.392 s | **0.080 s** | 17.35× faster |
+| Nearest-rank P95 | 339.922 s | **41.733 s** | 8.15× faster |
+| Maximum board time | 679.474 s | **82.961 s** | 8.19× faster |
+| Sum of board timers | 4715.180 s | **546.430 s** | 8.63× faster |
+| External elapsed | 715.55 s | **83.04 s** | 8.62× faster |
 
 For the even 112-board sample, median is the arithmetic mean of sorted observations
 56 and 57 (one-indexed), not either middle observation. Nearest-rank p95 is sorted
@@ -206,16 +235,22 @@ observation 107.
 Per group, `srj15` improves 705/720 → 718/720 and 46 → 53 full boards.
 `bug-reports` improves 1996/2447 → 2011/2447 and 32 → 38 full boards.
 The hardened scorer returns `KEEP`: exact workload identity is unchanged, both
-groups improve, errors remain zero, DRC falls, clean boards increase, and
-fully-routed-clean boards do not regress.
+groups improve, errors remain zero, and aggregate DRC, clean-board, and
+fully-routed-clean gates all improve. This is not a claim of per-board monotonicity:
+among the 47 boards whose finding count changes, 43 improve and four worsen. There
+are 18 clean-board gains and one loss, plus 19 fully-routed-clean gains and two
+losses.
 
-The full run retains the exact completion and grid-cost result of the prior
-checkpoint while cutting its DRC total 1419 → 977 and external elapsed
-218.48 → 89.64 s. Of the 54 boards whose DRC count changes, 52 improve and two
-increase by one finding; no previously clean board becomes dirty, and 16 additional
-boards become clean. `bugreport05` remains 80/228 at grid cost 39,288 and now has
-12 findings. Corpus `total_wall_ms` is a sum of overlapping board timers; external
-elapsed is the real end-to-end measure.
+The legacy baseline report contained 1,493 findings under the old first-seen layer
+checker; that number is intentionally not used in the comparison table. Rechecking
+the byte-identical baseline routes with the corrected physical-layer/ownership
+semantics yields the checker-comparable 1,227 above. On `bugreport05`, routed nets
+move 86/228 → 80/228, grid cost 37,109 → 39,288, and findings 15 → 12. The
+six-board preflight is 70/113 with 31 findings: bugreport01 and bugreport23 are
+clean, bugreport30 has 18, bugreport45 is clean, sample21 has six, and sample22
+has seven. Corpus
+`total_wall_ms` is a sum of overlapping board timers; external elapsed is the real
+end-to-end measure.
 
 ## Transferable upstream work
 
