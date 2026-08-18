@@ -3,16 +3,14 @@
 //! The continuous clearance legaliser handles movable wire vertices and rigid vias
 //! with local monotone nudges. A small residue remains when one through-via is boxed
 //! against several foreign features or pinned to a route terminal. This module tries
-//! one deliberately
-//! narrow topology-preserving portfolio: a generic-clearance geometry prefilter
+//! a deliberately narrow topology-preserving portfolio: a generic-clearance prefilter
 //! selects at most eight vias, then tries eight compass directions. Interior vias
 //! move rigidly by one generic clearance; endpoint-adjacent vias grow a short
-//! stationary-terminal dogleg whose single radius is the original exact generic-
-//! clearance deficit, quantised to a quarter through one clearance, so the physical
-//! first/last endpoint stays exact. Typed pair-specific or drill-only
-//! findings can therefore be left unproposed, but every proposed candidate is
-//! checked against the authoritative typed full-board DRC; at most one strictly
-//! lower-finding candidate is retained.
+//! stationary-terminal dogleg whose radius is chosen from the exact generic-clearance
+//! deficit, rounded up to one of four quarter-clearance steps. The physical first/last
+//! endpoint stays exact. Typed pair-specific or drill-only findings can therefore be
+//! left unproposed, but every proposed candidate is checked against the authoritative
+//! typed full-board DRC; at most one strictly lower-finding candidate is retained.
 
 use mr_drc::{dist, point_rect_gap, point_seg_dist, DrcBoard, DrcRules, Via, Violation};
 use mr_srj::{PcbTrace, RoutePoint, SimpleRouteJson};
