@@ -70,16 +70,19 @@ congestion + equal unrouted set, under the shared canonical tie-break):
 
 - M3 GPU wavefront field == CPU BFS field — **pass** (incl. the 32×32 wall, cost 93).
 - M4 GPU prefix-min sweep field == CPU sweep field == CPU BFS field — **pass**.
-- `MetalRouter` = `LeeRouter` on committed weighted/zero/obstacle cases,
-  deterministic stress grids, multilayer batches, passable-pad overrides, chunk
-  boundaries, and concurrent calls — **pass**.
+- On the committed fixed fixtures and deterministic fixed-seed stress cases,
+  `MetalRouter` and `LeeRouter` return the same canonical results for the covered
+  weighted/zero/obstacle grids, multilayer batches, passable-pad overrides, chunk
+  boundaries, and concurrent calls — **pass**. This is broad regression coverage,
+  not an exhaustive proof over every cost grid.
 
 The Rust source suite now contains **349 test cases** (348 passing, one explicitly
 ignored live-tool test), up from 243, plus two passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
 physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
 layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
-memory caps, cached isolation diagnoses, and parallel scheduling determinism.
+memory caps, fixed-fixture and fixed-seed Metal equivalence, cached isolation
+diagnoses, and parallel scheduling determinism.
 `research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
 regression-gate tests for benchmark reports.
 
@@ -97,28 +100,33 @@ path. (See `crates/mr-cpu/src/sweep.rs` and `crates/mr-metal/src/gpu.rs`.)
 
 ### Speed (honest)
 
-Release benchmark on an M4, 128×128 grid, 64 independent nets. The route outputs
-are comparable, while the implementations deliberately do different work: Lee is
-target-directed and the field implementations compute every cell.
+Release timings on an M4, 128×128 grid, 64 independent nets. This is not a
+like-for-like algorithm benchmark: targeted Lee stops once destinations settle;
+the CPU field timing constructs complete source-distance fields but does not
+reconstruct paths; Metal computes full fields and reconstructs the requested paths.
 
-| Implementation | warm p50 |
-|----------------|---------:|
-| CPU `LeeRouter` targeted paths | 14.95–18.22 ms |
-| CPU full distance fields | 26.28–27.67 ms |
-| Metal batched fields + paths | **3.42–3.75 ms** |
+| Implementation | statistic | observed latency |
+|----------------|-----------|-----------------:|
+| CPU `LeeRouter` targeted paths | one timed route/process | 14.95–18.22 ms |
+| CPU full distance fields | one timed batch/process | 26.28–27.67 ms |
+| Metal batched fields + paths | median of 7 warm batches/process | **3.42–3.75 ms** |
 
-The batched Metal path is **4.0–5.3× faster than Lee** and **7.1–8.1× faster than
-CPU full fields**. Cold runtime shader/pipeline setup remains 22.5–26.5 ms, then a
-process-global context amortizes it. Unit/obstacle grids avoid the weighted hop
-plane; weighted and zero-cost grids retain it for exact canonical equivalence.
+Each range spans three isolated processes; the seven-sample Metal median is the
+fourth sorted observation. The observed Lee-to-Metal elapsed-time ratio is
+4.0–5.3× and the CPU-full-field-to-Metal ratio is 7.1–8.1×, but neither is a
+like-for-like speedup for the reasons above. Cold runtime shader/pipeline setup
+remains 22.5–26.5 ms, then a process-global context amortizes it. Unit/obstacle
+grids avoid the weighted hop plane; committed fixed and fixed-seed cases check
+that weighted and zero-cost grids retain canonical CPU equivalence.
 
 Metal also exposes an exact weighted Hanan-edge isolated-route batch (including
 vias, windows, and passable pads) behind a dependency-inverted CPU provider. Its
-256×192×2, 48-net warm p50 is 16.7–18.9 ms. Real-board A/Bs did **not** establish a
-reliable automatic crossover—five of eight representative boards were slower—so
-the production negotiated router keeps targeted CPU A* by default. Experimental
-offload is explicit with `METALROUTE_EXPERIMENTAL_METAL_ISOLATED=1`; GPU contention
-or any command failure immediately takes the exact whole-batch CPU fallback.
+256×192×2, 48-net median-of-seven warm latency is 16.7–18.9 ms. Real-board A/Bs did
+**not** establish a reliable automatic crossover—five of eight representative
+boards were slower—so the production negotiated router keeps targeted CPU A* by
+default. Experimental offload is explicit with
+`METALROUTE_EXPERIMENTAL_METAL_ISOLATED=1`; GPU contention or any command failure
+immediately takes the exact whole-batch CPU fallback.
 
 ### tscircuit-style synthetic benchmark
 
@@ -169,7 +177,10 @@ or full-clean regression.
 The exact finished-code run improves the entire latency distribution: standard
 median **1.392 s → 0.135 s** (10.3×), nearest-rank p95 **339.9 s → 134.6 s** (2.53×),
 sum of overlapping board timers **4715 s → 1531 s** (3.08×), and external elapsed
-**715.55 s → 218.48 s** (3.28×). Peak per-board time falls 679.5 s → 210.5 s.
+**715.55 s → 218.48 s** (3.28×). With 112 boards, the reported median is the
+arithmetic mean of sorted observations 56 and 57 (one-indexed), not a lower- or
+upper-middle value; nearest-rank p95 is observation 107. Peak per-board time falls
+679.5 s → 210.5 s.
 A matched isolated `bugreport05` run fell **564.226 s → 35.411 s** (15.9×) with
 every non-timing result identical. The principal wins are unique-cell SRJ pad-halo
 filtering and O(1) exact Hanan-distance heuristics; the DRC exact-gap fast reject

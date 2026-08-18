@@ -46,8 +46,9 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
 - SRJ layer ownership, unknown-layer obstacles, width preservation, and DSN
   arbitrary-angle/multi-shape pad geometry;
 - DRC spatial-index equivalence and total deterministic ordering;
-- Metal weighted/zero/unit dispatch, chunk boundaries, memory limits, pad
-  overrides, multilayer batches, and concurrent calls;
+- fixed-fixture and deterministic fixed-seed Metal checks for weighted/zero/unit
+  dispatch, chunk boundaries, memory limits, pad overrides, multilayer batches,
+  and concurrent calls;
 - exact benchmark workload identity, DRC, clean-board, error, group, and aggregate
   consistency gates;
 - cached isolation diagnoses and bounded scratch reuse under nested concurrent
@@ -90,8 +91,10 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
 
 - Sources are routed in memory-bounded batches with one process-global Metal
   context. Per-line change flags replace one global atomic per relaxed cell.
-- Weighted and zero-cost fields carry minimum-hop labels and match the CPU
-  canonical path. Unit/obstacle grids use a distance-only fast path.
+- On committed fixed fixtures and deterministic fixed-seed stress cases, weighted
+  and zero-cost fields carry minimum-hop labels and match the CPU canonical path.
+  Unit/obstacle grids use a distance-only fast path. This is fixed-seed regression
+  coverage rather than exhaustive enumeration of cost grids.
 - Shared and packed cost planes preserve per-net passable-pad overrides without
   giving up batching.
 - Public field results are chunked and capped before host/GPU allocation;
@@ -127,17 +130,24 @@ doctests. Thirteen Python tests cover the benchmark scorer. Important new famili
 
 ### Metal microbenchmark
 
-M4, release, 128×128, 64 independent fields, three isolated processes:
+M4, release, 128×128, 64 independent nets, three isolated processes. This is not
+a like-for-like algorithm benchmark: targeted Lee stops after destinations settle;
+the CPU full-field timing constructs source-distance fields without reconstructing
+paths; Metal computes full fields and reconstructs paths. CPU rows are one timed
+observation per process. Metal warm p50/7 is the ordinary median—the fourth sorted
+observation—of seven post-setup batches in each process.
 
 | Measurement | Result |
 |-------------|-------:|
 | Metal cold setup | 22.525–26.518 ms |
 | Metal warm p50/7 | **3.419–3.746 ms** |
-| CPU Lee paths | 14.946–18.217 ms |
-| CPU full fields | 26.280–27.666 ms |
+| CPU targeted Lee paths | 14.946–18.217 ms |
+| CPU full fields (no path reconstruction) | 26.280–27.666 ms |
 
-Metal is 4.01–5.33× faster than Lee and 7.06–8.09× faster than CPU full-field
-construction after setup is amortized.
+The observed Lee-to-Metal elapsed-time ratio is 4.01–5.33× and the
+CPU-full-field-to-Metal ratio is 7.06–8.09× after setup is amortized. These ratios
+describe the measured operations above; they are not like-for-like algorithmic
+speedups.
 
 ### Synthetic negotiated benchmark
 
@@ -167,6 +177,10 @@ elapsed samples were 1.05–1.39 s; report time excludes process startup and was
 | Maximum board time | 679.474 s | **210.541 s** | 3.23× faster |
 | Sum of board timers | 4715.180 s | **1531.380 s** | 3.08× faster |
 | External elapsed | 715.55 s | **218.48 s** | 3.28× faster |
+
+For the even 112-board sample, median is the arithmetic mean of sorted observations
+56 and 57 (one-indexed), not either middle observation. Nearest-rank p95 is sorted
+observation 107.
 
 Per group, `srj15` improves 705/720 → 718/720 and 46 → 53 full boards.
 `bug-reports` improves 1996/2447 → 2011/2447 and 32 → 38 full boards.
