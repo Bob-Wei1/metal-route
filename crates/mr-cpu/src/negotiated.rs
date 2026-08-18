@@ -2284,6 +2284,7 @@ impl NegotiatedRouter {
                 nets,
                 group_ids,
                 &alone_path,
+                &paths,
                 &windows,
                 &best_order,
                 &multi_committed,
@@ -3516,6 +3517,74 @@ fn legalize_in_order(
     committed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyInsert {
+    Inserted,
+    Existing,
+    WouldCycle,
+}
+
+/// Add `from -> to` only when doing so preserves an acyclic dependency graph.
+/// The edge means `from` must be legalized before its blocking owner `to`.
+fn add_acyclic_dependency(
+    dependencies: &mut [Vec<usize>],
+    from: usize,
+    to: usize,
+) -> DependencyInsert {
+    if dependencies[from].contains(&to) {
+        return DependencyInsert::Existing;
+    }
+    let mut seen = vec![false; dependencies.len()];
+    let mut stack = vec![to];
+    while let Some(node) = stack.pop() {
+        if node == from {
+            return DependencyInsert::WouldCycle;
+        }
+        if seen[node] {
+            continue;
+        }
+        seen[node] = true;
+        stack.extend(dependencies[node].iter().copied());
+    }
+    dependencies[from].push(to);
+    dependencies[from].sort_unstable();
+    DependencyInsert::Inserted
+}
+
+/// Stable topological order for the observed failed-group-to-blocker graph.
+/// Unconstrained ties retain the winning seed order and then the group id.
+fn dependency_guided_order(seed_order: &[usize], dependencies: &[Vec<usize>]) -> Vec<usize> {
+    let n_groups = dependencies.len();
+    let mut rank = vec![usize::MAX; n_groups];
+    for (i, &group) in seed_order.iter().enumerate() {
+        rank[group] = i;
+    }
+    let mut indegree = vec![0usize; n_groups];
+    for targets in dependencies {
+        for &target in targets {
+            indegree[target] += 1;
+        }
+    }
+    let mut emitted = vec![false; n_groups];
+    let mut order = Vec::with_capacity(n_groups);
+    while order.len() < n_groups {
+        let next = (0..n_groups)
+            .filter(|&group| !emitted[group] && indegree[group] == 0)
+            .min_by_key(|&group| (rank[group], group));
+        let Some(group) = next else {
+            debug_assert!(false, "dependency insertion must preserve a DAG");
+            order.extend(seed_order.iter().copied().filter(|&g| !emitted[g]));
+            break;
+        };
+        emitted[group] = true;
+        order.push(group);
+        for &target in &dependencies[group] {
+            indegree[target] -= 1;
+        }
+    }
+    order
+}
+
 /// Bounded rip-up-and-reroute legalization.
 ///
 /// Produces a cell-disjoint-across-groups commit that, unlike [`legalize_in_order`],
@@ -3549,6 +3618,7 @@ fn ripup_legalize(
     nets: &[NetEndpoints],
     group_ids: &[usize],
     alone_path: &[Vec<CellIdx>],
+    negotiated_paths: &[Vec<CellIdx>],
     windows: &[Window],
     seed_group_order: &[usize],
     seed_committed: &Committed,
@@ -3562,6 +3632,8 @@ fn ripup_legalize(
 ) -> Committed {
     let dims = grid.dims;
     let n_nets = nets.len();
+    let n_groups = group_ids.iter().copied().max().map_or(0, |g| g + 1);
+    let mut dependencies = vec![Vec::<usize>::new(); n_groups];
 
     // A net needs the (expensive) full-board fallback only if its own alone-path
     // genuinely leaves its window. Nets whose alone-path fits the window never gain
@@ -3808,6 +3880,13 @@ fn ripup_legalize(
             (len, bg)
         });
 
+        // Learn every exact failed-group -> blocking-owner dependency. Reject an
+        // edge that would close a cycle so the graph can safely drive one stable
+        // topological restart after the ordinary bounded FIFO attempt.
+        for &blocker in &blocker_groups {
+            let _ = add_acyclic_dependency(&mut dependencies, g, blocker);
+        }
+
         let victim = blocker_groups[0];
 
         // Re-enqueue every (currently committed) net of the victim group, in input
@@ -3890,6 +3969,38 @@ fn ripup_legalize(
             // count is bounded by per_net_cap, so this terminates).
             rip_count[i] += 1;
             queue.push_back(i);
+        }
+    }
+
+    // One bounded global restart through the existing legalization primitive.
+    // It is evaluated only when blocker telemetry changed the winning seed order,
+    // and can replace the FIFO result only on a strict completion gain.
+    let has_dependency = dependencies.iter().any(|targets| !targets.is_empty());
+    let guided_order = dependency_guided_order(seed_group_order, &dependencies);
+    if has_dependency && guided_order != seed_group_order {
+        let guided = legalize_in_order(
+            grid,
+            coords,
+            heuristic_costs,
+            buf,
+            pad_set,
+            nets,
+            group_ids,
+            negotiated_paths,
+            windows,
+            &guided_order,
+            n_cells,
+            via_model,
+            clearance,
+            via_spacing_mm,
+            via_hole_spacing_mm,
+            protect_planar_from_vias,
+            has_zero_cost,
+        );
+        let guided_routed = guided.iter().filter(|path| path.is_some()).count();
+        let current_routed = committed.iter().filter(|path| path.is_some()).count();
+        if guided_routed > current_routed {
+            committed = guided;
         }
     }
 
@@ -4374,6 +4485,56 @@ mod tests {
             10,
             &original_order,
         ));
+    }
+
+    #[test]
+    fn dependency_graph_deduplicates_edges_and_rejects_cycles() {
+        let mut dependencies = vec![Vec::new(); 4];
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 0, 2),
+            DependencyInsert::Inserted
+        );
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 0, 2),
+            DependencyInsert::Existing
+        );
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 2, 3),
+            DependencyInsert::Inserted
+        );
+        let before = dependencies.clone();
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 3, 0),
+            DependencyInsert::WouldCycle
+        );
+        assert_eq!(
+            dependencies, before,
+            "rejected edges must not mutate the DAG"
+        );
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 1, 1),
+            DependencyInsert::WouldCycle
+        );
+    }
+
+    #[test]
+    fn dependency_order_respects_edges_and_preserves_seed_ties() {
+        let seed = vec![0, 1, 2, 3];
+        let mut dependencies = vec![Vec::new(); seed.len()];
+        assert_eq!(
+            add_acyclic_dependency(&mut dependencies, 2, 0),
+            DependencyInsert::Inserted
+        );
+        assert_eq!(
+            dependency_guided_order(&seed, &dependencies),
+            vec![1, 2, 0, 3],
+            "unconstrained ready groups retain seed rank while 2 precedes 0"
+        );
+        assert_eq!(
+            dependency_guided_order(&[3, 2, 1, 0], &vec![Vec::new(); 4]),
+            vec![3, 2, 1, 0],
+            "an empty dependency graph is byte-order inert"
+        );
     }
 
     #[test]

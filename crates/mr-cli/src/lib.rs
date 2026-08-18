@@ -2307,6 +2307,30 @@ mod tests {
         );
     }
 
+    /// A dependency-guided legalization restart must recover one additional route
+    /// without worsening this board's existing exact-clearance findings.
+    #[test]
+    fn bug28_dependency_portfolio_recovers_one_route_without_drc_regression() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport28-18a9ef.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport28 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport28");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route bugreport28");
+        assert_eq!((summary.routed, summary.total), (12, 14));
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert_eq!(
+            violations.len(),
+            18,
+            "the retained route must not worsen exact DRC: {violations:#?}"
+        );
+    }
+
     /// A net whose only corridor is walled off on the top layer. The wall sits on
     /// `"top"` only, so on a single layer the net cannot route; granting a second
     /// layer lets the negotiated router via down, cross, and via back up.
