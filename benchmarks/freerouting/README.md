@@ -93,7 +93,8 @@ important states are:
 - `matched`, `mismatched`, or `unavailable` for the cross-parser workload gate;
 - `route_timeout`, `route_error`, `missing_ses`, `reload_error`, or `ok` for each
   repetition;
-- `complete` only when a wall-time factor is valid under the gates above.
+- `complete` when both measured run sets and every SES reload complete under the
+  input/workload gates. The quality-gated ratio may still be `—`.
 
 The generated Markdown is a compact public table. The JSON remains the source
 of truth for individual samples, hashes, commands, compatibility evidence, and
