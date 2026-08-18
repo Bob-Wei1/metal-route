@@ -71,10 +71,10 @@ The native checker count and comparable-audit count are different views and are
 intentionally not conflated. Two independent full-corpus runs produced identical
 routing semantics after timing fields were removed.
 
-The Rust workspace contains 543 test cases: 533 passing, ten intentionally
-ignored manual/live/performance gates, and two passing doctests. Detailed
-methodology, accepted changes, rejected experiments, hashes, and checker
-definitions are in the
+The Rust workspace contains 556 unit and integration test cases: 546 passing and
+ten intentionally ignored manual/live/performance gates. Its two doctests also
+pass. Detailed methodology, accepted changes, rejected experiments, hashes, and
+checker definitions are in the
 [engineering report](research/2026-08-17-routing-improvements.md).
 
 ## Metal, without the spin
@@ -109,6 +109,34 @@ Exact outline enforcement also has a real cost: the two certified corpus runs
 took about 324 and 333 seconds on the measurement machine, versus about 180
 seconds for the outline-invalid predecessor. This release is a correctness and
 physical-quality improvement, not a full-corpus speed claim.
+
+## Freerouting comparison
+
+A pinned three-board smoke test compares byte-identical DAC2020 DSNs with
+[Freerouting 2.3.0](https://github.com/freerouting/freerouting/releases/tag/v2.3.0).
+Each tool gets one routing worker and three fresh processes; the table reports
+median external wall time from process launch through SES creation. Freerouting
+then reloads both tools' sessions and supplies the common `U / V` quality count
+(unconnected items / violations).
+
+| Fixture | metalroute median | Freerouting median | metalroute U / V | Freerouting U / V | Quality-gated ratio |
+|---|---:|---:|---:|---:|---:|
+| DAC2020 bm08 | **0.057 s** | 3.556 s | 0 / 24 | **0 / 1** | — |
+| DAC2020 bm06 | **10.410 s** | 18.833 s | 4 / 244 | **2 / 8** | — |
+| DAC2020 bm07 | 13.692 s | **12.556 s** | 4 / 40 | **3 / 0** | **Freerouting 1.09×** |
+
+No metalroute speedup is established. The reported routing-task count matches on
+bm08 (25) and bm07 (86), while bm06 is withheld at 97 vs 98. On bm08,
+metalroute's lower raw wall time is not assigned a ratio because its output has
+more violations. On bm07, Freerouting is both faster and no worse on the common
+quality counts, producing an observed median ratio of **1.09× in Freerouting's
+favor** under the gate. bm07's sample spread is high, so treat that number as
+directional smoke evidence, not a precise general speedup. Freerouting is no
+worse in U and strictly better in V on all three boards.
+
+See the [full samples, hashes, and interpretation](benchmarks/freerouting/results/2026-08-18-m4-pro.md)
+and the [reproduction methodology](benchmarks/freerouting/README.md). This is a
+three-board, two-layer smoke matrix—not Freerouting's complete benchmark suite.
 
 ## Quick start
 
