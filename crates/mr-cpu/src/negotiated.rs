@@ -150,10 +150,14 @@ const RIPUP_GLOBAL_BUDGET_PER_NET: usize = 20;
 const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
 
 /// The blocker-informed restart stores and probes an O(groups) dependency graph,
-/// then pays for one more whole legalization pass. Keep that bounded on unusually
-/// fragmented inputs while retaining the 168-group bugreport50 recovery case.
+/// then pays for one more whole legalization pass over every net and grid cell.
+/// Bound all three input axes while retaining the measured bugreport50 recovery.
 const GUIDED_RESTART_MAX_GROUPS: usize = 192;
+const GUIDED_RESTART_MAX_NETS: usize = 384;
+const GUIDED_RESTART_MAX_CELLS: usize = 1_500_000;
 const _: () = assert!(GUIDED_RESTART_MAX_GROUPS >= 168);
+const _: () = assert!(GUIDED_RESTART_MAX_NETS >= 322);
+const _: () = assert!(GUIDED_RESTART_MAX_CELLS >= 1_294_488);
 
 /// Per-net committed paths from one legalization pass, in input net order: `Some`
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
@@ -3611,8 +3615,10 @@ fn guided_candidate_is_better(guided: &Committed, current: &Committed) -> bool {
 }
 
 #[inline]
-fn should_collect_guided_dependencies(n_groups: usize) -> bool {
+fn should_collect_guided_dependencies(n_groups: usize, n_nets: usize, n_cells: usize) -> bool {
     n_groups <= GUIDED_RESTART_MAX_GROUPS
+        && n_nets <= GUIDED_RESTART_MAX_NETS
+        && n_cells <= GUIDED_RESTART_MAX_CELLS
 }
 
 /// Bounded rip-up-and-reroute legalization.
@@ -3663,7 +3669,7 @@ fn ripup_legalize(
     let dims = grid.dims;
     let n_nets = nets.len();
     let n_groups = group_ids.iter().copied().max().map_or(0, |g| g + 1);
-    let collect_dependencies = should_collect_guided_dependencies(n_groups);
+    let collect_dependencies = should_collect_guided_dependencies(n_groups, n_nets, n_cells);
     let mut dependencies = if collect_dependencies {
         vec![Vec::<usize>::new(); n_groups]
     } else {
@@ -4573,18 +4579,40 @@ mod tests {
     #[test]
     fn guided_restart_is_bounded_and_requires_strict_completion_gain() {
         assert!(should_collect_guided_dependencies(
-            GUIDED_RESTART_MAX_GROUPS
+            GUIDED_RESTART_MAX_GROUPS,
+            GUIDED_RESTART_MAX_NETS,
+            GUIDED_RESTART_MAX_CELLS,
         ));
-        assert!(!should_collect_guided_dependencies(
-            GUIDED_RESTART_MAX_GROUPS + 1
-        ));
+        assert!(should_collect_guided_dependencies(168, 322, 1_294_488));
 
-        let over_cap_seed: Vec<usize> = (0..=GUIDED_RESTART_MAX_GROUPS).collect();
-        assert_eq!(
-            dependency_guided_restart_order(&over_cap_seed, &[]),
-            None,
-            "an over-cap route carries no dependency table and must remain inert"
-        );
+        let just_over_cap = [
+            (
+                GUIDED_RESTART_MAX_GROUPS + 1,
+                GUIDED_RESTART_MAX_NETS,
+                GUIDED_RESTART_MAX_CELLS,
+            ),
+            (
+                GUIDED_RESTART_MAX_GROUPS,
+                GUIDED_RESTART_MAX_NETS + 1,
+                GUIDED_RESTART_MAX_CELLS,
+            ),
+            (
+                GUIDED_RESTART_MAX_GROUPS,
+                GUIDED_RESTART_MAX_NETS,
+                GUIDED_RESTART_MAX_CELLS + 1,
+            ),
+        ];
+        for (n_groups, n_nets, n_cells) in just_over_cap {
+            assert!(!should_collect_guided_dependencies(
+                n_groups, n_nets, n_cells
+            ));
+            let seed: Vec<usize> = (0..n_groups).collect();
+            assert_eq!(
+                dependency_guided_restart_order(&seed, &[]),
+                None,
+                "an over-cap route carries no dependency table and must remain inert"
+            );
+        }
 
         let one = vec![Some(vec![0]), None];
         let equal_but_different = vec![None, Some(vec![1])];
