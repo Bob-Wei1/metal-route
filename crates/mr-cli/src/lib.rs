@@ -683,7 +683,7 @@ fn route_problem_impl(
         // connectivity pads, else the router group) so the legaliser's same-net immunity
         // and its internal gate agree with the authoritative checker — otherwise it would
         // try to push apart copper the DRC considers one net, or miss real foreign pairs.
-        let labels = drc_board::reconstruct_net_labels(srj, &traces);
+        let labels = drc_board::reconstruct_net_labels(srj, &traces, layers);
         let traces: Vec<_> = traces
             .into_iter()
             .zip(labels)
@@ -1961,27 +1961,27 @@ mod tests {
     }
 
     /// Dense four-layer fixture: one exact one-clearance rigid via translation
-    /// reduces the endpoint-owned legacy-pad baseline from 32 to 30 findings,
+    /// reduces the layer-aware endpoint-owned pad baseline from 20 to 18 findings,
     /// without changing any of its 26 routed nets, endpoints, or via spans.
     #[test]
     fn sample11_bounded_via_repair_reduces_exact_drc() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample11-region-reroute.srj.json",
             26,
-            32,
-            30,
+            20,
+            18,
         );
     }
 
     /// Small independent fixture for the same portfolio: eight exact candidates
-    /// move one implicated via and remove all three of its findings (5 -> 2).
+    /// move one implicated via and clear all three residual findings.
     #[test]
     fn sample25_bounded_via_repair_reduces_exact_drc() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample25-region-reroute.srj.json",
             5,
-            5,
-            2,
+            3,
+            0,
         );
     }
 
