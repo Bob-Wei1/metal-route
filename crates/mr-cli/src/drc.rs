@@ -5,7 +5,7 @@
 //! barrel is correctly seen crossing the inner power planes it physically drills.
 //! [`run_drc`] routes a `.dsn`, runs the checker, and reports/writes the result.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -83,6 +83,22 @@ pub fn build_drc_board(
         mapping.dims.layers,
         signal_layers.len()
     );
+
+    // Layer names are the identity used to project the routed signal grid onto
+    // the physical stack. Duplicate names make that projection ambiguous:
+    // `LayerMap::index_of` would pick the first occurrence and silently collapse
+    // two physical layers (and a via between them) onto one. Reject either map
+    // before resolving indices so malformed DSNs fail closed.
+    for (role, layer_map) in [("signal", signal_layers), ("physical", physical_layers)] {
+        let mut seen = HashSet::with_capacity(layer_map.len() as usize);
+        for layer in 0..layer_map.len() {
+            let name = layer_map.name(layer);
+            anyhow::ensure!(
+                seen.insert(name),
+                "{role} layer map contains duplicate name {name:?}"
+            );
+        }
+    }
 
     // Resolve the complete signal-to-physical mapping up front and fail closed.
     // Falling back to the signal index can silently alias a missing name onto an
@@ -414,6 +430,105 @@ mod tests {
             err.to_string().contains("bottom") && err.to_string().contains("absent"),
             "unexpected error: {err:#}"
         );
+    }
+
+    fn empty_board() -> BoardRoute {
+        BoardRoute {
+            results: vec![],
+            unrouted: vec![],
+            congestion: vec![],
+            groups: vec![],
+        }
+    }
+
+    fn empty_mapping(layers: u32) -> Mapping {
+        Mapping::with_layers(
+            &mr_srj::Bounds {
+                min_x: 0.0,
+                max_x: 2.0,
+                min_y: 0.0,
+                max_y: 2.0,
+            },
+            1.0,
+            layers,
+        )
+    }
+
+    #[test]
+    fn duplicate_signal_layer_name_fails_closed() {
+        let signal = LayerMap::from_names(vec!["top".to_string(), "top".to_string()]);
+        let physical = LayerMap::from_names(vec!["top".to_string(), "bottom".to_string()]);
+
+        let err = build_drc_board(
+            &empty_board(),
+            &empty_mapping(2),
+            &signal,
+            &physical,
+            &[],
+            &[],
+            &HashMap::new(),
+            0.15,
+            default_rules(0.15),
+            true,
+        )
+        .expect_err("duplicate signal identities must not collapse onto one layer");
+        assert!(
+            err.to_string().contains("signal")
+                && err.to_string().contains("duplicate")
+                && err.to_string().contains("top"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn duplicate_physical_layer_name_fails_closed() {
+        let signal = LayerMap::from_names(vec!["top".to_string()]);
+        let physical = LayerMap::from_names(vec!["top".to_string(), "top".to_string()]);
+
+        let err = build_drc_board(
+            &empty_board(),
+            &empty_mapping(1),
+            &signal,
+            &physical,
+            &[],
+            &[],
+            &HashMap::new(),
+            0.15,
+            default_rules(0.15),
+            true,
+        )
+        .expect_err("duplicate physical identities must not hide a stack layer");
+        assert!(
+            err.to_string().contains("physical")
+                && err.to_string().contains("duplicate")
+                && err.to_string().contains("top"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn distinct_signal_to_physical_mapping_is_accepted() {
+        let signal = LayerMap::from_names(vec!["top".to_string(), "bottom".to_string()]);
+        let physical = LayerMap::from_names(vec![
+            "top".to_string(),
+            "inner1".to_string(),
+            "bottom".to_string(),
+        ]);
+
+        let board = build_drc_board(
+            &empty_board(),
+            &empty_mapping(2),
+            &signal,
+            &physical,
+            &[],
+            &[],
+            &HashMap::new(),
+            0.15,
+            default_rules(0.15),
+            true,
+        )
+        .expect("a one-to-one signal projection must remain valid");
+        assert_eq!(board.layers.len(), 3);
     }
 
     /// Without the poured-zone model (bare copper), a foreign through-via shorts the
