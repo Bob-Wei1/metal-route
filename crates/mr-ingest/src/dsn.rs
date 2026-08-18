@@ -12,10 +12,15 @@
 //! The unit in `(resolution <unit> <factor>)` declares the physical unit used by
 //! coordinates in the design. The factor is the precision Freerouting uses for
 //! its internal integer grid and for coordinates written to a session; it does
-//! **not** divide coordinates read from the DSN. A raw design value is therefore
-//! converted by `raw * unit_to_mm(unit)`. For the common `(resolution um 10)`
-//! header, `148313` is 148.313 mm on input, while the same position is written as
-//! `1483130` in a resolution-10 session.
+//! **not** divide standard coordinates read from the DSN. A raw design value is
+//! therefore converted by `raw * unit_to_mm(unit)`. For the common
+//! `(resolution um 10)` header, `148313` is 148.313 mm on input, while the same
+//! position is written as `1483130` in a resolution-10 session.
+//!
+//! The historical bed-of-nails exporter writes session-scaled integer
+//! coordinates into its design files. Those files identify themselves with
+//! `(host_cad "bed-of-nails")`; for that one producer we divide input geometry by
+//! the resolution factor to preserve the established handoff contract.
 //!
 //! KiCad emits DSN with y pointing *up* but written as negative numbers; we keep
 //! coordinates exactly as written (only scaled to mm) since the router only cares
@@ -387,6 +392,20 @@ fn unit_to_mm(unit: &str) -> Result<f64> {
     })
 }
 
+/// Whether this design uses the historical bed-of-nails convention where DSN
+/// input coordinates are already multiplied by the resolution factor.
+///
+/// Keep this producer check deliberately narrow. Standard Specctra/KiCad input
+/// coordinates are expressed directly in the declared physical unit.
+fn uses_resolution_scaled_input(pcb: &Sexpr) -> bool {
+    pcb.child_named("parser")
+        .and_then(|parser| parser.child_named("host_cad"))
+        .and_then(|host| host.as_list())
+        .and_then(|items| items.get(1))
+        .and_then(Sexpr::as_atom)
+        .is_some_and(|host| host.eq_ignore_ascii_case("bed-of-nails"))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -434,7 +453,12 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     if !divisor.is_finite() || divisor <= 0.0 {
         bail!("DSN resolution divisor must be positive and finite, got {divisor}");
     }
-    let mm_per_raw = unit_to_mm(unit)?;
+    let input_factor = if uses_resolution_scaled_input(pcb) {
+        divisor
+    } else {
+        1.0
+    };
+    let mm_per_raw = unit_to_mm(unit)? / input_factor;
     let to_mm = |raw: f64| raw * mm_per_raw;
 
     let structure = pcb
@@ -1399,6 +1423,41 @@ mod tests {
         // 1000 raw units at resolution 1 and 10000 at resolution 10.
         assert_eq!(one.units_per_mm(), 1_000.0);
         assert_eq!(ten.units_per_mm(), 10_000.0);
+    }
+
+    #[test]
+    fn bed_of_nails_scaled_input_retains_legacy_geometry_and_session_precision() {
+        let standard = r#"(pcb "standard"
+            (parser (host_cad "KiCad's Pcbnew"))
+            (resolution um 10)
+            (structure
+              (layer F.Cu (type signal))
+              (layer B.Cu (type signal))
+              (boundary (rect pcb 0 0 1300000 1515750))
+              (via "Via[0-1]_450:200_um")
+              (rule (width 1500)))
+            (library
+              (padstack "Via[0-1]_450:200_um"
+                (shape (circle F.Cu 4500))
+                (shape (circle B.Cu 4500)))))"#;
+        let legacy = standard.replace("KiCad's Pcbnew", "BED-OF-NAILS");
+
+        let standard = dsn_to_ingest(standard).unwrap();
+        let legacy = dsn_to_ingest(&legacy).unwrap();
+
+        assert_eq!(standard.stats.board_w_mm, 1300.0);
+        assert_eq!(standard.stats.board_h_mm, 1515.75);
+        assert_eq!(standard.stats.min_trace_width_mm, 1.5);
+        assert_eq!(standard.via_geometry.as_ref().unwrap().pad_diameter_mm, 4.5);
+
+        assert_eq!(legacy.stats.board_w_mm, 130.0);
+        assert!((legacy.stats.board_h_mm - 151.575).abs() < 1e-12);
+        assert_eq!(legacy.stats.min_trace_width_mm, 0.15);
+        assert_eq!(legacy.via_geometry.as_ref().unwrap().pad_diameter_mm, 0.45);
+
+        // Both producers write resolution-scaled integer coordinates to SES.
+        assert_eq!(standard.units_per_mm(), 10_000.0);
+        assert_eq!(legacy.units_per_mm(), 10_000.0);
     }
 
     #[test]
