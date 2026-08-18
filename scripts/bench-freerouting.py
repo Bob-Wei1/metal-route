@@ -704,6 +704,7 @@ def compare_engines(
             "faster_engine": None,
             "wall_time_factor": None,
             "post_reload_quality_equal": None,
+            "quality_gated_speedup": None,
         }
     if workload["status"] != "matched":
         return {
@@ -711,6 +712,7 @@ def compare_engines(
             "faster_engine": None,
             "wall_time_factor": None,
             "post_reload_quality_equal": None,
+            "quality_gated_speedup": None,
         }
     metal_wall = metalroute["median_external_wall_seconds"]
     free_wall = freerouting["median_external_wall_seconds"]
@@ -727,6 +729,7 @@ def compare_engines(
             "faster_engine": None,
             "wall_time_factor": None,
             "post_reload_quality_equal": None,
+            "quality_gated_speedup": None,
         }
     if metal_wall <= free_wall:
         faster = "metalroute"
@@ -737,26 +740,53 @@ def compare_engines(
 
     metal_quality = metalroute["post_reload_quality"]
     free_quality = freerouting["post_reload_quality"]
+    metal_counts = {
+        (item["unconnected_items"], item["violations"])
+        for item in metal_quality
+    }
+    free_counts = {
+        (item["unconnected_items"], item["violations"])
+        for item in free_quality
+    }
     quality_equal = (
-        len(metal_quality) == 1
-        and len(free_quality) == 1
-        and metal_quality[0] == free_quality[0]
+        len(metal_counts) == 1
+        and len(free_counts) == 1
+        and metal_counts == free_counts
+    )
+    faster_no_worse = False
+    if len(metal_counts) == 1 and len(free_counts) == 1:
+        metal_unconnected, metal_violations = next(iter(metal_counts))
+        free_unconnected, free_violations = next(iter(free_counts))
+        if faster == "metalroute":
+            faster_no_worse = (
+                metal_unconnected <= free_unconnected
+                and metal_violations <= free_violations
+            )
+        else:
+            faster_no_worse = (
+                free_unconnected <= metal_unconnected
+                and free_violations <= metal_violations
+            )
+    gated_speedup = (
+        {"engine": faster, "factor": factor} if faster_no_worse else None
     )
     return {
         "status": "complete",
         "faster_engine": faster,
-        "wall_time_factor": factor,
+        "wall_time_factor": factor if faster_no_worse else None,
         "median_external_wall_seconds": {
             "metalroute": metal_wall,
             "freerouting": free_wall,
         },
         "post_reload_quality_equal": quality_equal,
+        "quality_gated_speedup": gated_speedup,
         "equal_quality_speedup": (
             {"engine": faster, "factor": factor} if quality_equal else None
         ),
         "interpretation": (
-            "The factor compares fresh-process end-to-end wall time only. It is not "
-            "an equal-quality speedup unless equal_quality_speedup is non-null."
+            "The medians compare fresh-process end-to-end wall time. A factor is "
+            "reported only when the faster engine is no worse in both post-reload "
+            "unconnected-item and violation counts."
         ),
     }
 
@@ -911,19 +941,19 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Freerouting: `{tools['freerouting']['version']}` "
         f"(`{tools['freerouting']['sha256'][:12]}…`)",
         "",
-        "| Fixture | Gate | metalroute median | Freerouting median | Faster wall time | metalroute DRC U / V | Freerouting DRC U / V |",
+        "| Fixture | Gate | metalroute median | Freerouting median | Quality-gated ratio | metalroute DRC U / V | Freerouting DRC U / V |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for fixture in report["fixtures"]:
         comparison = fixture["comparison"]
         metal = fixture["engines"]["metalroute"]
         free = fixture["engines"]["freerouting"]
-        if comparison["status"] == "complete":
-            factor = (
-                f"{comparison['faster_engine']} {comparison['wall_time_factor']:.2f}×"
-            )
-        else:
-            factor = "not reported"
+        speedup = comparison.get("quality_gated_speedup")
+        factor = (
+            f"{speedup['engine']} {speedup['factor']:.2f}×"
+            if speedup is not None
+            else "—"
+        )
         lines.append(
             "| {name} | {gate} | {metal_time} | {free_time} | {factor} | {mq} | {fq} |".format(
                 name=fixture["fixture"]["filename"].replace("|", "\\|"),
@@ -939,8 +969,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         [
             "",
             "`U / V` means Freerouting post-reload unconnected items / violations. "
-            "A displayed factor is an end-to-end wall-time ratio, not an equal-quality "
-            "speedup unless the JSON field `equal_quality_speedup` is non-null.",
+            "A ratio appears only when the faster engine is no worse in both common "
+            "post-reload quality counts. Raw median times remain visible otherwise.",
             "",
             "A ratio is withheld when either input probe fails, the initial workload "
             "counts differ, a route fails, an SES is missing, or Freerouting cannot "

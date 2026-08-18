@@ -170,7 +170,8 @@
             "status",
             "faster_engine",
             "wall_time_factor",
-            "post_reload_quality_equal"
+            "post_reload_quality_equal",
+            "quality_gated_speedup"
           ],
           "properties": {
             "status": {
@@ -191,6 +192,9 @@
             },
             "post_reload_quality_equal": { "type": ["boolean", "null"] },
             "equal_quality_speedup": {
+              "type": ["object", "null"]
+            },
+            "quality_gated_speedup": {
               "type": ["object", "null"]
             }
           }

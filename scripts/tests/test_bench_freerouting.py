@@ -283,6 +283,59 @@ class HarnessTest(unittest.TestCase):
             [path.name for path in dsns], list(bench.OFFICIAL_SMOKE_FIXTURES)
         )
 
+    def test_speed_ratio_requires_faster_engine_to_be_no_worse(self) -> None:
+        compatibility = {
+            "metalroute": {"status": "compatible"},
+            "freerouting": {"status": "compatible"},
+        }
+        workload = {"status": "matched"}
+
+        def engine(wall: float, unconnected: int, violations: int) -> dict:
+            return {
+                "status": "complete",
+                "median_external_wall_seconds": wall,
+                "post_reload_quality": [
+                    {
+                        "unconnected_items": unconnected,
+                        "violations": violations,
+                        "quality_score": 0.0,
+                    }
+                ],
+            }
+
+        faster_but_worse = bench.compare_engines(
+            compatibility,
+            workload,
+            engine(1.0, 0, 2),
+            engine(2.0, 0, 1),
+        )
+        self.assertEqual(faster_but_worse["faster_engine"], "metalroute")
+        self.assertIsNone(faster_but_worse["wall_time_factor"])
+        self.assertIsNone(faster_but_worse["quality_gated_speedup"])
+
+        faster_and_better = bench.compare_engines(
+            compatibility,
+            workload,
+            engine(2.0, 0, 2),
+            engine(1.0, 0, 1),
+        )
+        self.assertEqual(
+            faster_and_better["quality_gated_speedup"],
+            {"engine": "freerouting", "factor": 2.0},
+        )
+
+        equal_counts_different_scores = bench.compare_engines(
+            compatibility,
+            workload,
+            engine(1.0, 0, 1),
+            engine(2.0, 0, 1),
+        )
+        self.assertTrue(equal_counts_different_scores["post_reload_quality_equal"])
+        self.assertEqual(
+            equal_counts_different_scores["equal_quality_speedup"],
+            {"engine": "metalroute", "factor": 2.0},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,17 +62,18 @@ this repository.
   [`DrcRunner.ps1`](https://github.com/freerouting/freerouting/blob/v2.3.0/scripts/benchmark/lib/DrcRunner.ps1)
   benchmark validation path.
 
-The ratio gate is conservative. Before routing, a zero-net metalroute ingest
+The comparison gate is conservative. Before routing, a zero-net metalroute ingest
 probe and a Freerouting baseline DRC probe must both succeed. After routing,
 metalroute's accepted two-point net count must equal Freerouting's baseline
-unconnected-item count, and every SES must reload. If any condition fails, raw
-times remain available for diagnosis but no ratio is published.
+unconnected-item count, and every SES must reload.
 
 Count equality is necessary, not sufficient, for semantic equivalence: the
 programs may still interpret a DSN rule or geometry feature differently. For
 that reason each result reports post-reload unconnected items and violations
-beside wall time. A raw wall-time factor is not called an equal-quality speedup
-unless those quality tuples also match.
+beside wall time. Raw median times remain visible, but a ratio is published only
+when the faster engine is no worse in both unconnected-item and violation count.
+Freerouting's aggregate quality score is retained as diagnostics but is not
+compared with metalroute's unrelated internal cost.
 
 ## Report contract
 
