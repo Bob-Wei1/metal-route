@@ -133,6 +133,11 @@ const PORTFOLIO_CELL_CAP: usize = 250_000;
 /// up to four extra legalization passes from multiplying latency on large boards.
 const ORDER_PORTFOLIO_MIN_GROUPS: usize = 6;
 const ORDER_PORTFOLIO_MAX_GROUPS: usize = 16;
+/// The two-group extension is a final-stage portfolio: it first retains the exact
+/// established result through rip-up, then pays for at most four more legalization
+/// passes and one more bounded rip-up. A tie or loss keeps the established board
+/// and trace byte-for-byte; only a strict final completion gain may replace it.
+const EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS: usize = 18;
 const ORDER_PORTFOLIO_MAX_NETS: usize = 32;
 const ORDER_PORTFOLIO_CELL_CAP: usize = 250_000;
 
@@ -778,6 +783,8 @@ pub struct NegotiatedRouter {
     committed_via_to_trace_guard: bool,
     #[cfg(test)]
     jacobi_scratch_probe: Option<std::sync::Arc<AtomicUsize>>,
+    #[cfg(test)]
+    extended_order_portfolio: bool,
 }
 
 /// Lightweight result of a negotiated route with the isolation diagnosis the
@@ -805,12 +812,20 @@ impl NegotiatedRouter {
             committed_via_to_trace_guard: false,
             #[cfg(test)]
             jacobi_scratch_probe: None,
+            #[cfg(test)]
+            extended_order_portfolio: true,
         }
     }
 
     #[cfg(test)]
     fn with_jacobi_scratch_probe(mut self, probe: std::sync::Arc<AtomicUsize>) -> Self {
         self.jacobi_scratch_probe = Some(probe);
+        self
+    }
+
+    #[cfg(test)]
+    fn without_extended_order_portfolio(mut self) -> Self {
+        self.extended_order_portfolio = false;
         self
     }
 
@@ -993,6 +1008,19 @@ fn should_try_diversified_orders(
         && n_nets <= ORDER_PORTFOLIO_MAX_NETS
         && n_cells <= ORDER_PORTFOLIO_CELL_CAP
         && original_best_routed < alone_routable
+}
+
+fn should_try_extended_diversified_orders(
+    n_groups: usize,
+    n_nets: usize,
+    n_cells: usize,
+    established_routed: usize,
+    alone_routable: usize,
+) -> bool {
+    ((ORDER_PORTFOLIO_MAX_GROUPS + 1)..=EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS).contains(&n_groups)
+        && n_nets <= ORDER_PORTFOLIO_MAX_NETS
+        && n_cells <= ORDER_PORTFOLIO_CELL_CAP
+        && established_routed < alone_routable
 }
 
 /// Four deterministic samples from the cyclic/dihedral order family. They change
@@ -2277,7 +2305,7 @@ impl NegotiatedRouter {
         // TRACE: capture every candidate order's (routed, cost) BEFORE `evaluated` is
         // consumed by the `best_idx` match below. Sorted by candidate index so the
         // list is deterministic and aligns with `candidates`. Read-only.
-        let traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
+        let mut traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
             let mut idxs: Vec<&(usize, usize, u64, Committed)> = evaluated.iter().collect();
             idxs.sort_unstable_by_key(|(idx, _, _, _)| *idx);
             idxs.into_iter()
@@ -2290,7 +2318,7 @@ impl NegotiatedRouter {
                 })
                 .collect()
         });
-        let (best_routed, best_order, multi_committed) = match best_idx {
+        let (best_routed, mut best_order, multi_committed) = match best_idx {
             Some(idx) => {
                 let routed = best.as_ref().map(|b| b.0).unwrap_or(0);
                 // Reclaim the winning committed vec by index without cloning.
@@ -2315,7 +2343,7 @@ impl NegotiatedRouter {
         // re-places the stranded net, and re-enqueues the ripped nets — bounded by
         // a global rip budget so it always terminates. The result is used only if
         // it routes strictly more nets than the multi-order pass (never a regress).
-        let committed = if best_routed < n_nets {
+        let mut committed = if best_routed < n_nets {
             let rip = ripup_legalize(
                 grid,
                 &coords,
@@ -2346,6 +2374,113 @@ impl NegotiatedRouter {
         } else {
             multi_committed
         };
+
+        // The established 6–16-group portfolio above remains structurally
+        // untouched. For only active exact-board masks in the newly admitted
+        // 17–18-group band, evaluate one additional final-stage candidate after the
+        // established result has already completed its ordinary rip-up pass. This
+        // makes the acceptance boundary the public final completion count:
+        // equal-completion alternate seeds cannot churn board or trace bytes merely
+        // because they beat pre-rip legalization. Inactive/legacy grids never enter
+        // this branch, preserving their established bytes across CLI and server.
+        let established_routed = committed.iter().filter(|path| path.is_some()).count();
+        #[cfg(test)]
+        let extended_order_portfolio = self.extended_order_portfolio;
+        #[cfg(not(test))]
+        let extended_order_portfolio = true;
+        if extended_order_portfolio
+            && grid.has_board_constraints()
+            && should_try_extended_diversified_orders(
+                n_groups,
+                n_nets,
+                n_cells,
+                established_routed,
+                alone_routable,
+            )
+        {
+            let extension_orders = diversified_fallback_orders(&base_order, &candidates);
+            let extension_offset = candidates.len();
+            let extension_evaluated = evaluate_orders(&extension_orders, extension_offset);
+            let mut extension_best: Option<(usize, u64, Vec<usize>)> = None;
+            let mut extension_best_idx = None;
+            for (idx, routed, total_cost, _) in &extension_evaluated {
+                let order = &extension_orders[*idx - extension_offset];
+                let better = extension_best.as_ref().is_none_or(|(br, bc, bo)| {
+                    legalization_candidate_is_better(*routed, *total_cost, order, *br, *bc, bo)
+                });
+                if better {
+                    extension_best = Some((*routed, *total_cost, order.clone()));
+                    extension_best_idx = Some(*idx);
+                }
+            }
+
+            let extension_trace: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
+                let mut idxs: Vec<&(usize, usize, u64, Committed)> =
+                    extension_evaluated.iter().collect();
+                idxs.sort_unstable_by_key(|(idx, _, _, _)| *idx);
+                idxs.into_iter()
+                    .map(|(idx, routed, total_cost, _)| CandidateEval {
+                        order: extension_orders[*idx - extension_offset].clone(),
+                        routed: *routed,
+                        total_cost: (*total_cost).min(Cost::MAX as u64) as Cost,
+                    })
+                    .collect()
+            });
+
+            if let (Some(idx), Some((extension_routed, _, extension_order))) =
+                (extension_best_idx, extension_best)
+            {
+                let extension_seed = extension_evaluated
+                    .into_iter()
+                    .find(|(candidate_idx, _, _, _)| *candidate_idx == idx)
+                    .map(|(_, _, _, candidate)| candidate)
+                    .unwrap_or_else(|| vec![None; n_nets]);
+                let extension_committed = if extension_routed < n_nets {
+                    let rip = ripup_legalize(
+                        grid,
+                        &coords,
+                        &heuristic_costs,
+                        &mut buf,
+                        &mut pad_set,
+                        nets,
+                        group_ids,
+                        &alone_path,
+                        &paths,
+                        &windows,
+                        &extension_order,
+                        &extension_seed,
+                        n_cells,
+                        &via_model,
+                        self.clearance_mm,
+                        self.via_spacing_mm,
+                        self.via_hole_spacing_mm,
+                        self.committed_via_to_trace_guard,
+                        has_zero_cost,
+                    );
+                    let rip_routed = rip.iter().filter(|path| path.is_some()).count();
+                    if rip_routed > extension_routed {
+                        rip
+                    } else {
+                        extension_seed
+                    }
+                } else {
+                    extension_seed
+                };
+                let extension_final_routed = extension_committed
+                    .iter()
+                    .filter(|path| path.is_some())
+                    .count();
+                if extension_final_routed > established_routed {
+                    committed = extension_committed;
+                    best_order = extension_order;
+                    if let (Some(candidates), Some(extension)) =
+                        (&mut traced_candidates, extension_trace)
+                    {
+                        candidates.extend(extension);
+                    }
+                }
+            }
+        }
         // TRACE: legalization result — the per-net alone paths (ratsnest / ideal
         // overlay), the chosen group order, every candidate order's score, and the
         // final committed routes. No-op for the production route.
@@ -4713,6 +4848,13 @@ mod tests {
             5,
             6,
         ));
+        assert!(eligible(
+            ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
         assert!(!eligible(
             ORDER_PORTFOLIO_MIN_GROUPS - 1,
             ORDER_PORTFOLIO_MAX_NETS,
@@ -4748,6 +4890,122 @@ mod tests {
             6,
             6,
         ));
+    }
+
+    #[test]
+    fn extended_order_trigger_is_exact_and_resource_bounded() {
+        let eligible = |groups, nets, cells, routed, alone| {
+            should_try_extended_diversified_orders(groups, nets, cells, routed, alone)
+        };
+
+        assert!(eligible(
+            ORDER_PORTFOLIO_MAX_GROUPS + 1,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(eligible(
+            EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS + 1,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS + 1,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP + 1,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            EXTENDED_ORDER_PORTFOLIO_MAX_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn extended_order_final_tie_preserves_established_board_alone_and_trace_bytes() {
+        let dims = Dims::new(13, 13);
+        let mut grid = Grid::filled(dims, OBSTACLE);
+        grid.board_constraint = vec![0; dims.len()];
+        for x in 0..13 {
+            grid.set(dims.idx(x, 6), 1);
+        }
+        for y in 0..13 {
+            grid.set(dims.idx(6, y), 1);
+        }
+        let mut nets = vec![
+            net("a", dims.idx(0, 6), dims.idx(12, 6)),
+            net("b", dims.idx(6, 0), dims.idx(6, 12)),
+        ];
+        let isolated: Vec<_> = [0, 2, 10, 12]
+            .into_iter()
+            .flat_map(|y| [0, 2, 10, 12].into_iter().map(move |x| (x, y)))
+            .take(15)
+            .collect();
+        for (i, (x, y)) in isolated.into_iter().enumerate() {
+            let cell = dims.idx(x, y);
+            grid.set(cell, 1);
+            nets.push(net(&format!("d{i}"), cell, cell));
+        }
+        assert_eq!(nets.len(), ORDER_PORTFOLIO_MAX_GROUPS + 1);
+
+        let established_router = NegotiatedRouter::new().without_extended_order_portfolio();
+        let established = established_router.route_with_outcome(&grid, &nets).unwrap();
+        let (established_board, established_trace) =
+            established_router.route_traced(&grid, &nets).unwrap();
+        assert_eq!(established.board, established_board);
+        assert_eq!(established.board.results.len(), nets.len() - 1);
+        assert!(should_try_extended_diversified_orders(
+            nets.len(),
+            nets.len(),
+            dims.len(),
+            established.board.results.len(),
+            nets.len(),
+        ));
+
+        let extended_router = NegotiatedRouter::new();
+        let extended = extended_router.route_with_outcome(&grid, &nets).unwrap();
+        let (extended_board, extended_trace) = extended_router.route_traced(&grid, &nets).unwrap();
+        assert_eq!(extended, established);
+        assert_eq!(extended_board, established_board);
+        assert_trace_eq(&extended_trace, &established_trace);
+        assert_eq!(
+            extended_trace
+                .legalization
+                .as_ref()
+                .unwrap()
+                .candidates
+                .len(),
+            3,
+            "a rejected extension must not leak extra candidates into the trace"
+        );
     }
 
     #[test]

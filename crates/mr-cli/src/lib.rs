@@ -2691,6 +2691,77 @@ mod tests {
         assert!(drc_candidate_is_not_worse(&legacy_drc, &selected_drc));
     }
 
+    /// Extending the already-bounded dihedral sample through 18 connection groups
+    /// gives this board a different first claimant, recovering one constrained
+    /// route while improving the authoritative final-soup DRC result.
+    #[test]
+    #[ignore = "affected real-board regression; run explicitly in release"]
+    fn bugreport09_extended_dihedral_order_recovers_one_safe_route() {
+        let srj = bugreport("bugreport09-618e09.srj.json");
+        let (traces, summary, _) = route_problem(&srj, None, RouterKind::Negotiated, None)
+            .expect("route bugreport09 with the bounded order portfolio");
+        assert_eq!(
+            (summary.routed, summary.total, summary.total_cost),
+            (26, 27, 2192)
+        );
+
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &traces,
+            routed_via_pad_diameter_mm(&srj),
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+        let violations = check_srj_solution(&srj, &traces, srj.layer_count.max(1));
+        assert_eq!(
+            violations.len(),
+            2,
+            "the recovered route must retain the measured exact DRC improvement: {violations:#?}"
+        );
+        assert!(violations.iter().all(|finding| {
+            finding.nets.0 != BOARD_EDGE_NET && finding.nets.1 != BOARD_EDGE_NET
+        }));
+    }
+
+    /// This board's original legalization routes 16 nets and its established
+    /// rip-up reaches 17. An extended order also reaches 17 before rip-up, so the
+    /// final-stage strict-gain gate must retain the established soup exactly.
+    #[test]
+    #[ignore = "affected real-board byte-regression control; run explicitly in release"]
+    fn bugreport43_extended_order_tie_preserves_established_soup() {
+        let srj = bugreport("bugreport43-e0f33a.srj.json");
+        let (traces, summary, _) = route_problem(&srj, None, RouterKind::Negotiated, None)
+            .expect("route bugreport43 with the final-stage order gate");
+        assert_eq!(
+            (summary.routed, summary.total, summary.total_cost),
+            (17, 31, 3748)
+        );
+
+        assert!(mr_srj::solution_respects_board_outline(
+            &srj,
+            &traces,
+            routed_via_pad_diameter_mm(&srj),
+            srj.layer_count.max(1),
+        )
+        .unwrap());
+        let violations = check_srj_solution(&srj, &traces, srj.layer_count.max(1));
+        assert_eq!(violations.len(), 18);
+        assert!(violations.iter().all(|finding| {
+            finding.nets.0 != BOARD_EDGE_NET && finding.nets.1 != BOARD_EDGE_NET
+        }));
+
+        let digest = serde_json::to_vec_pretty(&traces)
+            .unwrap()
+            .into_iter()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        assert_eq!(
+            digest, 0x34c5c7b3a54ef051,
+            "equal final completion must preserve the established serialized soup"
+        );
+    }
+
     fn assert_edge_clean_fixture_preserves_exact_legacy_route(name: &str) {
         let srj = bugreport(name);
         let legacy_srj = without_board_edge(srj.clone());
