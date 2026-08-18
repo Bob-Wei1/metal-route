@@ -25,8 +25,10 @@ The canonical current report SHA-256 is
 `8e52c3ab9a17188e28ab73d4d4314774261ea9dbdca3ba0367a4f583ccabf35f`;
 an independent repeat is
 `4749ed5f97fdd1dca69840bccc58f3c9befc02823be5a79ae6f02ef944ade345`.
-After removing timing fields, both current reports have semantic SHA-256
-`7e929cd433bd966d3b07a928d3b4b178e1e2d565e80916767ecf820f8a19230a`.
+After deleting `.total_wall_ms`, `.nets_per_sec`, each group `total_wall_ms`, and
+each board `wall_ms`, then serializing compact JSON with sorted keys, both current
+reports have SHA-256
+`c8e11c7d5fef04dbbd3d7659dd1a5d66d80887be51ee916a7f11881dd3ffc1d1`.
 
 At `f6c7fb0`, none of the locked corpus boards activated the fail-closed typed
 profile (0/112). Its raw corpus report SHA-256 is
@@ -125,9 +127,11 @@ Important new families:
   enforceable. Supported inputs resolve uniform board/per-connection trace width,
   generic `minClearance`/`defaultObstacleMargin`, trace↔pad (also governing
   via↔trace), via↔pad, optional pad↔pad and drill↔drill clearances, and exact
-  declared routed via pad/hole diameters. All supplied aliases must agree, via
-  geometry must satisfy the annular minimum, and pair-specific obstacle rules must
-  conservatively dominate the generic rule.
+  declared routed via pad/hole diameters. Per-connection width and via-diameter
+  aliases must agree. When both generic fields are present, the established
+  `minClearance` value takes precedence over `defaultObstacleMargin`; via geometry
+  must satisfy the annular minimum, and pair-specific obstacle rules must
+  conservatively dominate the resolved generic rule.
 - The typed gate fails closed unless pads are finite, connected, unrotated rects
   or conservative circle bounds and every routed terminal is covered only by pads
   that resolve unambiguously to its electrical group. Partial rules,

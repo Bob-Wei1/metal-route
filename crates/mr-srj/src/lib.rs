@@ -263,8 +263,10 @@ impl SimpleRouteJson {
     /// router can faithfully enforce.
     ///
     /// The profile is deliberately coherence-gated: all dynamic feature-pair
-    /// rules and via geometry must be present and finite, every supplied alias must
-    /// agree, the declared geometry must satisfy the annular-ring minimum, and every
+    /// rules and via geometry must be present and finite, per-connection width and
+    /// via-diameter aliases must agree, and the declared geometry must satisfy the
+    /// annular-ring minimum. When both generic fields are present, the established
+    /// `minClearance` value takes precedence over `defaultObstacleMargin`. Every
     /// connection must resolve to one common nominal width at or above
     /// `minTraceWidth`. Every obstacle must also be connected, finite, axis-aligned,
     /// and a supported rect/circle representation. Every terminal must sit in at

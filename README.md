@@ -221,8 +221,9 @@ raising fully-routed-clean boards **66 → 70**. It cleans `sample13`, `sample18
 `sample19`, and `sample23` (two findings each) and removes one of five findings
 from `sample44`; no board worsens. The canonical final report SHA-256 is
 `8e52c3ab9a17188e28ab73d4d4314774261ea9dbdca3ba0367a4f583ccabf35f`.
-Its timing-stripped semantics match the independent repeat at SHA-256
-`7e929cd433bd966d3b07a928d3b4b178e1e2d565e80916767ecf820f8a19230a`.
+Deleting the report-level and per-board timing/rate fields and serializing with
+sorted keys gives the same independent-repeat SHA-256,
+`c8e11c7d5fef04dbbd3d7659dd1a5d66d80887be51ee916a7f11881dd3ffc1d1`.
 Final group physical totals are 295 DRC findings/35 clean/29 fully-routed-clean
 for `bug-reports` and 139/41/41 for `srj15`.
 
@@ -261,9 +262,11 @@ physical fields only when they form one coherent, uniformly enforceable profile.
 The supported subset resolves board/per-connection trace width, generic
 `minClearance`/`defaultObstacleMargin`, trace↔pad (also used for via↔trace),
 via↔pad, optional pad↔pad and drill↔drill clearances, and exact declared
-routed via pad/hole diameters. Aliases must agree; via geometry must satisfy the
-annular minimum; pads must be finite, connected, unrotated rects or conservative
-circle bounds; and every terminal must be covered only by pads
+routed via pad/hole diameters. Per-connection width and via-diameter aliases must
+agree; when both generic fields are present, the established `minClearance`
+value takes precedence over `defaultObstacleMargin`. Via geometry must satisfy
+the annular minimum; pads must be finite, connected, unrotated rects or
+conservative circle bounds; and every terminal must be covered only by pads
 that resolve unambiguously to its electrical group. Partial, mixed-width, or
 ambiguous inputs fail closed to the established legacy policy.
 
