@@ -161,20 +161,22 @@ pub fn solution_to_drc_board(
 
     // Reconstruct the per-trace electrical-net identity exactly as the DRC sees it.
     let net_name = reconstruct_net_labels(srj, traces);
-    // Trace vertices tagged with their net, for pad-net resolution below.
-    let mut tagged_vertices: Vec<(f64, f64, String)> = Vec::new();
+    // Immutable trace endpoints tagged with their net, for legacy pad-net
+    // resolution below. Interior geometry may move during exact repair and must
+    // never acquire ownership of a foreign pad merely by entering it.
+    let mut tagged_endpoints: Vec<(f64, f64, String)> = Vec::new();
 
     // Traces first (stable: outer index, then route order) so layer indices are
     // deterministic and same-net immunity holds within each net component.
     for (i, t) in traces.iter().enumerate() {
         let net = net_name[i].clone();
-        // Record every vertex tagged with this net so an obstacle can be matched
-        // to the net that terminates inside it.
-        for rp in &t.route {
+        // Only route terminals establish ownership for an unlabelled legacy pad.
+        // The first/last coordinates are fixed by every geometry repair pass.
+        for rp in t.route.first().into_iter().chain(t.route.last()) {
             let (x, y) = match rp {
                 RoutePoint::Wire { x, y, .. } | RoutePoint::Via { x, y, .. } => (*x, *y),
             };
-            tagged_vertices.push((x, y, net.clone()));
+            tagged_endpoints.push((x, y, net.clone()));
         }
         // Walk the route, emitting every physical wire leg and one Via per Via
         // point. `to_solution_layered` compresses a vertical run into a Via and
@@ -254,7 +256,7 @@ pub fn solution_to_drc_board(
     // contact is immune. An obstacle no trace lands in is foreign copper / a keepout
     // and keeps net `None` (conflicts with every net — never hides a real short).
     for o in &srj.obstacles {
-        let net = pad_net(o, &tagged_vertices);
+        let net = pad_net(o, &tagged_endpoints);
         // A pad declaring a connectivity net is labelled `c<net>` to match the
         // traces relabelled above, so the pad is immune to EVERY trace of its own
         // electrical net (including the many sub-nets that share a junction pad). A
@@ -305,7 +307,7 @@ fn quantize(v: f64) -> i64 {
 /// The electrical net of obstacle `o`. Prefer the ground-truth `connectivity_netNNNN`
 /// it declares (labelled `c<net>` to match the connectivity-relabelled traces), so a
 /// pad is immune to its own net even when several router sub-nets share it. With no
-/// declared connectivity net, fall back to the net of whichever tagged trace vertex
+/// declared connectivity net, fall back to the net of whichever tagged trace endpoint
 /// lands inside the pad rect (inclusive); failing that, `None` (foreign / keepout —
 /// conflicts with every net, never hiding a real short).
 fn pad_net(o: &mr_srj::Obstacle, tagged: &[(f64, f64, String)]) -> Option<String> {

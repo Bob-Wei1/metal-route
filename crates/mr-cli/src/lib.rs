@@ -1961,15 +1961,15 @@ mod tests {
     }
 
     /// Dense four-layer fixture: one exact one-clearance rigid via translation
-    /// removes three findings while introducing one milder finding (38 -> 36),
+    /// reduces the endpoint-owned legacy-pad baseline from 32 to 30 findings,
     /// without changing any of its 26 routed nets, endpoints, or via spans.
     #[test]
     fn sample11_bounded_via_repair_reduces_exact_drc() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample11-region-reroute.srj.json",
             26,
-            38,
-            36,
+            32,
+            30,
         );
     }
 

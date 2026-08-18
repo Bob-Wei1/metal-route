@@ -1155,15 +1155,18 @@ fn features_by_layer(traces: &[PcbTrace], obstacles: &[Obstacle]) -> LayerFeatur
                 .map(|declared| format!("c{declared}"))
                 .or_else(|| {
                     // Match the authoritative DRC fallback for legacy pads without a
-                    // connectivity id: the first labelled trace vertex contained by
-                    // the pad owns it. Untagged traces remain conservative/foreign.
+                    // connectivity id: only an immutable first/last trace endpoint
+                    // contained by the pad owns it. Interior vertices may move and
+                    // must never claim a foreign pad. Untagged traces remain foreign.
                     let (cx, cy) = (o.center.x, o.center.y);
                     let (hw, hh) = (o.width / 2.0, o.height / 2.0);
                     traces.iter().find_map(|trace| {
                         let net = trace.net.as_ref()?;
                         trace
                             .route
-                            .iter()
+                            .first()
+                            .into_iter()
+                            .chain(trace.route.last())
                             .any(|point| {
                                 let (x, y) = match point {
                                     RoutePoint::Wire { x, y, .. }
@@ -1545,6 +1548,43 @@ mod tests {
             pts_of(&b),
             "same-net copper must not be nudged"
         );
+    }
+
+    #[test]
+    fn legacy_pad_ownership_uses_only_immutable_trace_endpoints() {
+        let trace = PcbTrace::new(vec![wire(-2.0, 0.0), wire(0.0, 0.0), wire(2.0, 0.0)])
+            .with_net("legacy-net");
+        let legacy_pad = |x| Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x,
+                y: 0.0,
+                layer: None,
+            },
+            width: 0.2,
+            height: 0.2,
+            layers: vec!["top".into()],
+            connected_to: Vec::new(),
+        };
+
+        let context = features_by_layer(
+            std::slice::from_ref(&trace),
+            &[legacy_pad(0.0), legacy_pad(2.0)],
+        );
+        let foreign = context.foreign_for_layer(0, "top");
+        assert_eq!(
+            foreign.len(),
+            1,
+            "the interior point's pad stays foreign while the terminal pad is own-net"
+        );
+        assert!(matches!(
+            foreign[0],
+            Feature::Rect {
+                c: (0.0, 0.0),
+                net: None,
+                ..
+            }
+        ));
     }
 
     /// (D3) A via landing that grazes a foreign track is nudged — together with its two

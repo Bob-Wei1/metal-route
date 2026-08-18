@@ -460,7 +460,7 @@ fn added_copper_length(before: f64, candidate: f64) -> u64 {
 mod tests {
     use super::*;
     use mr_drc::LayerKind;
-    use mr_srj::{Bounds, Point};
+    use mr_srj::{Bounds, Obstacle, Point};
 
     fn wire(x: f64, y: f64, layer: &str) -> RoutePoint {
         RoutePoint::Wire {
@@ -646,5 +646,55 @@ mod tests {
             traces,
             "equal-count candidate geometry must not churn the soup"
         );
+    }
+
+    #[test]
+    fn interior_via_cannot_claim_a_foreign_legacy_pad() {
+        let mut srj = open_srj();
+        // The pad sits on an intermediate layer crossed only by the target via.
+        // Its legacy input carries no connectivity identity, so no route owns it.
+        srj.obstacles = vec![Obstacle {
+            kind: "rect".into(),
+            center: Point {
+                x: 0.19,
+                y: 0.0,
+                layer: None,
+            },
+            width: 0.1,
+            height: 0.1,
+            layers: vec!["inner1".into()],
+            connected_to: Vec::new(),
+        }];
+        // Establish deterministic top/inner1/bottom physical layer indices. The
+        // two dummy traces are far from the target geometry and the legacy pad.
+        let traces = vec![
+            PcbTrace::new(vec![wire(-4.0, -4.0, "top"), wire(-3.0, -4.0, "top")])
+                .with_net("top-dummy"),
+            PcbTrace::new(vec![wire(-4.0, -3.0, "inner1"), wire(-3.0, -3.0, "inner1")])
+                .with_net("inner-dummy"),
+            compressed_trace(0.0),
+        ];
+        let rules = DrcRules {
+            clearance: 0.15,
+            plane_antipad: 0.2,
+            min_annular_ring: 0.1,
+        };
+
+        let before_board = drc_board::solution_to_drc_board(&srj, &traces, rules, 3);
+        assert_eq!(before_board.pads[0].net, None);
+        assert_eq!(
+            before_board.check().len(),
+            1,
+            "fixture has one via-pad finding"
+        );
+
+        let repaired = repair_clearance_vias(&srj, traces.clone(), rules, 3);
+        assert_eq!(
+            repaired, traces,
+            "entering an unlabelled foreign pad must not erase its only finding by relabelling it"
+        );
+        let after_board = drc_board::solution_to_drc_board(&srj, &repaired, rules, 3);
+        assert_eq!(after_board.pads[0].net, None);
+        assert_eq!(after_board.check().len(), 1);
     }
 }
