@@ -40,7 +40,8 @@
 //!
 //! The router contract is strictly two-point. A connection with `k` points in
 //! `pointsToConnect` is decomposed into `k-1` consecutive two-point
-//! [`mr_core::NetEndpoints`] in chain order (point[0]→point[1], point[1]→point[2],
+//! [`mr_core::NetEndpoints`] in chain order (`point[0]`→`point[1]`,
+//! `point[1]`→`point[2]`,
 //! …). When `k > 2` the resulting nets are named `"<conn.name>#0"`,
 //! `"<conn.name>#1"`, …; a plain two-point connection keeps the bare `conn.name`.
 //! Connections with fewer than two points produce no nets.
@@ -893,10 +894,10 @@ pub fn rasterize(srj: &SimpleRouteJson, resolution: f64) -> RasterizedProblem {
 /// `layers.len()` planes; `rasterize` is the standard-naming special case.
 ///
 /// The planar grid is **non-uniform / Hanan**: rather than uniform cells of size
-/// `resolution`, [`build_grid_lines`] draws per-axis lines through every pad
+/// `resolution`, `build_grid_lines` draws per-axis lines through every pad
 /// endpoint and obstacle edge (plus the board bounds and fill channels) so each pad
 /// lands on an exact node — this is what removes the pad-exit wiggle (see
-/// [`build_grid_lines`] and `trace_route`). `resolution` no longer sizes the cells;
+/// `build_grid_lines` and `trace_route`). `resolution` no longer sizes the cells;
 /// it is the fill-channel spacing fallback when the problem omits a track width.
 ///
 /// `clearance_cells` reserves a copper-to-copper clearance halo around every pad.

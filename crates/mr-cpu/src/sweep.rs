@@ -30,7 +30,7 @@
 //! acyclic while the lower [`CellIdx`] predecessor pins deterministic ties.
 //!
 //! On `tie_break_2x2` this greedy descent reproduces the BFS path `[0, 1, 3]` —
-//! see [`tests::sweep_tie_break_reproduces_path`]. More generally, every valid
+//! see `tests::sweep_tie_break_reproduces_path`. More generally, every valid
 //! predecessor of a cell has the same shortest distance and one fewer canonical
 //! hop, so backward lowest-index selection matches the CPU shortest-path label.
 //! The exhaustive 3×3 mask test pins this equivalence for every source/target pair.

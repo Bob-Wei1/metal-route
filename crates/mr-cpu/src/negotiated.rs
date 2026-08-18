@@ -60,9 +60,9 @@ use crate::dijkstra::{astar_buf, edge_cost, SearchBuf, COST_SCALE};
 
 /// Fixed-point cost scale: the base cost of one unit of planar travel.
 ///
-/// Numerically equal to [`COST_SCALE`] (`16`): a planar step of unit geometric
+/// Numerically equal to `COST_SCALE` (`16`): a planar step of unit geometric
 /// length costs `SCALE`, and on a non-uniform grid a step of length `len` costs
-/// `round(len * COST_SCALE)` (see [`edge_cost`]). All congestion penalties below are
+/// `round(len * COST_SCALE)` (see `edge_cost`). All congestion penalties below are
 /// expressed in multiples of `SCALE`, so they keep their strength *relative to the
 /// geometric base step* regardless of the board's physical pitch. On a uniform grid
 /// every step has length 1, so the base step is exactly `SCALE` and the whole cost

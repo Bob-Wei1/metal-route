@@ -3,9 +3,9 @@
 //! This crate ports the single-source distance-field computation behind the
 //! routers onto Apple-Silicon GPUs via Metal compute kernels (the `metal`
 //! crate). The CPU implementation in `mr-cpu` is the correctness ORACLE: every
-//! field this crate produces must equal [`mr_cpu::bfs_distance_field`] /
-//! [`mr_cpu::sweep_distance_field`] element-wise, and routed boards must be
-//! `mr_oracle::are_equivalent` to [`mr_cpu::LeeRouter`].
+//! field this crate produces must equal `mr_cpu::bfs_distance_field` /
+//! `mr_cpu::sweep_distance_field` element-wise, and routed boards must be
+//! `mr_oracle::are_equivalent` to `mr_cpu::LeeRouter`.
 //!
 //! Two kernels are implemented, both atomic-free with ping-pong buffers:
 //!
@@ -17,7 +17,7 @@
 //! * **M4 — separable H/V prefix-min sweep** ([`metal_sweep_field`]). One kernel
 //!   owns a row and runs a serial L→R then R→L prefix-min; another owns a column
 //!   and runs U→D then D→U. H/V passes alternate until convergence. This mirrors
-//!   [`mr_cpu::sweep_distance_field`] exactly.
+//!   `mr_cpu::sweep_distance_field` exactly.
 //! * **Batched M4** ([`metal_sweep_fields`]). Independent source fields are packed
 //!   into one buffer and dispatched together, amortising shader compilation,
 //!   command submission, and CPU↔GPU synchronization across a board's nets.
@@ -110,7 +110,7 @@ mod gpu;
 /// Single-source distance field via the naive atomic-free wavefront kernel (M3).
 ///
 /// Returns `dist` indexed by [`CellIdx`]; unreachable cells (and an obstacle
-/// source) are `Cost::MAX`. Equal to [`mr_cpu::bfs_distance_field`].
+/// source) are `Cost::MAX`. Equal to `mr_cpu::bfs_distance_field`.
 #[cfg(target_os = "macos")]
 pub fn metal_wavefront_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
     gpu::wavefront_field(grid, src)
@@ -126,8 +126,8 @@ pub fn metal_wavefront_field(_grid: &Grid, _src: CellIdx) -> Result<Vec<Cost>, R
 
 /// Single-source distance field via the separable H/V prefix-min sweep kernels
 /// (M4). Returns `dist` indexed by [`CellIdx`]; unreachable cells are
-/// `Cost::MAX`. Equal to [`mr_cpu::sweep_distance_field`] and
-/// [`mr_cpu::bfs_distance_field`].
+/// `Cost::MAX`. Equal to `mr_cpu::sweep_distance_field` and
+/// `mr_cpu::bfs_distance_field`.
 #[cfg(target_os = "macos")]
 pub fn metal_sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> {
     gpu::sweep_field(grid, src)
@@ -206,7 +206,7 @@ fn metal_sweep_fields_flat_with_costs(
 ///
 /// It computes nets' distance fields in memory-bounded GPU batches, then
 /// reconstructs each path from GPU-computed distance and minimum-hop labels so
-/// the result follows the same canonical contract as [`mr_cpu::LeeRouter`].
+/// the result follows the same canonical contract as `mr_cpu::LeeRouter`.
 /// Per-net passable pad cells are represented by a packed cost plane, preserving
 /// the shared router contract without giving up batching. Unreachable nets land in
 /// [`BoardRoute::unrouted`].

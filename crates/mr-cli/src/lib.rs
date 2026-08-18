@@ -6,7 +6,7 @@
 //!
 //! Subcommands:
 //!
-//! * [`run_route`] — read a tscircuit [`SimpleRouteJson`](mr_srj::SimpleRouteJson)
+//! * [`run_route`] — read a tscircuit [`SimpleRouteJson`]
 //!   problem, rasterise it, route it (Lee or rip-up), and emit the routed
 //!   solution soup as JSON.
 //! * [`run_project`] — print the M2 [`project_speedup`](mr_bench::project_speedup)

@@ -5,7 +5,8 @@
 //! one battery. A fixture optionally pins:
 //!
 //! * `expected_total_cost` — a hand-computed shortest-path cost, and/or
-//! * `expected_path` — the exact path of `nets[0]` under [`TieBreak::LowerCellIdx`],
+//! * `expected_path` — the exact path of `nets[0]` under
+//!   [`mr_core::TieBreak::LowerCellIdx`],
 //!   used to prove the tie-break is reproduced (plan R2).
 //!
 //! The "golden-grid format" is a tiny ASCII grid ([`parse_ascii`]):

@@ -4,7 +4,7 @@
 //! Two responsibilities:
 //!
 //! 1. [`time_router`] — a tiny, allocation-light wrapper that runs any
-//!    [`Router`](mr_core::Router) over a board and reports wall time plus a few
+//!    [`Router`] over a board and reports wall time plus a few
 //!    derived throughput numbers ([`RouteTiming`]). Used both by the Criterion
 //!    benchmark under `benches/` and by callers that want a cheap one-shot timing.
 //!

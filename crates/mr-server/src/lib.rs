@@ -77,7 +77,7 @@ pub const DEFAULT_SOLVE_LAYERS: u32 = 2;
 /// Hanan line arrays). Both are board-dependent, so they cannot be baked into a
 /// single shared router; instead `main.rs` supplies this factory and `lib.rs`
 /// stays backend-agnostic (a Metal backend can honour or ignore either input).
-/// The CPU [`NegotiatedRouter`](mr_cpu::NegotiatedRouter) prices A* moves by the
+/// The CPU [`NegotiatedRouter`] prices A* moves by the
 /// geometric step length read off these coords AND keeps the inter-net clearance
 /// halo at `clearance_mm` over the same coords, so passing the real Hanan coords
 /// (rather than a uniform fallback) is what keeps cost/heuristic/spacing correct on
