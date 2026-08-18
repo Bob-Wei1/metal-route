@@ -46,6 +46,9 @@ jobs:
             --out "$RUNNER_TEMP/bugreport21-solution.json"
           test -s "$RUNNER_TEMP/bugreport21-solution.json"
 
+      - name: Freerouting comparison harness tests
+        run: python3 scripts/tests/test_bench_freerouting.py
+
       - name: Metal build (compile-only; GPU may be unavailable on runners)
         run: cargo build -p mr-metal
 

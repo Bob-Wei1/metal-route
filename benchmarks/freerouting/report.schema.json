@@ -1,0 +1,306 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Bob-Wei1/metal-route/main/benchmarks/freerouting/report.schema.json",
+  "title": "metalroute / Freerouting same-DSN speed report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "methodology",
+    "system",
+    "tools",
+    "fixtures"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "metalroute.freerouting-speed.v1"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "methodology": {
+      "type": "object",
+      "required": [
+        "timed_scope",
+        "excluded_from_timing",
+        "repetitions",
+        "statistic",
+        "fixture_profile",
+        "freerouting_profile",
+        "freerouting_max_passes",
+        "external_timeout_seconds",
+        "router_worker_policy",
+        "validation",
+        "comparison_gate"
+      ],
+      "properties": {
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "warmups": { "const": 0 },
+        "statistic": { "const": "median" },
+        "freerouting_max_passes": { "type": "integer", "minimum": 1 },
+        "external_timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "freerouting_profile": {
+          "type": "object",
+          "required": [
+            "upstream",
+            "max_passes",
+            "max_threads",
+            "heap_initial",
+            "heap_max",
+            "job_timeout",
+            "fanout_timeout",
+            "optimizer_timeout",
+            "fanout_enabled",
+            "router_enabled",
+            "optimizer_enabled",
+            "file_log_level",
+            "matches_official_defaults"
+          ],
+          "properties": {
+            "max_passes": { "type": "integer", "minimum": 1 },
+            "max_threads": { "const": 1 },
+            "heap_initial": { "const": "256m" },
+            "heap_max": { "const": "8g" },
+            "fanout_timeout": { "const": "00:15:00" },
+            "optimizer_timeout": { "const": "00:10:00" },
+            "fanout_enabled": { "const": true },
+            "router_enabled": { "const": true },
+            "optimizer_enabled": { "const": true },
+            "file_log_level": { "const": "INFO" },
+            "matches_official_defaults": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "system": {
+      "type": "object"
+    },
+    "tools": {
+      "type": "object",
+      "required": ["metalroute", "freerouting", "java"],
+      "properties": {
+        "metalroute": { "$ref": "#/$defs/binary" },
+        "freerouting": {
+          "allOf": [
+            { "$ref": "#/$defs/binary" },
+            {
+              "type": "object",
+              "required": ["version"],
+              "properties": { "version": { "const": "2.3.0" } }
+            }
+          ]
+        }
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fixture" }
+    }
+  },
+  "$defs": {
+    "binary": {
+      "type": "object",
+      "required": ["sha256", "size_bytes"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "required": [
+        "fixture",
+        "input_compatibility",
+        "workload_check",
+        "engines",
+        "comparison"
+      ],
+      "properties": {
+        "fixture": {
+          "type": "object",
+          "required": ["filename", "sha256", "size_bytes"],
+          "properties": {
+            "filename": { "type": "string" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "size_bytes": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "input_compatibility": {
+          "type": "object",
+          "required": ["metalroute", "freerouting"],
+          "properties": {
+            "metalroute": { "$ref": "#/$defs/compatibility" },
+            "freerouting": { "$ref": "#/$defs/compatibility" }
+          }
+        },
+        "workload_check": {
+          "type": "object",
+          "required": [
+            "status",
+            "metalroute_two_point_net_counts",
+            "freerouting_initial_unconnected_items"
+          ],
+          "properties": {
+            "status": {
+              "enum": ["matched", "mismatched", "unavailable"]
+            },
+            "metalroute_two_point_net_counts": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "uniqueItems": true
+            },
+            "freerouting_initial_unconnected_items": {
+              "type": ["integer", "null"],
+              "minimum": 0
+            }
+          }
+        },
+        "engines": {
+          "type": "object",
+          "required": ["metalroute", "freerouting"],
+          "properties": {
+            "metalroute": { "$ref": "#/$defs/engine" },
+            "freerouting": { "$ref": "#/$defs/engine" }
+          }
+        },
+        "comparison": {
+          "type": "object",
+          "required": [
+            "status",
+            "faster_engine",
+            "wall_time_factor",
+            "post_reload_quality_equal"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "complete",
+                "input_incompatible_or_probe_error",
+                "workload_mismatch_or_unavailable",
+                "incomplete_runs_or_reload"
+              ]
+            },
+            "faster_engine": {
+              "type": ["string", "null"],
+              "enum": ["metalroute", "freerouting", null]
+            },
+            "wall_time_factor": {
+              "type": ["number", "null"],
+              "minimum": 1
+            },
+            "post_reload_quality_equal": { "type": ["boolean", "null"] },
+            "equal_quality_speedup": {
+              "type": ["object", "null"]
+            }
+          }
+        }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "required": [
+        "status",
+        "requested_runs",
+        "executed_runs",
+        "validated_runs",
+        "median_external_wall_seconds",
+        "external_wall_seconds",
+        "post_reload_quality",
+        "quality_stable_across_runs",
+        "runs"
+      ],
+      "properties": {
+        "status": { "enum": ["complete", "incomplete"] },
+        "requested_runs": { "type": "integer", "minimum": 0 },
+        "executed_runs": { "type": "integer", "minimum": 0 },
+        "validated_runs": { "type": "integer", "minimum": 0 },
+        "median_external_wall_seconds": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "external_wall_seconds": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "post_reload_quality": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/quality" }
+        },
+        "quality_stable_across_runs": { "type": "boolean" },
+        "runs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/run" }
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["compatible", "incompatible", "probe_error", "probe_timeout"]
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["unconnected_items", "violations", "quality_score"],
+      "properties": {
+        "unconnected_items": { "type": "integer", "minimum": 0 },
+        "violations": { "type": "integer", "minimum": 0 },
+        "quality_score": { "type": ["number", "null"] }
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "run",
+        "status",
+        "route_status",
+        "external_wall_seconds",
+        "exit_code",
+        "timed_out",
+        "logs"
+      ],
+      "properties": {
+        "run": { "type": "integer", "minimum": 1 },
+        "status": {
+          "enum": [
+            "ok",
+            "route_timeout",
+            "route_error",
+            "malformed_result",
+            "missing_ses",
+            "reload_error"
+          ]
+        },
+        "route_status": {
+          "enum": [
+            "route_ok",
+            "route_timeout",
+            "route_error",
+            "malformed_result",
+            "missing_ses"
+          ]
+        },
+        "external_wall_seconds": { "type": "number", "minimum": 0 },
+        "exit_code": { "type": ["integer", "null"] },
+        "timed_out": { "type": "boolean" },
+        "post_reload_drc": { "$ref": "#/$defs/drc" }
+      }
+    },
+    "drc": {
+      "type": "object",
+      "required": ["status", "exit_code", "timed_out", "wall_seconds", "logs"],
+      "properties": {
+        "status": {
+          "enum": ["ok", "timeout", "process_error", "missing_report", "malformed_report"]
+        },
+        "unconnected_items": { "type": "integer", "minimum": 0 },
+        "violations": { "type": "integer", "minimum": 0 },
+        "quality_score": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

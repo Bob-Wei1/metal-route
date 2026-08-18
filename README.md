@@ -196,6 +196,10 @@ Timing varies by machine. Completion, route identity, cost, and DRC semantics ar
 the deterministic gates. Benchmark inputs and their provenance are documented in
 [benchmarks/corpus/MANIFEST.md](benchmarks/corpus/MANIFEST.md).
 
+For a same-DSN, one-worker comparison with Freerouting 2.3.0, including
+post-route SES reload and Freerouting DRC, see the
+[Freerouting comparison methodology](benchmarks/freerouting/README.md).
+
 ## Known limitations
 
 - This is global/maze routing, not a full push-and-shove detailed router.
