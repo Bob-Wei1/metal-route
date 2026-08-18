@@ -163,6 +163,7 @@ fn srj29_sample021_routes_on_declared_eight_layer_stack() {
     let outcome = NegotiatedRouter::new()
         .with_via_model(via_model)
         .with_clearance_mm(clearance + DEFAULT_TRACE_WIDTH_MM)
+        .with_via_spacing_mm(VIA_PAD_MM + clearance)
         .with_coords(coords)
         .route_with_outcome(&problem.grid, &problem.nets)
         .expect("route SRJ29 sample 021");

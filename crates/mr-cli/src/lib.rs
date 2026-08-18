@@ -582,11 +582,13 @@ fn route_problem_impl(
     } else {
         0
     };
-    let trace_halo_mm = if min_clearance > 0.0 {
-        min_clearance + DEFAULT_TRACE_WIDTH
-    } else {
-        0.0
-    };
+    // Zero edge clearance still forbids copper overlap, so both trace half-widths
+    // remain part of the centreline rule even when `min_clearance == 0`.
+    let trace_halo_mm = min_clearance + DEFAULT_TRACE_WIDTH;
+    // Two foreign via pads need both radii plus the copper edge clearance. This is
+    // wider than the via-to-track keepout below by the difference between a via and
+    // trace radius, so the negotiated router tracks it as a separate centre rule.
+    let via_spacing_mm = VIA_PAD_MM + min_clearance;
     // D2: thread the real signal-via pad diameter so the rasteriser can reserve a
     // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
     let problem = rasterize_with_layers(
@@ -605,11 +607,7 @@ fn route_problem_impl(
     // via pad radius + clearance + the foreign trace's half-width, so a committed via's
     // copper keeps full `clearance` from a foreign track's copper.
     let mut via_model = ViaModel::through_hole(problem.mapping.dims.layers);
-    via_model.keepout_mm = if min_clearance > 0.0 {
-        VIA_PAD_MM / 2.0 + min_clearance + DEFAULT_TRACE_WIDTH / 2.0
-    } else {
-        0.0
-    };
+    via_model.keepout_mm = VIA_PAD_MM / 2.0 + min_clearance + DEFAULT_TRACE_WIDTH / 2.0;
     // The board's continuous grid-line geometry, so the negotiated router prices
     // planar steps by their real length. On a uniform grid this is byte-identical to
     // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
@@ -629,6 +627,7 @@ fn route_problem_impl(
             let negotiated = NegotiatedRouter::new()
                 .with_via_model(via_model.clone())
                 .with_clearance_mm(trace_halo_mm)
+                .with_via_spacing_mm(via_spacing_mm)
                 .with_coords(coords.clone());
             #[cfg(target_os = "macos")]
             let outcome = if use_metal_isolated_provider(
@@ -1244,6 +1243,7 @@ pub fn route_dsn_problem(
     // committed via's copper keeps full `clearance` from a foreign track's copper. No
     // `/resolution` cell conversion — that was a unit bug on the non-uniform Hanan grid.
     via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
+    let via_spacing_mm = VIA_PAD_MM + stats.min_clearance_mm.max(0.0);
     // D2: thread the real signal-via pad diameter for the via-class foreign-pad halo.
     let problem = rasterize_with_layers(
         &srj,
@@ -1272,6 +1272,7 @@ pub fn route_dsn_problem(
         // `clearance + track_w` (own half-width + clearance + foreign half-width) — the
         // bare clearance under-blocks and lets two centred tracks overlap by `track_w`.
         .with_clearance_mm(stats.min_clearance_mm + trace_w)
+        .with_via_spacing_mm(via_spacing_mm)
         .with_coords(coords)
         .route(&problem.grid, &problem.nets)
         .context("router failed")?;
@@ -1892,6 +1893,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zero_clearance_srj_still_prevents_via_pad_overlap() {
+        for (gap, expected_routed) in [(0.449, 1), (0.45, 2)] {
+            let json = format!(
+                r#"{{
+                    "layerCount": 2,
+                    "minTraceWidth": 0.15,
+                    "minClearance": 0.0,
+                    "bounds": {{"minX": 0.0, "maxX": {gap}, "minY": 0.0, "maxY": 0.0}},
+                    "connections": [
+                        {{"name": "a", "pointsToConnect": [
+                            {{"x": 0.0, "y": 0.0, "layer": "top"}},
+                            {{"x": 0.0, "y": 0.0, "layer": "bottom"}}
+                        ]}},
+                        {{"name": "b", "pointsToConnect": [
+                            {{"x": {gap}, "y": 0.0, "layer": "top"}},
+                            {{"x": {gap}, "y": 0.0, "layer": "bottom"}}
+                        ]}}
+                    ]
+                }}"#
+            );
+            let srj = parse_srj(json.as_bytes()).expect("parse zero-clearance fixture");
+            let (traces, summary, _) =
+                route_problem(&srj, Some(0.05), RouterKind::Negotiated, None)
+                    .expect("route zero-clearance fixture");
+            assert_eq!(
+                summary.routed, expected_routed,
+                "unexpected physical via result at {gap} mm: {summary:?}"
+            );
+            let violations =
+                drc_board::solution_to_drc_board(&srj, &traces, drc::default_rules(0.0), 2).check();
+            assert!(
+                violations.is_empty(),
+                "zero-clearance route still cannot overlap copper: {violations:#?}"
+            );
+        }
+    }
+
     /// Real-board regression for pad-aware exact-geometry repair. The two vias in
     /// bugreport01 initially sit 0.125 mm from foreign pads under a 0.150 mm rule;
     /// each can clear them by moving farther into its own connectivity-labelled pad.
@@ -2023,6 +2062,7 @@ mod tests {
     fn assert_real_via_repair(
         relative_path: &str,
         expected_routed: usize,
+        expected_total: usize,
         expected_before: usize,
         expected_after: usize,
     ) {
@@ -2036,7 +2076,7 @@ mod tests {
                 .expect("route before bounded via repair");
         assert_eq!(
             (summary.routed, summary.total),
-            (expected_routed, expected_routed)
+            (expected_routed, expected_total)
         );
 
         let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
@@ -2050,31 +2090,36 @@ mod tests {
         let after =
             drc_board::solution_to_drc_board(&srj, &repaired, rules, srj.layer_count).check();
         assert_eq!(after.len(), expected_after, "unexpected repaired DRC count");
-        assert!(drc_candidate_is_better(&before, &after));
+        assert_eq!(
+            drc_candidate_is_better(&before, &after),
+            expected_after < expected_before
+        );
         assert_eq!(endpoint_and_via_span_signature(&repaired), signature);
     }
 
-    /// Dense four-layer fixture: one exact one-clearance rigid via translation
-    /// reduces the layer-aware endpoint-owned pad baseline from 20 to 18 findings,
-    /// without changing any of its 26 routed nets, endpoints, or via spans.
+    /// Dense four-layer fixture: the combined exact via masks and feature-aware
+    /// spacing route 25 of 26 nets with eleven residual findings. None admits a
+    /// beneficial rigid via translation, and all routed endpoints/spans stay fixed.
     #[test]
-    fn sample11_bounded_via_repair_reduces_exact_drc() {
+    fn sample11_combined_clearance_guards_are_repair_stable() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample11-region-reroute.srj.json",
+            25,
             26,
-            20,
-            18,
+            11,
+            11,
         );
     }
 
-    /// Small independent fixture for the same portfolio: eight exact candidates
-    /// move one implicated via and clear all three residual findings.
+    /// Small independent fixture: the combined guards eliminate all findings during
+    /// routing, so bounded post-route repair is a deterministic no-op.
     #[test]
-    fn sample25_bounded_via_repair_reduces_exact_drc() {
+    fn sample25_combined_clearance_guards_are_repair_stable() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample25-region-reroute.srj.json",
             5,
-            3,
+            5,
+            0,
             0,
         );
     }
