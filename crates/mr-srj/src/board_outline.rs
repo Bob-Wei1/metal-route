@@ -149,18 +149,8 @@ impl BoardOutlineConstraint {
 
     /// Radius-parameterized form used by DRC for mixed-width external soups.
     pub fn trace_segment_with_radius_is_legal(&self, a: Point, b: Point, radius: f64) -> bool {
-        if !radius.is_finite() || radius < 0.0 {
-            return false;
-        }
-        if !finite_point(a) || !finite_point(b) || !point_in_polygon(a, &self.vertices) {
-            return false;
-        }
-        if !point_in_polygon(b, &self.vertices) {
-            return false;
-        }
-        let required = self.edge_clearance_mm + radius;
-        polygon_edges(&self.vertices)
-            .all(|(p, q)| seg_seg_dist(a, b, p, q) + GEOMETRY_EPS >= required)
+        self.trace_edge_gap_with_radius(a, b, radius)
+            .is_some_and(|gap| gap + GEOMETRY_EPS >= self.edge_clearance_mm)
     }
 
     /// Copper-edge gap from a trace capsule to the physical boundary. `None`
@@ -187,7 +177,10 @@ impl BoardOutlineConstraint {
         // A positive-radius centreline that exits and re-enters must cross an edge,
         // making the exact distance zero. Keep the containment branch explicit for
         // defensive zero-width callers too.
-        if distance <= GEOMETRY_EPS && segment_crosses_polygon_boundary(a, b, &self.vertices) {
+        if a != b
+            && distance <= GEOMETRY_EPS
+            && segment_crosses_polygon_boundary(a, b, &self.vertices)
+        {
             return None;
         }
         Some(distance - radius)
@@ -435,7 +428,9 @@ impl<'a> OutlineRasterIndex<'a> {
     /// Check only edges whose AABB is close enough to the segment AABB to
     /// possibly violate clearance, then apply the authoritative exact distance.
     fn segment_is_legal(&self, a: Point, b: Point, candidates: &[usize]) -> bool {
-        let required = self.outline.trace_keepout_mm();
+        let radius = self.outline.trace_radius_mm();
+        let edge_clearance = self.outline.edge_clearance_mm();
+        let required = edge_clearance + radius;
         let candidate_limit = required + GEOMETRY_EPS;
         let min_x = a.0.min(b.0);
         let max_x = a.0.max(b.0);
@@ -448,7 +443,11 @@ impl<'a> OutlineRasterIndex<'a> {
             {
                 return true;
             }
-            seg_seg_dist(a, b, edge.a, edge.b) + GEOMETRY_EPS >= required
+            let distance = seg_seg_dist(a, b, edge.a, edge.b);
+            if a != b && distance <= GEOMETRY_EPS && segments_intersect(a, b, edge.a, edge.b) {
+                return false;
+            }
+            distance - radius + GEOMETRY_EPS >= edge_clearance
         })
     }
 }
@@ -504,6 +503,14 @@ pub fn solution_respects_board_outline(
     else {
         return Ok(true);
     };
+    // An active edge contract treats invalid emitted copper geometry as an
+    // ineligible soup even though ordinary DRC has no dedicated invalid-width
+    // finding.
+    if traces.iter().flat_map(|trace| &trace.route).any(|point| {
+        matches!(point, RoutePoint::Wire { width, .. } if !width.is_finite() || *width <= 0.0)
+    }) {
+        return Ok(false);
+    }
     // Match the authoritative emitted-soup DRC: standard stack names resolve to
     // their numeric layers and every unknown alias falls back to top (layer 0).
     let layers = LayerMap::standard(effective_layer_count.max(1));
@@ -784,6 +791,65 @@ mod tests {
     }
 
     #[test]
+    fn zero_clearance_crossing_predicate_matches_gap_at_zero_and_sub_epsilon_radius() {
+        let mut board = concave();
+        board.physical_rules.min_board_edge_clearance = Some(0.0);
+        let outline = BoardOutlineConstraint::from_srj(&board, 0.15, 0.45)
+            .unwrap()
+            .unwrap();
+        let (a, b) = ((-4.1066667, -4.7666667), (5.1266667, -4.7666667));
+        for radius in [0.0, GEOMETRY_EPS / 2.0] {
+            assert_eq!(
+                outline.trace_segment_with_radius_is_legal(a, b, radius),
+                outline
+                    .trace_edge_gap_with_radius(a, b, radius)
+                    .is_some_and(|gap| gap + GEOMETRY_EPS >= outline.edge_clearance_mm()),
+                "boolean and gap predicates diverged at radius {radius}"
+            );
+            assert!(
+                !outline.trace_segment_with_radius_is_legal(a, b, radius),
+                "an inside-to-inside concave crossing must fail even at radius {radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_mask_rejects_sub_epsilon_concave_crossing() {
+        let mut board = concave();
+        board.physical_rules.min_board_edge_clearance = Some(0.0);
+        let outline = BoardOutlineConstraint::from_srj(&board, GEOMETRY_EPS, 0.45)
+            .unwrap()
+            .unwrap();
+        let mask = outline.raster_mask_plane(&[-4.1066667, 5.1266667], &[-4.7666667]);
+        assert_eq!(mask.len(), 2);
+        assert_ne!(mask[0] & Grid::BOARD_EDGE_POS_X, 0);
+        assert_ne!(mask[1] & Grid::BOARD_EDGE_NEG_X, 0);
+    }
+
+    #[test]
+    fn boundary_singleton_uses_shared_epsilon_disk_semantics() {
+        let board = srj(serde_json::json!({
+            "layerCount": 1,
+            "minBoardEdgeClearance": 0.0,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0}
+        }));
+        let outline =
+            BoardOutlineConstraint::from_srj(&board, 2.0 * GEOMETRY_EPS, 2.0 * GEOMETRY_EPS)
+                .unwrap()
+                .unwrap();
+        let point = (0.0, 5.0);
+        assert!(outline.trace_point_is_legal(point));
+        assert!(outline.via_point_is_legal(point));
+        assert!(outline.trace_segment_is_legal(point, point));
+        assert!(outline.trace_segment_with_radius_is_legal(point, point, 0.0));
+        assert!(outline.trace_segment_with_radius_is_legal(point, point, GEOMETRY_EPS,));
+        assert!(!outline.trace_segment_with_radius_is_legal(point, point, 2.0 * GEOMETRY_EPS,));
+
+        let tiny_positive = PcbTrace::new(vec![wire(point.0, point.1, 2.0 * GEOMETRY_EPS)]);
+        assert!(solution_respects_board_outline(&board, &[tiny_positive], 0.45, 1).unwrap());
+    }
+
+    #[test]
     fn rectangular_capsule_and_via_honor_feature_radius_plus_clearance() {
         let board = srj(serde_json::json!({
             "layerCount": 2,
@@ -927,6 +993,20 @@ mod tests {
         }));
         let singleton = PcbTrace::new(vec![wire(0.25, 5.0, 0.2)]);
         assert!(!solution_respects_board_outline(&rectangular, &[singleton], 0.4, 2).unwrap());
+
+        for invalid_width in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+            let invalid = PcbTrace::new(vec![wire(5.0, 5.0, invalid_width)]);
+            assert!(
+                !solution_respects_board_outline(
+                    &rectangular,
+                    std::slice::from_ref(&invalid),
+                    0.4,
+                    2,
+                )
+                .unwrap(),
+                "invalid emitted width {invalid_width:?} must fail closed"
+            );
+        }
 
         let crossing = PcbTrace::new(vec![
             wire(-4.1066667, -4.7666667, 0.15),

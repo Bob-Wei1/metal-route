@@ -1392,9 +1392,9 @@ pub fn rasterize_with_layers(
 ///
 /// Unlike [`rasterize_with_layers`]'s compatibility entry point, this keeps
 /// trace→pad and via→pad edge clearances distinct, uses the resolved nominal
-/// trace width for routing-channel geometry. `outline`, board-edge clearance, and
-/// `allowViaInPad` are deliberately not claimed by this projection: they parse and
-/// round-trip, but need dedicated core geometry/repair semantics before activation.
+/// trace width for routing-channel geometry. `outline` and board-edge clearance
+/// are projected into exact continuous node, via, and planar-edge masks;
+/// `allowViaInPad` remains parse-only until dedicated placement semantics exist.
 /// Coherent supported projections opt directly into exact physical geometry:
 /// their values came from the board rather than an old cell-count approximation.
 pub fn rasterize_with_uniform_physical_rules(

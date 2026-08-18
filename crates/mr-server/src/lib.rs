@@ -33,6 +33,7 @@
 //! which Lee/rip-up handle comfortably while still resolving fixture-scale pad
 //! pitches.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -235,7 +236,10 @@ fn prepare(
         .flatten();
     let trace_width = physical
         .map(|rules| rules.trace_width_mm)
-        .or(srj.min_trace_width)
+        .or_else(|| {
+            srj.min_trace_width
+                .filter(|width| width.is_finite() && *width > 0.0)
+        })
         .unwrap_or(DEFAULT_TRACE_WIDTH);
     let edge_clearance_mm = clearance_policy.unwrap_or_else(|| {
         physical.map_or_else(
@@ -254,8 +258,18 @@ fn prepare(
             } else {
                 0
             };
+            // Keep compatibility routing and emitted soup on the same physical
+            // width even when a malformed legacy declaration falls back to the
+            // product default.
+            let raster_srj = if srj.min_trace_width == Some(trace_width) {
+                Cow::Borrowed(srj)
+            } else {
+                let mut normalized = srj.clone();
+                normalized.min_trace_width = Some(trace_width);
+                Cow::Owned(normalized)
+            };
             rasterize_with_layers(
-                srj,
+                &raster_srj,
                 resolution,
                 layers,
                 clearance_cells,
@@ -935,6 +949,89 @@ mod tests {
             overridden.problem.grid.via_forbidden.is_empty(),
             "the established explicit zero-clearance policy stays a full opt-out"
         );
+    }
+
+    #[test]
+    fn active_outline_absent_or_zero_width_uses_default_for_raster_and_emitted_soup() {
+        let base: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0},
+                {"x": 10.0, "y": 10.0}, {"x": 0.0, "y": 10.0}
+            ],
+            "connections": [{
+                "name": "n",
+                "pointsToConnect": [
+                    {"x": 2.0, "y": 5.0, "layer": "top"},
+                    {"x": 8.0, "y": 5.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut canonical = base.clone();
+        canonical.min_trace_width = Some(DEFAULT_TRACE_WIDTH);
+        let canonical_prep = prepare(&canonical, Some(1.0), 2, Some(0.0));
+        let canonical_legacy = without_board_edge_contract(&canonical);
+        let canonical_legacy_prep = prepare(&canonical_legacy, Some(1.0), 2, Some(0.0));
+        assert!(!canonical_prep.problem.grid.board_constraint.is_empty());
+
+        for declared_width in [None, Some(0.0)] {
+            let mut srj = base.clone();
+            srj.min_trace_width = declared_width;
+            let prep = prepare(&srj, Some(1.0), 2, Some(0.0));
+            assert_eq!(prep.trace_width, DEFAULT_TRACE_WIDTH);
+            assert_eq!(
+                prep.problem.grid, canonical_prep.problem.grid,
+                "active legacy raster must use the emitted width for {declared_width:?}"
+            );
+            assert_eq!(
+                prep.problem.mapping.x_lines,
+                canonical_prep.problem.mapping.x_lines
+            );
+            assert_eq!(
+                prep.problem.mapping.y_lines,
+                canonical_prep.problem.mapping.y_lines
+            );
+
+            // Production first evaluates the contract-cleared legacy portfolio
+            // member. It must retain the same width alignment even though the
+            // active marker is intentionally absent from that scoped clone.
+            let legacy_srj = without_board_edge_contract(&srj);
+            let legacy_prep = prepare(&legacy_srj, Some(1.0), 2, Some(0.0));
+            assert_eq!(legacy_prep.trace_width, DEFAULT_TRACE_WIDTH);
+            assert_eq!(legacy_prep.problem.grid, canonical_legacy_prep.problem.grid);
+            assert_eq!(
+                legacy_prep.problem.mapping.x_lines,
+                canonical_legacy_prep.problem.mapping.x_lines
+            );
+            assert_eq!(
+                legacy_prep.problem.mapping.y_lines,
+                canonical_legacy_prep.problem.mapping.y_lines
+            );
+
+            let router = configured_negotiated_router(prep.router.clone());
+            let board = router
+                .route(&prep.problem.grid, &prep.problem.nets)
+                .unwrap();
+            let solution = solution_from_board(&prep, &board);
+            assert!(!solution.is_empty());
+            assert!(solution.iter().flat_map(|trace| &trace.route).all(|point| {
+                !matches!(
+                    point,
+                    mr_srj::RoutePoint::Wire { width, .. }
+                        if (*width - DEFAULT_TRACE_WIDTH).abs() > f64::EPSILON
+                )
+            }));
+            assert!(mr_srj::solution_respects_board_outline(
+                &srj,
+                &solution,
+                DEFAULT_VIA_PAD_DIAMETER,
+                2,
+            )
+            .unwrap());
+        }
     }
 
     #[tokio::test]

@@ -689,6 +689,20 @@ fn board_edge_contract_is_active(srj: &SimpleRouteJson) -> bool {
     !srj.physical_rules.outline.is_empty() || srj.physical_rules.min_board_edge_clearance.is_some()
 }
 
+/// Match partial/legacy board-edge raster geometry to the width that this CLI
+/// actually emits. The caller must resolve the typed physical profile from the
+/// original SRJ before using this clone: changing `minTraceWidth` can otherwise
+/// make an incoherent profile coherent and silently broaden product semantics.
+fn legacy_board_edge_raster_input(srj: &SimpleRouteJson) -> std::borrow::Cow<'_, SimpleRouteJson> {
+    if board_edge_contract_is_active(srj) && srj.min_trace_width != Some(DEFAULT_TRACE_WIDTH) {
+        let mut constrained = srj.clone();
+        constrained.min_trace_width = Some(DEFAULT_TRACE_WIDTH);
+        std::borrow::Cow::Owned(constrained)
+    } else {
+        std::borrow::Cow::Borrowed(srj)
+    }
+}
+
 fn routed_via_pad_diameter_mm(srj: &SimpleRouteJson) -> f64 {
     srj.uniform_physical_rules()
         .map(|rules| rules.via_pad_diameter_mm)
@@ -804,14 +818,20 @@ fn route_problem_impl(
     // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
     let problem = match physical {
         Some(rules) => rasterize_with_uniform_physical_rules(srj, resolution, layer_map, rules),
-        None => rasterize_with_layers(
-            srj,
-            resolution,
-            layer_map,
-            clearance_cells,
-            min_clearance,
-            via_pad_mm,
-        ),
+        None => {
+            // `physical` was deliberately selected from the untouched input.
+            // Normalize only the SRJ used to build the active board mask/Hanan
+            // geometry so it matches the fixed-width legacy soup we emit.
+            let raster_srj = legacy_board_edge_raster_input(srj);
+            rasterize_with_layers(
+                &raster_srj,
+                resolution,
+                layer_map,
+                clearance_cells,
+                min_clearance,
+                via_pad_mm,
+            )
+        }
     };
     let total = problem.nets.len();
 
@@ -2405,6 +2425,204 @@ mod tests {
         srj.physical_rules.outline.clear();
         srj.physical_rules.min_board_edge_clearance = None;
         srj
+    }
+
+    fn assert_route_output_identical(
+        actual: &(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics),
+        expected: &(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics),
+        context: &str,
+    ) {
+        assert_eq!(actual.0, expected.0, "{context}: trace soup changed");
+        assert_eq!(actual.1, expected.1, "{context}: summary changed");
+        assert_eq!(
+            actual.2.congestion, expected.2.congestion,
+            "{context}: congestion changed"
+        );
+        assert_eq!(
+            actual.2.x_lines, expected.2.x_lines,
+            "{context}: x Hanan lines changed"
+        );
+        assert_eq!(
+            actual.2.y_lines, expected.2.y_lines,
+            "{context}: y Hanan lines changed"
+        );
+    }
+
+    #[test]
+    fn partial_width_outline_retry_matches_emitted_width_without_touching_inactive_legacy() {
+        let mut canonical = bugreport("bugreport21-board-outline.srj.json");
+        canonical.min_trace_width = Some(DEFAULT_TRACE_WIDTH);
+        assert!(canonical.uniform_physical_rules().is_none());
+        let expected_constrained =
+            route_problem_impl(&canonical, None, RouterKind::Negotiated, None, true).unwrap();
+
+        for declared_width in [0.05, 0.30] {
+            let mut active = canonical.clone();
+            active.min_trace_width = Some(declared_width);
+            assert!(active.uniform_physical_rules().is_none());
+            let constrained_input = legacy_board_edge_raster_input(&active);
+            assert!(matches!(&constrained_input, std::borrow::Cow::Owned(_)));
+            assert_eq!(
+                constrained_input.min_trace_width,
+                Some(DEFAULT_TRACE_WIDTH),
+                "active partial masks must use emitted width, not {declared_width}"
+            );
+
+            let selected = route_problem(&active, None, RouterKind::Negotiated, None).unwrap();
+            assert_route_output_identical(
+                &selected,
+                &expected_constrained,
+                &format!("active partial width {declared_width}"),
+            );
+            assert!(selected
+                .0
+                .iter()
+                .flat_map(|trace| &trace.route)
+                .all(|point| {
+                    !matches!(
+                        point,
+                        RoutePoint::Wire { width, .. }
+                            if (*width - DEFAULT_TRACE_WIDTH).abs() > f64::EPSILON
+                    )
+                }));
+            assert!(mr_srj::solution_respects_board_outline(
+                &active,
+                &selected.0,
+                VIA_PAD_MM,
+                active.layer_count.max(1),
+            )
+            .unwrap());
+
+            let inactive = without_board_edge(active);
+            assert!(matches!(
+                legacy_board_edge_raster_input(&inactive),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            let historical =
+                route_problem_impl(&inactive, None, RouterKind::Negotiated, None, true).unwrap();
+            let public = route_problem(&inactive, None, RouterKind::Negotiated, None).unwrap();
+            assert_route_output_identical(
+                &public,
+                &historical,
+                &format!("inactive partial width {declared_width}"),
+            );
+        }
+    }
+
+    fn width_only_incoherent_typed_outline() -> SimpleRouteJson {
+        serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.30,
+            "nominalTraceWidth": DEFAULT_TRACE_WIDTH,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleEdgeToViaHoleEdgeClearance": 0.10,
+            "minPadEdgeToPadEdgeClearance": 0.11,
+            "minViaHoleDiameter": 0.20,
+            "minViaPadDiameter": 0.40,
+            "bounds": {"minX": -9.0, "maxX": 9.0, "minY": -7.0, "maxY": 7.0},
+            "outline": [
+                {"x": -8.0, "y": -6.0}, {"x": -2.0, "y": -6.0},
+                {"x": -2.0, "y": 2.0}, {"x": 2.0, "y": 2.0},
+                {"x": 2.0, "y": -6.0}, {"x": 8.0, "y": -6.0},
+                {"x": 8.0, "y": 6.0}, {"x": -8.0, "y": 6.0}
+            ],
+            "obstacles": [
+                {
+                    "type": "rect", "shape": "rect",
+                    "center": {"x": -4.49, "y": -4.0},
+                    "width": 0.54, "height": 0.64, "layers": ["top"],
+                    "connectedTo": ["n"]
+                },
+                {
+                    "type": "rect", "shape": "rect",
+                    "center": {"x": 5.51, "y": -4.0},
+                    "width": 0.54, "height": 0.64, "layers": ["top"],
+                    "connectedTo": ["n"]
+                }
+            ],
+            "connections": [{
+                "name": "n", "nominalTraceWidth": DEFAULT_TRACE_WIDTH,
+                "pointsToConnect": [
+                    {"x": -4.49, "y": -4.0, "layer": "top"},
+                    {"x": 5.51, "y": -4.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn raster_width_normalization_cannot_activate_an_incoherent_typed_profile() {
+        let active = width_only_incoherent_typed_outline();
+        assert!(
+            active.uniform_physical_rules().is_none(),
+            "the original minimum/nominal mismatch must retain legacy semantics"
+        );
+        let raster_input = legacy_board_edge_raster_input(&active);
+        assert!(matches!(&raster_input, std::borrow::Cow::Owned(_)));
+        assert!(
+            raster_input.uniform_physical_rules().is_some(),
+            "fixture must expose why physical selection cannot be recomputed from the raster clone"
+        );
+        assert_eq!(
+            routed_via_pad_diameter_mm(&active),
+            VIA_PAD_MM,
+            "the incoherent original keeps legacy via geometry"
+        );
+
+        let mut legacy_reference = active.clone();
+        let outline = legacy_reference.physical_rules.outline.clone();
+        let edge_clearance = legacy_reference.physical_rules.min_board_edge_clearance;
+        legacy_reference.physical_rules = Default::default();
+        legacy_reference.physical_rules.outline = outline;
+        legacy_reference.physical_rules.min_board_edge_clearance = edge_clearance;
+        for connection in &mut legacy_reference.connections {
+            connection.rules = Default::default();
+        }
+        assert!(legacy_reference.uniform_physical_rules().is_none());
+
+        let inactive = without_board_edge(active.clone());
+        let legacy =
+            route_problem_impl(&inactive, Some(0.5), RouterKind::Negotiated, None, true).unwrap();
+        assert!(
+            !mr_srj::solution_respects_board_outline(
+                &active,
+                &legacy.0,
+                VIA_PAD_MM,
+                active.layer_count,
+            )
+            .unwrap(),
+            "fixture must force the constrained product branch"
+        );
+
+        let selected = route_problem(&active, Some(0.5), RouterKind::Negotiated, None).unwrap();
+        let expected =
+            route_problem(&legacy_reference, Some(0.5), RouterKind::Negotiated, None).unwrap();
+        assert_route_output_identical(
+            &selected,
+            &expected,
+            "raster-only normalization must preserve legacy clearance/via semantics",
+        );
+        assert!(selected
+            .0
+            .iter()
+            .flat_map(|trace| &trace.route)
+            .all(|point| {
+                !matches!(
+                    point,
+                    RoutePoint::Wire { width, .. }
+                        if (*width - DEFAULT_TRACE_WIDTH).abs() > f64::EPSILON
+                )
+            }));
+        assert!(mr_srj::solution_respects_board_outline(
+            &active,
+            &selected.0,
+            VIA_PAD_MM,
+            active.layer_count,
+        )
+        .unwrap());
     }
 
     #[test]
