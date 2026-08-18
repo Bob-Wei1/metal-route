@@ -65,7 +65,8 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
     let dims = grid.dims;
     let (w, h) = (dims.w, dims.h);
     let mut dist = vec![Cost::MAX; dims.len()];
-    if dims.is_empty()
+    if !grid.is_well_formed()
+        || dims.is_empty()
         || !dims.contains(src)
         || grid.is_obstacle(src)
         || grid.is_board_forbidden(src)
@@ -140,7 +141,7 @@ pub fn sweep_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
 /// Single-source distance field via Dijkstra — the reference the sweep is graded
 /// against. Unreachable cells are `Cost::MAX`.
 pub fn bfs_distance_field(grid: &Grid, src: CellIdx) -> Vec<Cost> {
-    if !grid.dims.contains(src) {
+    if !grid.is_well_formed() || !grid.dims.contains(src) {
         return vec![Cost::MAX; grid.dims.len()];
     }
     dijkstra(grid, src, |_| 0).dist
@@ -160,7 +161,15 @@ pub fn path_from_field(
     src: CellIdx,
     dst: CellIdx,
 ) -> Option<Vec<CellIdx>> {
-    if dist.len() != grid.dims.len() || !grid.dims.contains(src) || !grid.dims.contains(dst) {
+    if !grid.is_well_formed()
+        || dist.len() != grid.dims.len()
+        || !grid.dims.contains(src)
+        || !grid.dims.contains(dst)
+        || grid.is_obstacle(src)
+        || grid.is_obstacle(dst)
+        || grid.is_board_forbidden(src)
+        || grid.is_board_forbidden(dst)
+    {
         return None;
     }
     if dist[dst as usize] == Cost::MAX {
@@ -389,5 +398,26 @@ mod tests {
         assert_eq!(sweep_distance_field(&grid, 99), expected);
         assert_eq!(bfs_distance_field(&grid, 99), expected);
         assert_eq!(path_from_field(&grid, &[0], 0, 1), None);
+    }
+
+    #[test]
+    fn public_field_helpers_fail_closed_on_malformed_grid_masks() {
+        let dims = Dims::new(2, 1);
+        let mut grid = Grid::filled(dims, 1);
+        grid.board_constraint = vec![0];
+        let expected = vec![Cost::MAX; dims.len()];
+
+        assert_eq!(sweep_distance_field(&grid, 1), expected);
+        assert_eq!(bfs_distance_field(&grid, 1), expected);
+        assert_eq!(path_from_field(&grid, &[Cost::MAX, 0], 1, 1), None);
+
+        let mut forbidden = Grid::filled(dims, 1);
+        forbidden.board_constraint = vec![0; dims.len()];
+        forbidden.board_constraint[1] = Grid::BOARD_TRACE_NODE;
+        assert_eq!(path_from_field(&forbidden, &[Cost::MAX, 0], 1, 1), None);
+
+        let mut obstacle = Grid::filled(dims, 1);
+        obstacle.set(1, mr_core::OBSTACLE);
+        assert_eq!(path_from_field(&obstacle, &[Cost::MAX, 0], 1, 1), None);
     }
 }

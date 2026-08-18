@@ -32,7 +32,7 @@ use mr_core::LayerMap;
 use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation, ViolationClass};
 use mr_srj::{BoardOutlineConstraint, PcbTrace, RoutePoint, SimpleRouteJson};
 
-use crate::{BOARD_EDGE_NET, VIA_DRILL_MM, VIA_PAD_MM};
+use crate::{BOARD_EDGE_GEOMETRY_EPS_MM, BOARD_EDGE_NET, VIA_DRILL_MM, VIA_PAD_MM};
 
 /// Resolve a routed layer name against the effective physical stack. This is
 /// the same defensive fallback as SRJ point rasterization: absent or unknown
@@ -324,8 +324,8 @@ pub fn solution_to_drc_board(
     for (i, t) in traces.iter().enumerate() {
         let net = net_name[i].clone();
         let trace_segment_start = segments.len();
+        let trace_via_start = vias.len();
         let mut zero_length_wire: Option<(f64, f64, f64, u32)> = None;
-        let mut has_via = false;
         // Only route terminals establish ownership for an unlabelled legacy pad.
         // The first/last coordinates are fixed by every geometry repair pass.
         for (point, side) in [
@@ -388,7 +388,6 @@ pub fn solution_to_drc_board(
                     from_layer,
                     to_layer,
                 } => {
-                    has_via = true;
                     let from = named_layer(from_layer, &effective_layers);
                     let to = named_layer(to_layer, &effective_layers);
                     // Hand-built/external soups may omit the source landing as well.
@@ -421,17 +420,27 @@ pub fn solution_to_drc_board(
         }
         // A routed zero-hop net is emitted as one Wire vertex. Preserve its
         // physical copper as a zero-length capsule instead of silently dropping
-        // it from generic and board-edge DRC. A coincident Via already supplies a
-        // wider physical disk, so do not duplicate that representation.
-        if segments.len() == trace_segment_start && !has_via {
+        // it from generic and board-edge DRC. Suppress it only when a coincident
+        // via from this trace occupies the wire's layer and physically covers the
+        // complete disk; a narrower or layer-disjoint via is not equivalent.
+        if segments.len() == trace_segment_start {
             if let Some((x, y, width, layer)) = zero_length_wire {
-                segments.push(Segment {
-                    net,
-                    layer,
-                    a: (x, y),
-                    b: (x, y),
-                    width,
+                let covered_by_via = vias[trace_via_start..].iter().any(|via| {
+                    let first_layer = via.from_layer.min(via.to_layer);
+                    let last_layer = via.from_layer.max(via.to_layer);
+                    via.center == (x, y)
+                        && (first_layer..=last_layer).contains(&layer)
+                        && via.pad_diameter + BOARD_EDGE_GEOMETRY_EPS_MM >= width
                 });
+                if !covered_by_via {
+                    segments.push(Segment {
+                        net,
+                        layer,
+                        a: (x, y),
+                        b: (x, y),
+                        width,
+                    });
+                }
             }
         }
     }
@@ -495,7 +504,6 @@ pub(crate) fn check_with_srj_rules(srj: &SimpleRouteJson, board: &DrcBoard) -> V
 fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation> {
     const DEFAULT_TRACE_WIDTH: f64 = 0.15;
     const DEFAULT_VIA_PAD_DIAMETER: f64 = 0.45;
-    const EDGE_EPS: f64 = 1e-9;
 
     let trace_width = board
         .segments
@@ -531,7 +539,7 @@ fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation
         let gap = constraint
             .as_ref()
             .and_then(|outline| outline.trace_edge_gap_with_radius(segment.a, segment.b, radius));
-        if gap.is_some_and(|measured| measured + EDGE_EPS >= required) {
+        if gap.is_some_and(|measured| measured + BOARD_EDGE_GEOMETRY_EPS_MM >= required) {
             continue;
         }
         out.push(Violation {
@@ -542,7 +550,7 @@ fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation
                 (segment.a.1 + segment.b.1) / 2.0,
             ),
             nets: (segment.net.clone(), BOARD_EDGE_NET.into()),
-            measured: gap.unwrap_or_else(|| -radius.abs().max(EDGE_EPS)),
+            measured: gap.unwrap_or_else(|| -radius.abs().max(BOARD_EDGE_GEOMETRY_EPS_MM)),
             required,
         });
     }
@@ -552,7 +560,7 @@ fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation
         let gap = constraint
             .as_ref()
             .and_then(|outline| outline.disk_edge_gap(via.center, radius));
-        if gap.is_some_and(|measured| measured + EDGE_EPS >= required) {
+        if gap.is_some_and(|measured| measured + BOARD_EDGE_GEOMETRY_EPS_MM >= required) {
             continue;
         }
         out.push(Violation {
@@ -560,7 +568,7 @@ fn check_board_outline(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation
             layer: via.from_layer.min(via.to_layer),
             location: via.center,
             nets: (via.net.clone(), BOARD_EDGE_NET.into()),
-            measured: gap.unwrap_or_else(|| -radius.abs().max(EDGE_EPS)),
+            measured: gap.unwrap_or_else(|| -radius.abs().max(BOARD_EDGE_GEOMETRY_EPS_MM)),
             required,
         });
     }
@@ -825,6 +833,136 @@ mod tests {
         let findings = check_with_srj_rules(&srj, &board);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].nets.1, BOARD_EDGE_NET);
+    }
+
+    #[test]
+    fn narrow_via_does_not_suppress_wider_singleton_wire_at_board_edge() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.6,
+            "nominalTraceWidth": 0.6,
+            "defaultObstacleMargin": 0.0,
+            "minTraceToPadEdgeClearance": 0.0,
+            "minViaEdgeToPadEdgeClearance": 0.0,
+            "minViaHoleDiameter": 0.1,
+            "minViaPadDiameter": 0.2,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        assert_eq!(
+            srj.uniform_physical_rules()
+                .expect("complete physical profile")
+                .via_pad_diameter_mm,
+            0.2
+        );
+        let trace = PcbTrace::new(vec![
+            RoutePoint::Wire {
+                x: 0.7,
+                y: 0.0,
+                width: 0.6,
+                layer: "top".into(),
+            },
+            RoutePoint::Via {
+                x: 0.7,
+                y: 0.0,
+                from_layer: "top".into(),
+                to_layer: "bottom".into(),
+            },
+        ])
+        .with_net("wide-point");
+        let board = solution_to_drc_board(
+            &srj,
+            &[trace],
+            DrcRules {
+                clearance: 0.0,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+            2,
+        );
+
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!(board.vias[0].pad_diameter, 0.2);
+        assert_eq!(board.segments.len(), 1);
+        assert_eq!(board.segments[0].width, 0.6);
+        let findings = check_with_srj_rules(&srj, &board);
+        assert_eq!(findings.len(), 1, "only the wider wire disk is unsafe");
+        assert_eq!(findings[0].nets.1, BOARD_EDGE_NET);
+    }
+
+    #[test]
+    fn wider_via_covering_singleton_wire_is_not_duplicated() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        let trace = PcbTrace::new(vec![
+            wire_on(0.9, 0.0, "top"),
+            RoutePoint::Via {
+                x: 0.9,
+                y: 0.0,
+                from_layer: "top".into(),
+                to_layer: "bottom".into(),
+            },
+        ])
+        .with_net("canonical-via");
+        let board = solution_to_drc_board(
+            &srj,
+            &[trace],
+            DrcRules {
+                clearance: 0.0,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+            2,
+        );
+
+        assert!(board.segments.is_empty());
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!(board.vias[0].pad_diameter, VIA_PAD_MM);
+        let findings = check_with_srj_rules(&srj, &board);
+        assert_eq!(findings.len(), 1, "the covering via disk is checked once");
+        assert_eq!(findings[0].nets.1, BOARD_EDGE_NET);
+    }
+
+    #[test]
+    fn via_on_other_layers_does_not_suppress_singleton_wire() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 3,
+            "minTraceWidth": 0.1,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        let trace = PcbTrace::new(vec![
+            wire_on(0.9, 0.0, "top"),
+            RoutePoint::Via {
+                x: 0.9,
+                y: 0.0,
+                from_layer: "inner1".into(),
+                to_layer: "bottom".into(),
+            },
+        ])
+        .with_net("layer-disjoint-via");
+        let board = solution_to_drc_board(
+            &srj,
+            &[trace],
+            DrcRules {
+                clearance: 0.0,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+            3,
+        );
+
+        assert_eq!(board.vias.len(), 1);
+        assert_eq!((board.vias[0].from_layer, board.vias[0].to_layer), (1, 2));
+        assert_eq!(board.segments.len(), 1);
+        assert_eq!(board.segments[0].layer, 0);
     }
 
     #[test]

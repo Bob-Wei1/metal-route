@@ -63,9 +63,13 @@ pub const VIA_DRILL_MM: f64 = 0.2;
 const DRC_SCORE_QUANTUM_MM: f64 = 1e-6;
 
 /// Reserved pseudo-net used by the exact outline checker. Geometry transforms may
-/// improve ordinary copper DRC, but never by introducing or worsening one of these
-/// physical-board-boundary findings.
+/// improve ordinary copper DRC, but not by introducing one from an edge-clean
+/// baseline or worsening the aggregate profile of pre-existing findings.
 const BOARD_EDGE_NET: &str = "__board_edge__";
+
+/// Numerical tolerance shared by exact outline checks and the board-edge repair
+/// gate.
+const BOARD_EDGE_GEOMETRY_EPS_MM: f64 = 1e-9;
 
 /// Stable identity available in the public DRC result. Location is deliberately
 /// excluded: moving a vertex or via changes the checker-reported feature centroid,
@@ -126,34 +130,56 @@ fn drc_severity_profiles(
     profiles
 }
 
-fn board_edge_severity_profiles(
+fn board_edge_deficit(violation: &mr_drc::Violation) -> f64 {
+    let deficit = violation.required - violation.measured;
+    if deficit.is_nan() || deficit == f64::INFINITY {
+        f64::INFINITY
+    } else if deficit <= 0.0 || deficit == f64::NEG_INFINITY {
+        0.0
+    } else {
+        deficit
+    }
+}
+
+fn board_edge_deficit_profiles(
     violations: &[mr_drc::Violation],
-) -> std::collections::BTreeMap<DrcFindingIdentity, Vec<u64>> {
-    let mut profiles = std::collections::BTreeMap::<DrcFindingIdentity, Vec<u64>>::new();
+) -> std::collections::BTreeMap<DrcFindingIdentity, Vec<f64>> {
+    let mut profiles = std::collections::BTreeMap::<DrcFindingIdentity, Vec<f64>>::new();
     for violation in violations.iter().filter(|violation| {
         violation.nets.0 == BOARD_EDGE_NET || violation.nets.1 == BOARD_EDGE_NET
     }) {
         profiles
             .entry(drc_finding_identity(violation))
             .or_default()
-            .push(drc_severity(violation));
+            .push(board_edge_deficit(violation));
     }
-    for severity in profiles.values_mut() {
-        severity.sort_unstable_by(|a, b| b.cmp(a));
+    for deficits in profiles.values_mut() {
+        deficits.sort_unstable_by(|a, b| b.total_cmp(a));
     }
     profiles
 }
 
-/// Board-edge safety is a hard constraint above the ordinary total-finding score.
-/// Removing findings is allowed, but every retained identity/multiplicity rank must
-/// have existed before and be no more severe. This prevents a transform from
-/// trading two copper findings for one newly unsafe outline crossing.
+fn board_edge_deficit_is_not_worse(after: f64, before: f64) -> bool {
+    match (after.is_infinite(), before.is_infinite()) {
+        (true, false) => false,
+        (_, true) => true,
+        (false, false) => after <= before || after - before <= BOARD_EDGE_GEOMETRY_EPS_MM,
+    }
+}
+
+/// Board-edge safety is a constraint above the ordinary total-finding score. An
+/// edge-clean baseline therefore guarantees an edge-clean candidate. When the
+/// baseline already contains edge findings, the public `Violation` has no feature
+/// id, so this can only require each retained identity/multiplicity deficit rank to
+/// be no worse; it does not claim physical-feature correspondence. This aggregate
+/// gate still prevents a transform from trading copper findings for a more severe
+/// outline profile under the same public identities.
 fn board_edge_findings_are_not_worse(
     before: &[mr_drc::Violation],
     candidate: &[mr_drc::Violation],
 ) -> bool {
-    let before = board_edge_severity_profiles(before);
-    let candidate = board_edge_severity_profiles(candidate);
+    let before = board_edge_deficit_profiles(before);
+    let candidate = board_edge_deficit_profiles(candidate);
     for (identity, candidate_severity) in &candidate {
         let Some(before_severity) = before.get(identity) else {
             return false;
@@ -164,7 +190,7 @@ fn board_edge_findings_are_not_worse(
         if candidate_severity
             .iter()
             .zip(before_severity)
-            .any(|(after, before)| after > before)
+            .any(|(&after, &before)| !board_edge_deficit_is_not_worse(after, before))
         {
             return false;
         }
@@ -1665,6 +1691,67 @@ mod tests {
         let improved_edge = [clearance_violation(0.16, ("trace", BOARD_EDGE_NET))];
         assert!(drc_candidate_is_better(&before, &improved_edge));
         assert!(drc_candidate_is_better(&before, &[]));
+    }
+
+    #[test]
+    fn board_edge_comparator_uses_checker_tolerance_not_ordinary_quantum() {
+        let before = [
+            clearance_violation(0.1, ("trace", BOARD_EDGE_NET)),
+            clearance_violation(0.05, ("A", "B")),
+        ];
+        let sub_quantum_worsening = [clearance_violation(
+            0.1 - 0.4 * DRC_SCORE_QUANTUM_MM,
+            ("trace", BOARD_EDGE_NET),
+        )];
+        assert_eq!(
+            drc_severity(&before[0]),
+            drc_severity(&sub_quantum_worsening[0]),
+            "ordinary DRC intentionally rounds this sub-nanometre change to a tie"
+        );
+        assert!(!board_edge_findings_are_not_worse(
+            &before,
+            &sub_quantum_worsening
+        ));
+        assert!(
+            !drc_candidate_is_better(&before, &sub_quantum_worsening),
+            "removing an ordinary finding cannot hide a board-edge worsening below 1e-6 mm"
+        );
+
+        let checker_tolerance_jitter = [clearance_violation(
+            0.1 - BOARD_EDGE_GEOMETRY_EPS_MM,
+            ("trace", BOARD_EDGE_NET),
+        )];
+        assert!(board_edge_findings_are_not_worse(
+            &before,
+            &checker_tolerance_jitter
+        ));
+        assert!(drc_candidate_is_better(&before, &checker_tolerance_jitter));
+    }
+
+    #[test]
+    fn board_edge_comparator_normalizes_nonfinite_deficits_deterministically() {
+        let finite = [clearance_violation(0.1, ("trace", BOARD_EDGE_NET))];
+        let mut nan = clearance_violation(0.1, ("trace", BOARD_EDGE_NET));
+        nan.measured = f64::NAN;
+        let mut infinite_deficit = clearance_violation(0.1, ("trace", BOARD_EDGE_NET));
+        infinite_deficit.measured = f64::NEG_INFINITY;
+
+        assert!(!board_edge_findings_are_not_worse(
+            &finite,
+            std::slice::from_ref(&nan)
+        ));
+        assert!(!board_edge_findings_are_not_worse(
+            &finite,
+            std::slice::from_ref(&infinite_deficit)
+        ));
+        assert!(board_edge_findings_are_not_worse(
+            std::slice::from_ref(&nan),
+            std::slice::from_ref(&nan)
+        ));
+        assert!(board_edge_findings_are_not_worse(
+            std::slice::from_ref(&infinite_deficit),
+            &finite
+        ));
     }
 
     #[test]
