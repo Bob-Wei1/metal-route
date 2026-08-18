@@ -517,6 +517,313 @@ pub fn metal_route_isolated_batch(
     Ok(output)
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RaggedRouteStats {
+    packed_cells: usize,
+    full_field_cells: usize,
+    readback_cells: usize,
+    chunks: usize,
+}
+
+/// Experimental cropped/ragged implementation of
+/// [`metal_route_isolated_batch`].
+///
+/// This has the same exact weighted, via, window, passable-pad, and canonical
+/// path contract as the established full-field entry point. Its implementation
+/// packs each field at the submitted window's real size and reconstructs paths on
+/// the GPU, so distance/hop planes never become host vectors. The surface remains
+/// hidden until a negotiated-router integration can select it conservatively.
+/// A nonempty [`Grid::via_forbidden`] mask currently fails closed because the
+/// compact request does not yet encode each net's `via_passable_pads` exemptions.
+/// Any malformed shape, resource failure, shader error, or invalid compact result
+/// rejects the whole call with [`RouterError::BackendUnavailable`]; callers must
+/// then rerun the complete batch on the CPU.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn metal_route_isolated_batch_ragged(
+    grid: &Grid,
+    nets: &[NetEndpoints],
+    windows: &[MetalWindow],
+    edges: MetalEdgeCosts<'_>,
+) -> Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+    ragged_isolated_batch_impl(grid, nets, windows, edges).map(|(routes, _)| routes)
+}
+
+#[cfg(target_os = "macos")]
+fn ragged_isolated_batch_impl(
+    grid: &Grid,
+    nets: &[NetEndpoints],
+    windows: &[MetalWindow],
+    edges: MetalEdgeCosts<'_>,
+) -> Result<(Vec<Option<MetalIsolatedRoute>>, RaggedRouteStats), RouterError> {
+    let unavailable = |message: String| RouterError::BackendUnavailable(message);
+    if !grid.is_well_formed() {
+        return Err(unavailable(
+            "ragged isolated batch has a malformed grid".into(),
+        ));
+    }
+    // This compact request does not yet carry per-net via-pad exemptions. Even
+    // an all-false, nonempty mask means the caller selected the static-mask
+    // contract, so fail the whole batch closed until both arrays are packed.
+    if !grid.via_forbidden.is_empty() {
+        return Err(unavailable(
+            "ragged isolated Metal routing does not support static via masks".into(),
+        ));
+    }
+    let dims = grid.dims;
+    let expected_x = (dims.w as usize).saturating_sub(1);
+    let expected_y = (dims.h as usize).saturating_sub(1);
+    let expected_vias = (dims.layers as usize).saturating_sub(1);
+    if windows.len() != nets.len()
+        || edges.x.len() != expected_x
+        || edges.y.len() != expected_y
+        || edges.vias.len() != expected_vias
+    {
+        return Err(unavailable(
+            "ragged isolated batch shape does not match grid/nets".into(),
+        ));
+    }
+    for (net, &window) in nets.iter().zip(windows) {
+        if !window.is_valid(dims) {
+            return Err(unavailable(format!(
+                "net `{}` has an invalid ragged-route window",
+                net.net
+            )));
+        }
+        if net.passable_pads.iter().any(|&cell| !dims.contains(cell))
+            || net
+                .via_passable_pads
+                .iter()
+                .any(|cell| !dims.contains(*cell) || !net.passable_pads.contains(cell))
+            || !dims.contains(net.src)
+            || !dims.contains(net.dst)
+            || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
+            || (grid.is_obstacle(net.dst) && !net.passable_pads.contains(&net.dst))
+        {
+            return Err(unavailable(format!(
+                "net `{}` has an invalid ragged-route endpoint",
+                net.net
+            )));
+        }
+    }
+    if nets.is_empty() {
+        return Ok((Vec::new(), RaggedRouteStats::default()));
+    }
+
+    let via_edges: Vec<Cost> = edges
+        .vias
+        .iter()
+        .map(|edge| edge.unwrap_or_default())
+        .collect();
+    let via_allowed: Vec<u32> = edges
+        .vias
+        .iter()
+        .map(|edge| u32::from(edge.is_some()))
+        .collect();
+    let mut output = Vec::with_capacity(nets.len());
+    let mut stats = RaggedRouteStats {
+        full_field_cells: dims.len().checked_mul(nets.len()).ok_or_else(|| {
+            unavailable("ragged isolated full-field comparison is too large".into())
+        })?,
+        ..RaggedRouteStats::default()
+    };
+
+    let window_cells = |window: MetalWindow| -> Result<usize, RouterError> {
+        let w = (window.x1 - window.x0 + 1) as usize;
+        let h = (window.y1 - window.y0 + 1) as usize;
+        w.checked_mul(h)
+            .and_then(|plane| plane.checked_mul(dims.layers as usize))
+            .ok_or_else(|| unavailable("ragged isolated window is too large".into()))
+    };
+
+    let mut batch_start = 0usize;
+    while batch_start < nets.len() {
+        let mut batch_end = batch_start;
+        let mut batch_cells = 0usize;
+        while batch_end < nets.len() && batch_end - batch_start < MAX_FIELDS_PER_BATCH {
+            let next = window_cells(windows[batch_end])?;
+            let combined = batch_cells
+                .checked_add(next)
+                .ok_or_else(|| unavailable("ragged isolated batch is too large".into()))?;
+            if batch_end > batch_start && combined > MAX_BATCH_CELLS {
+                break;
+            }
+            batch_cells = combined;
+            batch_end += 1;
+        }
+
+        let net_batch = &nets[batch_start..batch_end];
+        let window_batch = &windows[batch_start..batch_end];
+        let mut fields = Vec::with_capacity(net_batch.len());
+        let mut packed_costs = Vec::with_capacity(batch_cells);
+        for (net, &window) in net_batch.iter().zip(window_batch) {
+            let w = window.x1 - window.x0 + 1;
+            let h = window.y1 - window.y0 + 1;
+            let plane = w.checked_mul(h).ok_or_else(|| {
+                unavailable(format!("net `{}` ragged window is too large", net.net))
+            })?;
+            let cell_offset = u32::try_from(packed_costs.len())
+                .map_err(|_| unavailable("ragged isolated batch exceeds 32-bit indexing".into()))?;
+            for layer in 0..dims.layers {
+                for y in window.y0..=window.y1 {
+                    for x in window.x0..=window.x1 {
+                        packed_costs.push(grid.cost[dims.idx3(x, y, layer) as usize]);
+                    }
+                }
+            }
+            let packed_cell = |global: CellIdx| -> u32 {
+                if !window.contains(dims, global) {
+                    return u32::MAX;
+                }
+                let (x, y, layer) = dims.xyz(global);
+                cell_offset + layer * plane + (y - window.y0) * w + x - window.x0
+            };
+            for &pad in &net.passable_pads {
+                let local = packed_cell(pad);
+                if local != u32::MAX && packed_costs[local as usize] == Cost::MAX {
+                    packed_costs[local as usize] = 1;
+                }
+            }
+            fields.push(gpu::RaggedField {
+                cell_offset,
+                w,
+                h,
+                layers: dims.layers,
+                x0: window.x0,
+                y0: window.y0,
+                src: packed_cell(net.src),
+                dst: packed_cell(net.dst),
+            });
+        }
+        if packed_costs.len() != batch_cells {
+            return Err(unavailable(
+                "ragged isolated packing disagrees with its preflight".into(),
+            ));
+        }
+
+        let ragged = gpu::sweep_ragged_paths(
+            grid,
+            &fields,
+            &packed_costs,
+            edges.x,
+            edges.y,
+            &via_edges,
+            &via_allowed,
+        )?;
+        if ragged.paths.len() != net_batch.len() || ragged.search_costs.len() != net_batch.len() {
+            return Err(unavailable(
+                "ragged isolated GPU result shape is invalid".into(),
+            ));
+        }
+        stats.packed_cells = stats
+            .packed_cells
+            .checked_add(ragged.packed_cells)
+            .ok_or_else(|| unavailable("ragged packed-cell statistic overflowed".into()))?;
+        stats.readback_cells = stats
+            .readback_cells
+            .checked_add(ragged.readback_cells)
+            .ok_or_else(|| unavailable("ragged readback statistic overflowed".into()))?;
+        stats.chunks += 1;
+
+        for (((path, &search_cost), net), &window) in ragged
+            .paths
+            .into_iter()
+            .zip(&ragged.search_costs)
+            .zip(net_batch)
+            .zip(window_batch)
+        {
+            let Some(path) = path else {
+                if search_cost != Cost::MAX {
+                    return Err(unavailable(
+                        "unrouted ragged Metal field returned a finite cost".into(),
+                    ));
+                }
+                output.push(None);
+                continue;
+            };
+            if path.first() != Some(&net.src)
+                || path.last() != Some(&net.dst)
+                || path.len() > window_cells(window)?
+                || path.iter().any(|&cell| !window.contains(dims, cell))
+            {
+                return Err(unavailable(
+                    "ragged Metal compact path failed endpoint/window validation".into(),
+                ));
+            }
+            let mut unique = std::collections::HashSet::with_capacity(path.len());
+            if path.iter().any(|&cell| !unique.insert(cell)) {
+                return Err(unavailable(
+                    "ragged Metal compact path contains a cycle".into(),
+                ));
+            }
+            let mut checked_cost: Cost = 0;
+            for pair in path.windows(2) {
+                let (u, v) = (pair[0], pair[1]);
+                let (ux, uy, ul) = dims.xyz(u);
+                let (vx, vy, vl) = dims.xyz(v);
+                let edge = if ul != vl {
+                    if ux != vx || uy != vy || ul.abs_diff(vl) != 1 {
+                        return Err(unavailable(
+                            "ragged Metal compact path has a non-adjacent via".into(),
+                        ));
+                    }
+                    edges.vias[ul.min(vl) as usize].ok_or_else(|| {
+                        unavailable("ragged Metal compact path used a forbidden via".into())
+                    })?
+                } else if ux.abs_diff(vx) == 1 && uy == vy {
+                    edges.x[ux.min(vx) as usize]
+                } else if uy.abs_diff(vy) == 1 && ux == vx {
+                    edges.y[uy.min(vy) as usize]
+                } else {
+                    return Err(unavailable(
+                        "ragged Metal compact path has non-adjacent planar cells".into(),
+                    ));
+                };
+                let enter = if grid.is_obstacle(v) && net.passable_pads.contains(&v) {
+                    1
+                } else {
+                    grid.cost_at(v)
+                };
+                if enter == Cost::MAX {
+                    return Err(unavailable(
+                        "ragged Metal compact path entered an obstacle".into(),
+                    ));
+                }
+                checked_cost = checked_cost.saturating_add(isolated_step_cost(edge, enter));
+            }
+            if checked_cost != search_cost {
+                return Err(unavailable(
+                    "ragged Metal compact path cost failed validation".into(),
+                ));
+            }
+            output.push(Some(MetalIsolatedRoute { path, search_cost }));
+        }
+        batch_start = batch_end;
+    }
+
+    if output.len() != nets.len() {
+        return Err(unavailable(
+            "ragged isolated batch did not produce every result".into(),
+        ));
+    }
+    Ok((output, stats))
+}
+
+/// Non-macOS fallback. Callers must retry the complete batch on the CPU.
+#[cfg(not(target_os = "macos"))]
+#[doc(hidden)]
+pub fn metal_route_isolated_batch_ragged(
+    _grid: &Grid,
+    _nets: &[NetEndpoints],
+    _windows: &[MetalWindow],
+    _edges: MetalEdgeCosts<'_>,
+) -> Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
+    Err(RouterError::BackendUnavailable(
+        "Metal compute is only available on macOS".into(),
+    ))
+}
+
 /// Non-macOS fallback. Callers must retry the same batch on the CPU.
 #[cfg(not(target_os = "macos"))]
 pub fn metal_route_isolated_batch(
@@ -864,6 +1171,18 @@ mod tests {
             },
         )
         .unwrap();
+        let ragged = metal_route_isolated_batch_ragged(
+            grid,
+            nets,
+            &windows,
+            MetalEdgeCosts {
+                x: &x,
+                y: &y,
+                vias: &vias,
+            },
+        )
+        .unwrap();
+        assert_eq!(ragged, gpu, "ragged and full-field Metal paths");
         let (_, trace) = NegotiatedRouter::new()
             .with_coords(coords.clone())
             .with_via_model(via_model.clone())
@@ -1387,6 +1706,206 @@ mod tests {
     }
 
     #[test]
+    fn ragged_batch_matches_full_fields_on_adversarial_variable_windows() {
+        let dims = mr_core::Dims::with_layers(13, 11, 3);
+        let x: Vec<_> = (0..dims.w - 1).map(|i| (i * 17) % 41).collect();
+        let y: Vec<_> = (0..dims.h - 1).map(|i| (i * 23) % 37).collect();
+        let via_patterns = [
+            vec![Some(0), Some(Cost::MAX)],
+            vec![Some(29), None],
+            vec![None, Some(7)],
+        ];
+        for case in 0..18u64 {
+            let mut state = 0xD1B5_4A32_D192_ED03u64 ^ case.wrapping_mul(0x9E37_79B9);
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut grid = Grid::filled(dims, 1);
+            for enter in &mut grid.cost {
+                let r = next();
+                *enter = if r % 13 == 0 {
+                    Cost::MAX
+                } else if r % 7 == 0 {
+                    0
+                } else {
+                    1 + (r % 31) as Cost
+                };
+            }
+            let mut nets = Vec::new();
+            let mut windows = Vec::new();
+            for net_i in 0..24u32 {
+                let w = 2 + (next() % 12) as u32;
+                let h = 2 + (next() % 10) as u32;
+                let x0 = (next() % (dims.w - w + 1) as u64) as u32;
+                let y0 = (next() % (dims.h - h + 1) as u64) as u32;
+                let window = MetalWindow {
+                    x0,
+                    y0,
+                    x1: x0 + w - 1,
+                    y1: y0 + h - 1,
+                };
+                let src = dims.idx3(
+                    x0 + (next() % w as u64) as u32,
+                    y0 + (next() % h as u64) as u32,
+                    (next() % dims.layers as u64) as u32,
+                );
+                let dst = dims.idx3(
+                    x0 + (next() % w as u64) as u32,
+                    y0 + (next() % h as u64) as u32,
+                    (next() % dims.layers as u64) as u32,
+                );
+                let mut pads = Vec::new();
+                if grid.is_obstacle(src) {
+                    pads.push(src);
+                }
+                if grid.is_obstacle(dst) && dst != src {
+                    pads.push(dst);
+                }
+                // Exercise own obstacle pads away from endpoints as well.
+                let pad = dims.idx3(x0, y0, net_i % dims.layers);
+                if grid.is_obstacle(pad) && !pads.contains(&pad) {
+                    pads.push(pad);
+                }
+                nets.push(NetEndpoints {
+                    net: format!("ragged-{case:02}-{net_i:02}"),
+                    src,
+                    dst,
+                    passable_pads: pads,
+                    via_passable_pads: Vec::new(),
+                });
+                windows.push(window);
+            }
+            let vias = &via_patterns[case as usize % via_patterns.len()];
+            let edges = MetalEdgeCosts { x: &x, y: &y, vias };
+            let full = metal_route_isolated_batch(&grid, &nets, &windows, edges).unwrap();
+            let first = metal_route_isolated_batch_ragged(&grid, &nets, &windows, edges).unwrap();
+            let second = metal_route_isolated_batch_ragged(&grid, &nets, &windows, edges).unwrap();
+            assert_eq!(first, full, "case {case}: ragged vs full-field");
+            assert_eq!(second, first, "case {case}: deterministic compact output");
+        }
+    }
+
+    #[test]
+    fn ragged_batch_compacts_fields_and_readback_across_chunk_boundary() {
+        let dims = mr_core::Dims::with_layers(64, 48, 2);
+        let grid = Grid::filled(dims, 1);
+        let nets: Vec<_> = (0..=MAX_FIELDS_PER_BATCH)
+            .map(|i| {
+                let x0 = ((i * 7) % 52) as u32;
+                let y0 = ((i * 11) % 36) as u32;
+                NetEndpoints {
+                    net: format!("compact-{i:03}"),
+                    src: dims.idx3(x0, y0, i as u32 % 2),
+                    dst: dims.idx3(x0 + 11, y0 + 11, (i as u32 + 1) % 2),
+                    passable_pads: Vec::new(),
+                    via_passable_pads: Vec::new(),
+                }
+            })
+            .collect();
+        let windows: Vec<_> = nets
+            .iter()
+            .map(|net| {
+                let (x0, y0) = dims.xy(net.src);
+                MetalWindow {
+                    x0,
+                    y0,
+                    x1: x0 + 11,
+                    y1: y0 + 11,
+                }
+            })
+            .collect();
+        let x = vec![13; dims.w as usize - 1];
+        let y = vec![17; dims.h as usize - 1];
+        let vias = [Some(31)];
+        let edges = MetalEdgeCosts {
+            x: &x,
+            y: &y,
+            vias: &vias,
+        };
+        let full = metal_route_isolated_batch(&grid, &nets, &windows, edges).unwrap();
+        let (ragged, stats) = ragged_isolated_batch_impl(&grid, &nets, &windows, edges).unwrap();
+        assert_eq!(ragged, full);
+        assert_eq!(stats.chunks, 2);
+        assert_eq!(stats.packed_cells, 12 * 12 * 2 * nets.len());
+        assert_eq!(stats.full_field_cells, dims.len() * nets.len());
+        assert!(stats.packed_cells * 10 < stats.full_field_cells);
+        assert!(stats.readback_cells * 10 < stats.packed_cells);
+    }
+
+    #[test]
+    fn ragged_batch_maps_all_validation_failures_to_backend_unavailable() {
+        let dims = mr_core::Dims::new(3, 2);
+        let net = NetEndpoints {
+            net: "bad".into(),
+            src: 0,
+            dst: 5,
+            passable_pads: Vec::new(),
+            via_passable_pads: Vec::new(),
+        };
+        let edges = MetalEdgeCosts {
+            x: &[SCALE, SCALE],
+            y: &[SCALE],
+            vias: &[],
+        };
+        let mut malformed = Grid::filled(dims, 1);
+        malformed.cost.pop();
+        assert!(matches!(
+            metal_route_isolated_batch_ragged(
+                &malformed,
+                std::slice::from_ref(&net),
+                &[MetalWindow::full(dims)],
+                edges,
+            ),
+            Err(RouterError::BackendUnavailable(_))
+        ));
+        let grid = Grid::filled(dims, 1);
+        assert!(matches!(
+            metal_route_isolated_batch_ragged(&grid, std::slice::from_ref(&net), &[], edges,),
+            Err(RouterError::BackendUnavailable(_))
+        ));
+        let invalid = NetEndpoints { src: 99, ..net };
+        assert!(matches!(
+            metal_route_isolated_batch_ragged(&grid, &[invalid], &[MetalWindow::full(dims)], edges,),
+            Err(RouterError::BackendUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn ragged_batch_rejects_any_nonempty_static_via_mask() {
+        let dims = mr_core::Dims::with_layers(3, 2, 2);
+        let mut grid = Grid::filled(dims, 1);
+        // Nonempty selects the static via-mask contract even when no bit is set.
+        grid.via_forbidden = vec![false; dims.len()];
+        let src = dims.idx3(0, 0, 0);
+        let net = NetEndpoints {
+            net: "masked-via".into(),
+            src,
+            dst: dims.idx3(2, 1, 1),
+            passable_pads: vec![src],
+            via_passable_pads: vec![src],
+        };
+        let err = metal_route_isolated_batch_ragged(
+            &grid,
+            &[net],
+            &[MetalWindow::full(dims)],
+            MetalEdgeCosts {
+                x: &[SCALE, SCALE],
+                y: &[SCALE],
+                vias: &[Some(SCALE)],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RouterError::BackendUnavailable(message)
+                if message == "ragged isolated Metal routing does not support static via masks"
+        ));
+    }
+
+    #[test]
     fn isolated_batch_honours_cpu_window_before_full_retry() {
         let dims = mr_core::Dims::new(50, 40);
         let mut grid = Grid::filled(dims, 1);
@@ -1785,6 +2304,119 @@ mod tests {
     }
 
     // ---- D3: CPU vs Metal batch benchmark ------------------------------------
+
+    /// End-to-end full-field vs ragged/compact work at the observed bug05 and
+    /// bug50 board dimensions, net counts, and aggregate window-area ratios.
+    ///
+    /// Run with:
+    /// `cargo test -p mr-metal --release ragged_representative_window_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "large representative Metal microbenchmark"]
+    fn ragged_representative_window_benchmark() {
+        let cases = [
+            (
+                "bug05-shaped",
+                mr_core::Dims::with_layers(733, 878, 2),
+                228usize,
+                220u32,
+                25u32,
+                360u32,
+                20u32,
+            ),
+            (
+                "bug50-shaped",
+                mr_core::Dims::with_layers(702, 461, 4),
+                322usize,
+                170u32,
+                15u32,
+                175u32,
+                15u32,
+            ),
+        ];
+        for (name, dims, net_count, base_w, step_w, base_h, step_h) in cases {
+            let grid = Grid::filled(dims, 1);
+            let mut nets = Vec::with_capacity(net_count);
+            let mut windows = Vec::with_capacity(net_count);
+            for i in 0..net_count as u32 {
+                let w = base_w + (i % 5) * step_w;
+                let h = base_h + (i % 3) * step_h;
+                let x0 = (i * 97) % (dims.w - w + 1);
+                let y0 = (i * 53) % (dims.h - h + 1);
+                let window = MetalWindow {
+                    x0,
+                    y0,
+                    x1: x0 + w - 1,
+                    y1: y0 + h - 1,
+                };
+                nets.push(NetEndpoints {
+                    net: format!("{name}-{i:03}"),
+                    src: dims.idx3(x0 + 2, y0 + 2, i % dims.layers),
+                    dst: dims.idx3(window.x1 - 2, window.y1 - 2, (i + 1) % dims.layers),
+                    passable_pads: Vec::new(),
+                    via_passable_pads: Vec::new(),
+                });
+                windows.push(window);
+            }
+            let x: Vec<_> = (0..dims.w - 1).map(|i| 8 + (i % 7) * 3).collect();
+            let y: Vec<_> = (0..dims.h - 1).map(|i| 9 + (i % 5) * 5).collect();
+            let vias = vec![Some(160); dims.layers.saturating_sub(1) as usize];
+            let edges = MetalEdgeCosts {
+                x: &x,
+                y: &y,
+                vias: &vias,
+            };
+
+            let expected = metal_route_isolated_batch(&grid, &nets, &windows, edges).unwrap();
+            let (ragged, stats) =
+                ragged_isolated_batch_impl(&grid, &nets, &windows, edges).unwrap();
+            assert_eq!(ragged, expected);
+            let mut full_samples = Vec::with_capacity(3);
+            let mut ragged_samples = Vec::with_capacity(3);
+            for sample in 0..3 {
+                if sample % 2 == 0 {
+                    let started = Instant::now();
+                    let got =
+                        metal_route_isolated_batch_ragged(&grid, &nets, &windows, edges).unwrap();
+                    ragged_samples.push(started.elapsed());
+                    assert_eq!(got, expected);
+                    let started = Instant::now();
+                    let got = metal_route_isolated_batch(&grid, &nets, &windows, edges).unwrap();
+                    full_samples.push(started.elapsed());
+                    assert_eq!(got, expected);
+                } else {
+                    let started = Instant::now();
+                    let got = metal_route_isolated_batch(&grid, &nets, &windows, edges).unwrap();
+                    full_samples.push(started.elapsed());
+                    assert_eq!(got, expected);
+                    let started = Instant::now();
+                    let got =
+                        metal_route_isolated_batch_ragged(&grid, &nets, &windows, edges).unwrap();
+                    ragged_samples.push(started.elapsed());
+                    assert_eq!(got, expected);
+                }
+            }
+            full_samples.sort_unstable();
+            ragged_samples.sort_unstable();
+            let full = full_samples[1];
+            let ragged = ragged_samples[1];
+            println!(
+                "\n=== {name}: {}x{}x{}, {net_count} fields ===\n\
+                 field cells: {} -> {} ({:.2}x smaller)\n\
+                 host readback u32s: {} -> {} ({:.1}x smaller)\n\
+                 warm end-to-end p50/3: full {full:.3?}; ragged {ragged:.3?}; {:.2}x speedup",
+                dims.w,
+                dims.h,
+                dims.layers,
+                stats.full_field_cells,
+                stats.packed_cells,
+                stats.full_field_cells as f64 / stats.packed_cells as f64,
+                stats.full_field_cells * 2,
+                stats.readback_cells,
+                stats.full_field_cells as f64 * 2.0 / stats.readback_cells as f64,
+                full.as_secs_f64() / ragged.as_secs_f64(),
+            );
+        }
+    }
 
     /// End-to-end timing for the exact weighted/Hanan/window/via isolated API.
     /// Includes host mask packing, shared-buffer creation, kernel convergence,

@@ -428,6 +428,290 @@ kernel void sweep_vias_edges(
         atomic_store_explicit(changed, 1u, memory_order_relaxed);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Experimental ragged/cropped edge-aware batch.
+//
+// Fields are packed back-to-back at their real per-net window sizes.  Host-built
+// line descriptors let one kernel sweep rows and columns without padding every
+// field to the full board.  `edge0` maps a cropped line back to the global Hanan
+// edge vectors, so weighted planar/via semantics remain identical to M4 above.
+// ---------------------------------------------------------------------------
+struct RaggedLine {
+    uint base;
+    uint len;
+    uint stride;
+    uint edge0;
+};
+
+struct RaggedField {
+    uint cell_offset;
+    uint w;
+    uint h;
+    uint layers;
+    uint x0;
+    uint y0;
+    uint src;
+    uint dst;
+};
+
+struct RaggedMeta {
+    uint fields;
+    uint global_w;
+    uint global_h;
+    uint reserved;
+};
+
+kernel void sweep_ragged_lines_edges(
+    device       uint*  dist       [[buffer(0)]],
+    device const uint*  cost       [[buffer(1)]],
+    device const uint*  edges      [[buffer(2)]],
+    device const RaggedLine* lines [[buffer(3)]],
+    device       atomic_uint* changed [[buffer(4)]],
+    device       uint*  hops       [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    RaggedLine line = lines[gid];
+    bool line_changed = false;
+    for (uint pos = 1u; pos < line.len; ++pos) {
+        uint cur = line.base + pos * line.stride;
+        uint c = cost[cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur - line.stride;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(edges[line.edge0 + pos - 1u], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    for (uint posi = line.len; posi >= 2u; --posi) {
+        uint pos = posi - 2u;
+        uint cur = line.base + pos * line.stride;
+        uint c = cost[cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur + line.stride;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(edges[line.edge0 + pos], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+kernel void sweep_ragged_vias_edges(
+    device       uint*  dist       [[buffer(0)]],
+    device const uint*  cost       [[buffer(1)]],
+    device const uint*  via_edges  [[buffer(2)]],
+    device const uint*  via_allowed [[buffer(3)]],
+    device const RaggedField* fields [[buffer(4)]],
+    device       atomic_uint* changed [[buffer(5)]],
+    device       uint*  hops       [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    RaggedField field = fields[gid.y];
+    uint plane = field.w * field.h;
+    if (gid.x >= plane) return;
+    uint base = field.cell_offset + gid.x;
+    bool line_changed = false;
+    for (uint layer = 1u; layer < field.layers; ++layer) {
+        if (via_allowed[layer - 1u] == 0u) continue;
+        uint cur = base + layer * plane;
+        uint c = cost[cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur - plane;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(via_edges[layer - 1u], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    for (uint layeri = field.layers; layeri >= 2u; --layeri) {
+        uint layer = layeri - 2u;
+        if (via_allowed[layer] == 0u) continue;
+        uint cur = base + layer * plane;
+        uint c = cost[cur];
+        if (c == COST_MAX) continue;
+        uint prev_idx = cur + plane;
+        uint prev = dist[prev_idx];
+        if (prev == COST_MAX) continue;
+        uint cand = sat_add(prev, passable_mul(via_edges[layer], c));
+        uint cand_hops = sat_add(hops[prev_idx], 1u);
+        if (cand != COST_MAX &&
+            (cand < dist[cur] || (cand == dist[cur] && cand_hops < hops[cur]))) {
+            dist[cur] = cand;
+            hops[cur] = cand_hops;
+            line_changed = true;
+        }
+    }
+    if (line_changed) {
+        atomic_store_explicit(changed, 1u, memory_order_relaxed);
+    }
+}
+
+inline bool ragged_pred_matches(
+    uint pred,
+    uint cur,
+    uint edge,
+    device const uint* dist,
+    device const uint* hops,
+    device const uint* cost)
+{
+    uint dp = dist[pred];
+    uint hp = hops[pred];
+    uint need_hops = hops[cur];
+    if (dp == COST_MAX || hp == COST_MAX || need_hops == 0u || need_hops == COST_MAX) {
+        return false;
+    }
+    uint step = passable_mul(edge, cost[cur]);
+    return sat_add(dp, step) == dist[cur] && sat_add(hp, 1u) == need_hops;
+}
+
+// Return the canonical lower global CellIdx predecessor. Cropping never changes
+// index ordering, so checking lower layer, up, left, right, down, upper is exact.
+inline uint ragged_predecessor(
+    RaggedField field,
+    uint cur,
+    device const uint* dist,
+    device const uint* hops,
+    device const uint* cost,
+    device const uint* x_edges,
+    device const uint* y_edges,
+    device const uint* via_edges,
+    device const uint* via_allowed)
+{
+    uint plane = field.w * field.h;
+    uint rel = cur - field.cell_offset;
+    uint layer = rel / plane;
+    uint xy = rel - layer * plane;
+    uint x = xy % field.w;
+    uint y = xy / field.w;
+
+    if (layer > 0u && via_allowed[layer - 1u] != 0u) {
+        uint pred = cur - plane;
+        if (ragged_pred_matches(pred, cur, via_edges[layer - 1u], dist, hops, cost)) return pred;
+    }
+    if (y > 0u) {
+        uint pred = cur - field.w;
+        if (ragged_pred_matches(pred, cur, y_edges[field.y0 + y - 1u], dist, hops, cost)) return pred;
+    }
+    if (x > 0u) {
+        uint pred = cur - 1u;
+        if (ragged_pred_matches(pred, cur, x_edges[field.x0 + x - 1u], dist, hops, cost)) return pred;
+    }
+    if (x + 1u < field.w) {
+        uint pred = cur + 1u;
+        if (ragged_pred_matches(pred, cur, x_edges[field.x0 + x], dist, hops, cost)) return pred;
+    }
+    if (y + 1u < field.h) {
+        uint pred = cur + field.w;
+        if (ragged_pred_matches(pred, cur, y_edges[field.y0 + y], dist, hops, cost)) return pred;
+    }
+    if (layer + 1u < field.layers && via_allowed[layer] != 0u) {
+        uint pred = cur + plane;
+        if (ragged_pred_matches(pred, cur, via_edges[layer], dist, hops, cost)) return pred;
+    }
+    return COST_MAX;
+}
+
+kernel void ragged_path_lengths(
+    device const uint* dist [[buffer(0)]],
+    device const uint* hops [[buffer(1)]],
+    device const uint* cost [[buffer(2)]],
+    device const uint* x_edges [[buffer(3)]],
+    device const uint* y_edges [[buffer(4)]],
+    device const uint* via_edges [[buffer(5)]],
+    device const uint* via_allowed [[buffer(6)]],
+    device const RaggedField* fields [[buffer(7)]],
+    device uint* lengths [[buffer(8)]],
+    device uint* route_costs [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    RaggedField field = fields[gid];
+    if (field.src == COST_MAX || field.dst == COST_MAX || dist[field.dst] == COST_MAX) {
+        lengths[gid] = 0u;
+        route_costs[gid] = COST_MAX;
+        return;
+    }
+    route_costs[gid] = dist[field.dst];
+    uint max_len = field.w * field.h * field.layers;
+    uint len = 1u;
+    uint cur = field.dst;
+    while (cur != field.src) {
+        if (len >= max_len) {
+            lengths[gid] = COST_MAX;
+            return;
+        }
+        cur = ragged_predecessor(
+            field, cur, dist, hops, cost, x_edges, y_edges, via_edges, via_allowed);
+        if (cur == COST_MAX) {
+            lengths[gid] = COST_MAX;
+            return;
+        }
+        ++len;
+    }
+    lengths[gid] = len;
+}
+
+inline uint ragged_global_cell(
+    RaggedField field,
+    constant RaggedMeta& meta,
+    uint packed_cell)
+{
+    uint plane = field.w * field.h;
+    uint rel = packed_cell - field.cell_offset;
+    uint layer = rel / plane;
+    uint xy = rel - layer * plane;
+    uint x = xy % field.w;
+    uint y = xy / field.w;
+    return layer * meta.global_w * meta.global_h
+        + (field.y0 + y) * meta.global_w + field.x0 + x;
+}
+
+kernel void ragged_write_paths(
+    device const uint* dist [[buffer(0)]],
+    device const uint* hops [[buffer(1)]],
+    device const uint* cost [[buffer(2)]],
+    device const uint* x_edges [[buffer(3)]],
+    device const uint* y_edges [[buffer(4)]],
+    device const uint* via_edges [[buffer(5)]],
+    device const uint* via_allowed [[buffer(6)]],
+    device const RaggedField* fields [[buffer(7)]],
+    device const uint* lengths [[buffer(8)]],
+    device const uint* offsets [[buffer(9)]],
+    device uint* paths [[buffer(10)]],
+    constant RaggedMeta& meta [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint len = lengths[gid];
+    if (len == 0u || len == COST_MAX) return;
+    RaggedField field = fields[gid];
+    uint cur = field.dst;
+    for (uint rev = 0u; rev < len; ++rev) {
+        paths[offsets[gid] + len - rev - 1u] = ragged_global_cell(field, meta, cur);
+        if (cur == field.src) return;
+        cur = ragged_predecessor(
+            field, cur, dist, hops, cost, x_edges, y_edges, via_edges, via_allowed);
+        if (cur == COST_MAX) return;
+    }
+}
 "#;
 
 /// Dims as laid out for the MSL `Dims` struct (six `u32`s).
@@ -445,6 +729,48 @@ struct GpuDims {
     track_hops: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RaggedField {
+    pub(crate) cell_offset: u32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) layers: u32,
+    pub(crate) x0: u32,
+    pub(crate) y0: u32,
+    /// Absolute packed-cell index, or `u32::MAX` when outside the window.
+    pub(crate) src: u32,
+    /// Absolute packed-cell index, or `u32::MAX` when outside the window.
+    pub(crate) dst: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RaggedLine {
+    base: u32,
+    len: u32,
+    stride: u32,
+    edge0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RaggedMeta {
+    fields: u32,
+    global_w: u32,
+    global_h: u32,
+    reserved: u32,
+}
+
+pub(crate) struct RaggedPathBatch {
+    pub(crate) paths: Vec<Option<Vec<CellIdx>>>,
+    pub(crate) search_costs: Vec<Cost>,
+    /// Number of cropped field cells retained on the GPU for this chunk.
+    pub(crate) packed_cells: usize,
+    /// Host-visible `u32`s: two words per field plus actual routed path cells.
+    pub(crate) readback_cells: usize,
+}
+
 /// A cached Metal context (device + queue + compiled pipelines).
 struct MetalCtx {
     device: Device,
@@ -455,6 +781,10 @@ struct MetalCtx {
     sweep_rows_edges: ComputePipelineState,
     sweep_cols_edges: ComputePipelineState,
     sweep_vias_edges: ComputePipelineState,
+    sweep_ragged_lines_edges: ComputePipelineState,
+    sweep_ragged_vias_edges: ComputePipelineState,
+    ragged_path_lengths: ComputePipelineState,
+    ragged_write_paths: ComputePipelineState,
 }
 
 impl MetalCtx {
@@ -485,6 +815,10 @@ impl MetalCtx {
             sweep_rows_edges: pipeline("sweep_rows_edges")?,
             sweep_cols_edges: pipeline("sweep_cols_edges")?,
             sweep_vias_edges: pipeline("sweep_vias_edges")?,
+            sweep_ragged_lines_edges: pipeline("sweep_ragged_lines_edges")?,
+            sweep_ragged_vias_edges: pipeline("sweep_ragged_vias_edges")?,
+            ragged_path_lengths: pipeline("ragged_path_lengths")?,
+            ragged_write_paths: pipeline("ragged_write_paths")?,
             device,
             queue,
         })
@@ -506,13 +840,18 @@ fn with_metal_ctx<T>(
     f(ctx)
 }
 
-fn new_u32_buffer(device: &Device, data: &[u32]) -> Buffer {
+fn new_buffer<T>(device: &Device, data: &[T]) -> Buffer {
     let bytes = std::mem::size_of_val(data) as u64;
+    debug_assert!(bytes > 0, "Metal buffer inputs use explicit dummy words");
     device.new_buffer_with_data(
         data.as_ptr() as *const _,
-        bytes.max(4),
+        bytes,
         MTLResourceOptions::StorageModeShared,
     )
+}
+
+fn new_u32_buffer(device: &Device, data: &[u32]) -> Buffer {
+    new_buffer(device, data)
 }
 
 fn read_u32_buffer(buf: &Buffer, len: usize) -> Vec<u32> {
@@ -1075,6 +1414,355 @@ pub(crate) fn sweep_fields_flat_edges(
             Ok(FlatSweep {
                 dist: read_u32_buffer(&dist_buf, total),
                 hops: Some(read_u32_buffer(&hop_buf, total)),
+            })
+        })
+    })
+}
+
+/// Solve exact weighted fields at their true cropped sizes and reconstruct paths
+/// on the GPU. Distance/hop planes remain device-side; only two metadata words per
+/// field and the actual path cells are copied into Rust vectors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_ragged_paths(
+    grid: &Grid,
+    fields: &[RaggedField],
+    costs: &[Cost],
+    x_edges: &[Cost],
+    y_edges: &[Cost],
+    via_edges: &[Cost],
+    via_allowed: &[u32],
+) -> Result<RaggedPathBatch, RouterError> {
+    if !grid.is_well_formed() {
+        return Err(RouterError::BackendUnavailable(
+            "ragged Metal batch received a malformed grid".into(),
+        ));
+    }
+    validate_edge_array_lengths(
+        grid,
+        x_edges.len(),
+        y_edges.len(),
+        via_edges.len(),
+        via_allowed.len(),
+    )?;
+    if fields.is_empty() {
+        if !costs.is_empty() {
+            return Err(RouterError::BackendUnavailable(
+                "empty ragged Metal batch has packed costs".into(),
+            ));
+        }
+        return Ok(RaggedPathBatch {
+            paths: Vec::new(),
+            search_costs: Vec::new(),
+            packed_cells: 0,
+            readback_cells: 0,
+        });
+    }
+
+    let dims = grid.dims;
+    let mut expected_offset = 0usize;
+    let mut max_field_cells = 0usize;
+    let mut max_plane = 0usize;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    for field in fields {
+        if field.w == 0
+            || field.h == 0
+            || field.layers != dims.layers
+            || field.x0.checked_add(field.w).is_none_or(|x| x > dims.w)
+            || field.y0.checked_add(field.h).is_none_or(|y| y > dims.h)
+            || field.cell_offset as usize != expected_offset
+        {
+            return Err(RouterError::BackendUnavailable(
+                "invalid ragged Metal field descriptor".into(),
+            ));
+        }
+        let plane = (field.w as usize)
+            .checked_mul(field.h as usize)
+            .ok_or_else(|| RouterError::BackendUnavailable("ragged field is too large".into()))?;
+        let cells = plane
+            .checked_mul(field.layers as usize)
+            .ok_or_else(|| RouterError::BackendUnavailable("ragged field is too large".into()))?;
+        let end = expected_offset
+            .checked_add(cells)
+            .ok_or_else(|| RouterError::BackendUnavailable("ragged batch is too large".into()))?;
+        if end > u32::MAX as usize
+            || [field.src, field.dst].into_iter().any(|cell| {
+                cell != u32::MAX && !((expected_offset as u32)..(end as u32)).contains(&cell)
+            })
+        {
+            return Err(RouterError::BackendUnavailable(
+                "ragged Metal endpoint/offset is out of range".into(),
+            ));
+        }
+        max_field_cells = max_field_cells.max(cells);
+        max_plane = max_plane.max(plane);
+
+        let plane_u32 = u32::try_from(plane)
+            .map_err(|_| RouterError::BackendUnavailable("ragged field is too large".into()))?;
+        for layer in 0..field.layers {
+            let layer_base = field.cell_offset + layer * plane_u32;
+            for y in 0..field.h {
+                rows.push(RaggedLine {
+                    base: layer_base + y * field.w,
+                    len: field.w,
+                    stride: 1,
+                    edge0: field.x0,
+                });
+            }
+            for x in 0..field.w {
+                cols.push(RaggedLine {
+                    base: layer_base + x,
+                    len: field.h,
+                    stride: field.w,
+                    edge0: field.y0,
+                });
+            }
+        }
+        expected_offset = end;
+    }
+    if costs.len() != expected_offset {
+        return Err(RouterError::BackendUnavailable(
+            "ragged Metal cost packing does not match descriptors".into(),
+        ));
+    }
+    let total = checked_batch_cells(costs.len(), 1)?;
+
+    let mut init = vec![Cost::MAX; total];
+    let mut hop_init = vec![u32::MAX; total];
+    let mut any_runnable = false;
+    for field in fields {
+        if field.src != u32::MAX && costs[field.src as usize] != Cost::MAX {
+            init[field.src as usize] = 0;
+            hop_init[field.src as usize] = 0;
+            any_runnable = true;
+        }
+    }
+    if !any_runnable {
+        return Ok(RaggedPathBatch {
+            paths: vec![None; fields.len()],
+            search_costs: vec![Cost::MAX; fields.len()],
+            packed_cells: total,
+            readback_cells: 0,
+        });
+    }
+
+    autoreleasepool(|| {
+        with_metal_ctx(|ctx| {
+            let dev = &ctx.device;
+            validate_edge_batch_buffers(
+                dev,
+                total,
+                costs.len(),
+                x_edges.len(),
+                y_edges.len(),
+                via_edges.len(),
+                via_allowed.len(),
+            )?;
+            validate_buffer_len(dev, fields.len().saturating_mul(8), "ragged fields")?;
+            validate_buffer_len(dev, rows.len().saturating_mul(4), "ragged rows")?;
+            validate_buffer_len(dev, cols.len().saturating_mul(4), "ragged columns")?;
+            validate_buffer_len(dev, fields.len(), "ragged path lengths")?;
+            validate_buffer_len(dev, fields.len(), "ragged route costs")?;
+
+            let zero = [0u32];
+            let dist_buf = new_u32_buffer(dev, &init);
+            let hop_buf = new_u32_buffer(dev, &hop_init);
+            let cost_buf = new_u32_buffer(dev, costs);
+            let x_buf = new_u32_buffer(dev, if x_edges.is_empty() { &zero } else { x_edges });
+            let y_buf = new_u32_buffer(dev, if y_edges.is_empty() { &zero } else { y_edges });
+            let via_buf = new_u32_buffer(
+                dev,
+                if via_edges.is_empty() {
+                    &zero
+                } else {
+                    via_edges
+                },
+            );
+            let via_allowed_buf = new_u32_buffer(
+                dev,
+                if via_allowed.is_empty() {
+                    &zero
+                } else {
+                    via_allowed
+                },
+            );
+            let field_buf = new_buffer(dev, fields);
+            let row_buf = new_buffer(dev, &rows);
+            let col_buf = new_buffer(dev, &cols);
+            let flag_buf = new_u32_buffer(dev, &[0u32]);
+
+            let tg = MTLSize::new(64, 1, 1);
+            let row_threads = MTLSize::new(rows.len() as u64, 1, 1);
+            let col_threads = MTLSize::new(cols.len() as u64, 1, 1);
+            let via_threads = MTLSize::new(max_plane as u64, fields.len() as u64, 1);
+            for _ in 0..max_field_cells.max(1) {
+                reset_u32_buffer(&flag_buf);
+                let cmd = ctx.queue.new_command_buffer();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_ragged_lines_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&x_buf), 0);
+                    enc.set_buffer(3, Some(&row_buf), 0);
+                    enc.set_buffer(4, Some(&flag_buf), 0);
+                    enc.set_buffer(5, Some(&hop_buf), 0);
+                    enc.dispatch_threads(row_threads, tg);
+                    enc.end_encoding();
+                }
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_ragged_lines_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&y_buf), 0);
+                    enc.set_buffer(3, Some(&col_buf), 0);
+                    enc.set_buffer(4, Some(&flag_buf), 0);
+                    enc.set_buffer(5, Some(&hop_buf), 0);
+                    enc.dispatch_threads(col_threads, tg);
+                    enc.end_encoding();
+                }
+                if dims.layers > 1 {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.sweep_ragged_vias_edges);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&cost_buf), 0);
+                    enc.set_buffer(2, Some(&via_buf), 0);
+                    enc.set_buffer(3, Some(&via_allowed_buf), 0);
+                    enc.set_buffer(4, Some(&field_buf), 0);
+                    enc.set_buffer(5, Some(&flag_buf), 0);
+                    enc.set_buffer(6, Some(&hop_buf), 0);
+                    enc.dispatch_threads(via_threads, tg);
+                    enc.end_encoding();
+                }
+                run_command_buffer(cmd)?;
+                if read_u32_buffer(&flag_buf, 1)[0] == 0 {
+                    break;
+                }
+            }
+
+            let length_buf = new_u32_buffer(dev, &vec![0u32; fields.len()]);
+            let route_cost_buf = new_u32_buffer(dev, &vec![Cost::MAX; fields.len()]);
+            let field_threads = MTLSize::new(fields.len() as u64, 1, 1);
+            let cmd = ctx.queue.new_command_buffer();
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&ctx.ragged_path_lengths);
+                enc.set_buffer(0, Some(&dist_buf), 0);
+                enc.set_buffer(1, Some(&hop_buf), 0);
+                enc.set_buffer(2, Some(&cost_buf), 0);
+                enc.set_buffer(3, Some(&x_buf), 0);
+                enc.set_buffer(4, Some(&y_buf), 0);
+                enc.set_buffer(5, Some(&via_buf), 0);
+                enc.set_buffer(6, Some(&via_allowed_buf), 0);
+                enc.set_buffer(7, Some(&field_buf), 0);
+                enc.set_buffer(8, Some(&length_buf), 0);
+                enc.set_buffer(9, Some(&route_cost_buf), 0);
+                enc.dispatch_threads(field_threads, tg);
+                enc.end_encoding();
+            }
+            run_command_buffer(cmd)?;
+
+            let lengths = read_u32_buffer(&length_buf, fields.len());
+            let search_costs = read_u32_buffer(&route_cost_buf, fields.len());
+            if lengths.contains(&u32::MAX) {
+                return Err(RouterError::BackendUnavailable(
+                    "ragged Metal path reconstruction failed".into(),
+                ));
+            }
+            let mut offsets = Vec::with_capacity(fields.len());
+            let mut path_cells = 0usize;
+            for (&len, field) in lengths.iter().zip(fields) {
+                let field_cells = (field.w as usize) * (field.h as usize) * (field.layers as usize);
+                if len as usize > field_cells {
+                    return Err(RouterError::BackendUnavailable(
+                        "ragged Metal returned an invalid path length".into(),
+                    ));
+                }
+                offsets.push(u32::try_from(path_cells).map_err(|_| {
+                    RouterError::BackendUnavailable("ragged Metal paths are too large".into())
+                })?);
+                path_cells = path_cells.checked_add(len as usize).ok_or_else(|| {
+                    RouterError::BackendUnavailable("ragged Metal paths are too large".into())
+                })?;
+            }
+            if path_cells > total {
+                return Err(RouterError::BackendUnavailable(
+                    "ragged Metal compact paths exceed packed fields".into(),
+                ));
+            }
+
+            let flat_paths = if path_cells == 0 {
+                Vec::new()
+            } else {
+                validate_buffer_len(dev, path_cells, "ragged compact paths")?;
+                let offset_buf = new_u32_buffer(dev, &offsets);
+                let path_buf = new_u32_buffer(dev, &vec![u32::MAX; path_cells]);
+                let meta = RaggedMeta {
+                    fields: fields.len() as u32,
+                    global_w: dims.w,
+                    global_h: dims.h,
+                    reserved: 0,
+                };
+                let meta_buf = new_buffer(dev, std::slice::from_ref(&meta));
+                let cmd = ctx.queue.new_command_buffer();
+                {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&ctx.ragged_write_paths);
+                    enc.set_buffer(0, Some(&dist_buf), 0);
+                    enc.set_buffer(1, Some(&hop_buf), 0);
+                    enc.set_buffer(2, Some(&cost_buf), 0);
+                    enc.set_buffer(3, Some(&x_buf), 0);
+                    enc.set_buffer(4, Some(&y_buf), 0);
+                    enc.set_buffer(5, Some(&via_buf), 0);
+                    enc.set_buffer(6, Some(&via_allowed_buf), 0);
+                    enc.set_buffer(7, Some(&field_buf), 0);
+                    enc.set_buffer(8, Some(&length_buf), 0);
+                    enc.set_buffer(9, Some(&offset_buf), 0);
+                    enc.set_buffer(10, Some(&path_buf), 0);
+                    enc.set_buffer(11, Some(&meta_buf), 0);
+                    enc.dispatch_threads(field_threads, tg);
+                    enc.end_encoding();
+                }
+                run_command_buffer(cmd)?;
+                read_u32_buffer(&path_buf, path_cells)
+            };
+
+            let mut paths = Vec::with_capacity(fields.len());
+            for ((&len, &offset), field) in lengths.iter().zip(&offsets).zip(fields) {
+                if len == 0 {
+                    paths.push(None);
+                    continue;
+                }
+                let start = offset as usize;
+                let end = start + len as usize;
+                let path = flat_paths[start..end].to_vec();
+                let packed_to_global = |packed: u32| {
+                    let rel = packed - field.cell_offset;
+                    let plane = field.w * field.h;
+                    let layer = rel / plane;
+                    let xy = rel % plane;
+                    let x = xy % field.w;
+                    let y = xy / field.w;
+                    dims.idx3(field.x0 + x, field.y0 + y, layer)
+                };
+                if path.first().copied() != Some(packed_to_global(field.src))
+                    || path.last().copied() != Some(packed_to_global(field.dst))
+                    || path.iter().any(|&cell| !dims.contains(cell))
+                    || search_costs[paths.len()] == Cost::MAX
+                {
+                    return Err(RouterError::BackendUnavailable(
+                        "ragged Metal produced an invalid compact path".into(),
+                    ));
+                }
+                paths.push(Some(path));
+            }
+
+            Ok(RaggedPathBatch {
+                paths,
+                search_costs,
+                packed_cells: total,
+                readback_cells: fields.len().saturating_mul(2).saturating_add(path_cells),
             })
         })
     })
