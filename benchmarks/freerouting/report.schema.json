@@ -139,7 +139,8 @@
           "required": [
             "status",
             "metalroute_two_point_net_counts",
-            "freerouting_initial_unconnected_items"
+            "freerouting_autorouter_task_counts",
+            "freerouting_baseline_unconnected_items"
           ],
           "properties": {
             "status": {
@@ -150,7 +151,12 @@
               "items": { "type": "integer", "minimum": 0 },
               "uniqueItems": true
             },
-            "freerouting_initial_unconnected_items": {
+            "freerouting_autorouter_task_counts": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "uniqueItems": true
+            },
+            "freerouting_baseline_unconnected_items": {
               "type": ["integer", "null"],
               "minimum": 0
             }
@@ -291,6 +297,7 @@
         "external_wall_seconds": { "type": "number", "minimum": 0 },
         "exit_code": { "type": ["integer", "null"] },
         "timed_out": { "type": "boolean" },
+        "router_result": { "type": ["object", "null"] },
         "post_reload_drc": { "$ref": "#/$defs/drc" }
       }
     },

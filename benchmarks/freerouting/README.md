@@ -71,9 +71,9 @@ The selected fixture SHA-256 values are:
   benchmark validation path.
 
 The comparison gate is conservative. Before routing, a zero-net metalroute ingest
-probe and a Freerouting baseline DRC probe must both succeed. After routing,
-metalroute's accepted two-point net count must equal Freerouting's baseline
-unconnected-item count, and every SES must reload.
+probe and a Freerouting baseline DRC probe must both succeed. During routing,
+metalroute's two-point task count must equal the task count in Freerouting's
+completed autorouter log, and every SES must reload.
 
 Count equality is necessary, not sufficient, for semantic equivalence: the
 programs may still interpret a DSN rule or geometry feature differently. For

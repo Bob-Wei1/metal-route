@@ -86,6 +86,7 @@ if "-drc" in sys.argv:
 if "-do" in sys.argv:
     ses = pathlib.Path(sys.argv[sys.argv.index("-do") + 1])
     ses.write_text("(session freerouting)\n", encoding="utf-8")
+    print("Auto-routing stage completed: started with 2 unrouted nets, completed in 0.01 seconds")
     raise SystemExit(0)
 raise SystemExit(3)
 """

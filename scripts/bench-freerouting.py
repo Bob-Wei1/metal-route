@@ -63,6 +63,9 @@ PARSE_STATS_RE = re.compile(
     r"\(skipped (?P<skipped>\d+) <2-pin\)"
 )
 FREEROUTING_VERSION_RE = re.compile(r"Freerouting v(?P<version>\d+\.\d+\.\d+)")
+FREEROUTING_TASKS_RE = re.compile(
+    r"Auto-routing stage completed: started with (?P<tasks>\d+) unrouted nets"
+)
 
 METALROUTE_INCOMPATIBILITY_MARKERS = (
     "failed to convert dsn to problem",
@@ -196,6 +199,13 @@ def parse_metalroute_stats(text: str) -> dict[str, int] | None:
         "original_nets": int(values["nets"]),
         "nets_skipped_below_two_pins": int(values["skipped"]),
     }
+
+
+def parse_freerouting_result(text: str) -> dict[str, int] | None:
+    match = FREEROUTING_TASKS_RE.search(text)
+    if match is None:
+        return None
+    return {"initial_unrouted_tasks": int(match.group("tasks"))}
 
 
 def collection_count(value: Any) -> int:
@@ -571,6 +581,7 @@ def freerouting_run(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
+    parsed = parse_freerouting_result(f"{result.stdout}\n{result.stderr}")
     record: dict[str, Any] = {
         "run": run_number,
         "status": "route_ok",
@@ -578,6 +589,7 @@ def freerouting_run(
         "external_wall_seconds": result.wall_seconds,
         "exit_code": result.exit_code,
         "timed_out": result.timed_out,
+        "router_result": parsed,
         "logs": {
             "stdout": public_log_path(stdout_path, output_dir),
             "stderr": public_log_path(stderr_path, output_dir),
@@ -590,6 +602,11 @@ def freerouting_run(
     elif result.exit_code != 0:
         record["status"] = record["route_status"] = "route_error"
         record["error"] = "Freerouting process failed; see referenced logs"
+    elif parsed is None:
+        record["status"] = record["route_status"] = "malformed_result"
+        record["error"] = (
+            "Freerouting did not emit its completed autorouter task-count line"
+        )
     elif not ses_path.is_file() or ses_path.stat().st_size == 0:
         record["status"] = record["route_status"] = "missing_ses"
         record["error"] = "Freerouting exited successfully without a non-empty SES"
@@ -686,7 +703,9 @@ def summarize_engine(runs: list[dict[str, Any]], requested_runs: int) -> dict[st
 
 
 def workload_check(
-    metalroute_runs: list[dict[str, Any]], freerouting_preflight_record: dict[str, Any]
+    metalroute_runs: list[dict[str, Any]],
+    freerouting_runs: list[dict[str, Any]],
+    freerouting_preflight_record: dict[str, Any],
 ) -> dict[str, Any]:
     metal_counts = sorted(
         {
@@ -695,20 +714,27 @@ def workload_check(
             if run.get("router_result") is not None
         }
     )
+    free_counts = sorted(
+        {
+            run["router_result"]["initial_unrouted_tasks"]
+            for run in freerouting_runs
+            if run.get("router_result") is not None
+        }
+    )
     baseline = freerouting_preflight_record.get("baseline_drc", {})
-    freerouting_count = baseline.get("unconnected_items")
     record: dict[str, Any] = {
         "status": "unavailable",
         "metalroute_two_point_net_counts": metal_counts,
-        "freerouting_initial_unconnected_items": freerouting_count,
+        "freerouting_autorouter_task_counts": free_counts,
+        "freerouting_baseline_unconnected_items": baseline.get("unconnected_items"),
         "note": (
-            "Equality is a conservative cross-parser gate, not proof that every DSN "
-            "rule or geometry feature has identical semantics."
+            "Equality compares each engine's reported initial routing-task count; "
+            "it is not proof that every DSN rule or geometry feature has identical semantics."
         ),
     }
-    if len(metal_counts) == 1 and isinstance(freerouting_count, int):
+    if len(metal_counts) == 1 and len(free_counts) == 1:
         record["status"] = (
-            "matched" if metal_counts[0] == freerouting_count else "mismatched"
+            "matched" if metal_counts[0] == free_counts[0] else "mismatched"
         )
     return record
 
@@ -899,7 +925,7 @@ def benchmark_fixture(
 
     metal_runs = [record for record, _ in metal_pairs]
     free_runs = [record for record, _ in free_pairs]
-    workload = workload_check(metal_runs, free_preflight)
+    workload = workload_check(metal_runs, free_runs, free_preflight)
     metal_summary = summarize_engine(metal_runs, repetitions)
     free_summary = summarize_engine(free_runs, repetitions)
     comparison = compare_engines(compatibility, workload, metal_summary, free_summary)
@@ -1196,8 +1222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Freerouting 2.3.0 reloads INPUT.dsn+OUTPUT.ses and writes JSON DRC"
                 ),
                 "comparison_gate": (
-                    "both input probes pass; metalroute two-point nets equal Freerouting "
-                    "baseline unconnected items; every timed SES reloads"
+                    "both input probes pass; each engine reports the same initial "
+                    "routing-task count; every timed SES reloads"
                 ),
                 "command_templates": {
                     "metalroute": (
