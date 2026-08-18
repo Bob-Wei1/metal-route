@@ -1,7 +1,7 @@
 {
   "schema": "wn.kicad_cruncher.pnp.v1",
   "source": {
-    "path": "/Users/embedder/Documents/bed-of-nails/tests/fixtures/external/datum/datum.kicad_pcb",
+    "path": "/fixtures/datum.kicad_pcb",
     "name": "datum.kicad_pcb",
     "stem": "datum"
   },

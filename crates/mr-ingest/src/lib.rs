@@ -336,14 +336,14 @@ mod tests {
     }
 
     /// Live integration test against the installed CLI + a real board. Ignored so
-    /// the offline suite stays hermetic; run with:
+    /// the offline suite stays hermetic; set `MR_KICAD_TEST_BOARD` and run with:
     /// `cargo test -p mr-ingest -- --ignored`
     #[test]
     #[ignore = "requires kicad-cruncher on PATH and a real board file"]
     fn run_kicad_cruncher_live() {
-        let board =
-            "/Users/embedder/Documents/bed-of-nails/tests/fixtures/external/datum/datum.kicad_pcb";
-        let ir = run_kicad_cruncher(board).expect("live kicad-cruncher run should succeed");
+        let board = std::env::var("MR_KICAD_TEST_BOARD")
+            .expect("set MR_KICAD_TEST_BOARD to a real .kicad_pcb path");
+        let ir = run_kicad_cruncher(&board).expect("live kicad-cruncher run should succeed");
         assert!(!ir.pads.is_empty(), "expected at least one placement");
         assert!(ir.layers.contains(&"top".to_string()));
     }

@@ -3,6 +3,11 @@
 Cargo.lock.bak
 .DS_Store
 
+# Local agent and workspace state (never publish).
+/.embedder/
+/.firecrawl/
+/.claude/
+
 # tscircuit benchmark harness (cloned, not vendored) + generated fixtures
 /.bench/
 /bench/

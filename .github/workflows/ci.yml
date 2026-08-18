@@ -39,12 +39,12 @@ jobs:
       - name: Reproducible benchmark (smoke — must run, numbers not gated)
         run: cargo run -p mr-cli --bin metalroute -- bench --boards 3 --nets 10
 
-      - name: DRC smoke (must run, violation count not gated)
-        run: >
-          cargo run -p mr-cli --bin metalroute -- drc
-          --input bench/fixture_fresh/fixture.dsn
-          --skip-nets=GND --skip-nets=+5VA --skip-nets=-5VA --skip-nets=3V3
-          --max-nets 20 --max-violations 10
+      - name: Exact board-outline routing smoke
+        run: |
+          cargo run -p mr-cli --bin metalroute -- route \
+            --input benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json \
+            --out "$RUNNER_TEMP/bugreport21-solution.json"
+          test -s "$RUNNER_TEMP/bugreport21-solution.json"
 
       - name: Metal build (compile-only; GPU may be unavailable on runners)
         run: cargo build -p mr-metal

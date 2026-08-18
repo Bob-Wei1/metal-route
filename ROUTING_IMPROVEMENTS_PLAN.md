@@ -5,7 +5,7 @@ with git-worktree isolation) to implement five routing improvements, then integr
 and benchmark them. This document is self-contained — you do not need any prior
 conversation context.
 
-**Repo:** `/Users/embedder/Documents/autorouter` (cargo workspace). Current `main` HEAD
+**Repo:** the `metal-route` Cargo workspace. Current `main` HEAD
 already contains the prerequisite fix described in §3.
 
 ---
