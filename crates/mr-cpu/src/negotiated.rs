@@ -129,6 +129,13 @@ const PORTFOLIO_MIN_NETS: usize = PARALLEL_NEGOTIATION_THRESHOLD + 1;
 const PORTFOLIO_MAX_NETS: usize = 179;
 const PORTFOLIO_CELL_CAP: usize = 250_000;
 
+/// Completion-only legalization-order fallback. Three independent hard bounds keep
+/// two extra legalization passes from becoming a latency multiplier on large boards.
+const ORDER_PORTFOLIO_MIN_GROUPS: usize = 6;
+const ORDER_PORTFOLIO_MAX_GROUPS: usize = 16;
+const ORDER_PORTFOLIO_MAX_NETS: usize = 32;
+const ORDER_PORTFOLIO_CELL_CAP: usize = 250_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NegotiationMode {
     Adaptive,
@@ -965,6 +972,19 @@ fn should_try_serial_candidate(
         && dims.len() <= PORTFOLIO_CELL_CAP
 }
 
+fn should_try_diversified_orders(
+    n_groups: usize,
+    n_nets: usize,
+    n_cells: usize,
+    original_best_routed: usize,
+    alone_routable: usize,
+) -> bool {
+    (ORDER_PORTFOLIO_MIN_GROUPS..=ORDER_PORTFOLIO_MAX_GROUPS).contains(&n_groups)
+        && n_nets <= ORDER_PORTFOLIO_MAX_NETS
+        && n_cells <= ORDER_PORTFOLIO_CELL_CAP
+        && original_best_routed < alone_routable
+}
+
 /// More routed nets wins; for equal completion, lower caller-grid cost wins. An
 /// exact tie deliberately keeps the primary candidate to minimize route churn.
 fn serial_candidate_is_better(primary: &BoardRoute, serial: &BoardRoute) -> bool {
@@ -1029,6 +1049,30 @@ fn legalization_candidate_is_better(
     routed > best_routed
         || (routed == best_routed && total_cost < best_cost)
         || (routed == best_routed && total_cost == best_cost && order < best_order)
+}
+
+/// Diversified fallback orders form a completion-only portfolio: they may replace
+/// the original-order winner only when they route strictly more nets. Equal-routed
+/// cost wins stay with the original portfolio because cost is not DRC-aligned.
+#[inline]
+fn diversified_candidate_is_better(
+    routed: usize,
+    total_cost: u64,
+    order: &[usize],
+    original_best_routed: usize,
+    best_routed: usize,
+    best_cost: u64,
+    best_order: &[usize],
+) -> bool {
+    routed > original_best_routed
+        && legalization_candidate_is_better(
+            routed,
+            total_cost,
+            order,
+            best_routed,
+            best_cost,
+            best_order,
+        )
 }
 
 /// Convert a computed passable step price into the `u32` search domain without
@@ -2076,52 +2120,88 @@ impl NegotiatedRouter {
         // the 3 heuristic orders above plus the rip-up stage already recover the same
         // routable nets the exhaustive search finds. Capping 6–7 group boards to the
         // heuristics cuts those solves ~18× (≈30 s → ≈1.7 s) with identical routed
-        // counts. (An earlier experiment ADDING random orders beyond exhaustive also
-        // REGRESSED DRC quality — the `(routed, unit_cost)` selection metric is not
-        // clearance-aligned — so more orders is never the answer; fewer is.)
+        // counts. An earlier experiment adding random orders beyond exhaustive also
+        // regressed DRC quality because equal-completion cost selection is not
+        // clearance-aligned. The bounded deterministic fallback below is therefore
+        // completion-only: it cannot replace an equal-routed original winner.
         if n_groups <= 5 {
             for perm in permutations(&base_order) {
                 candidates.push(perm);
             }
         }
 
-        // Evaluate each candidate IN PARALLEL and keep the best. The candidate orders
+        // Evaluate each candidate IN PARALLEL. The candidate orders
         // are independent (`legalize_in_order` is a pure function of its inputs), so
         // rayon distributes them across cores; each worker uses its OWN `SearchBuf` +
         // `PadSet` scratch via `map_init` (never shared). Results are collected with
         // their candidate INDEX, then the winner is picked by a fully deterministic,
         // scheduling-independent fold over the indexed results.
-        let evaluated: Vec<(usize, usize, u64, Committed)> = candidates
-            .par_iter()
-            .enumerate()
-            .map_init(
-                || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
-                |(buf, pad_set), (idx, order)| {
-                    let committed = legalize_in_order(
-                        grid,
-                        &coords,
-                        &heuristic_costs,
-                        buf,
-                        pad_set,
-                        nets,
-                        group_ids,
-                        &paths,
-                        &windows,
-                        order,
-                        n_cells,
-                        &via_model,
-                        self.clearance_mm,
-                        self.via_spacing_mm,
-                        self.via_hole_spacing_mm,
-                        self.committed_via_to_trace_guard,
-                        has_zero_cost,
-                    );
-                    let routed = committed.iter().filter(|c| c.is_some()).count();
-                    let total_cost = committed_grid_cost(grid, nets, &committed);
-                    (idx, routed, total_cost, committed)
-                },
-            )
-            .collect();
+        let evaluate_orders = |orders: &[Vec<usize>], index_offset: usize| {
+            orders
+                .par_iter()
+                .enumerate()
+                .map_init(
+                    || (SearchBuf::new(n_cells), PadSet::new(n_cells)),
+                    |(buf, pad_set), (idx, order)| {
+                        let committed = legalize_in_order(
+                            grid,
+                            &coords,
+                            &heuristic_costs,
+                            buf,
+                            pad_set,
+                            nets,
+                            group_ids,
+                            &paths,
+                            &windows,
+                            order,
+                            n_cells,
+                            &via_model,
+                            self.clearance_mm,
+                            self.via_spacing_mm,
+                            self.via_hole_spacing_mm,
+                            self.committed_via_to_trace_guard,
+                            has_zero_cost,
+                        );
+                        let routed = committed.iter().filter(|c| c.is_some()).count();
+                        let total_cost = committed_grid_cost(grid, nets, &committed);
+                        (index_offset + idx, routed, total_cost, committed)
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        let mut evaluated = evaluate_orders(&candidates, 0);
+        let original_candidate_count = candidates.len();
+        let original_best_routed = evaluated
+            .iter()
+            .map(|(_, routed, _, _)| *routed)
+            .max()
+            .unwrap_or(0);
+        let alone_routable = alone_path.iter().filter(|path| !path.is_empty()).count();
+
+        // Medium grouped boards occasionally need one different first claimant for a
+        // physical via bottleneck. Only pay for these deterministic alternatives when
+        // the original portfolio left an individually-routable net congested. Small
+        // boards already exhaust every order; large boards stay behind the hard cap.
+        if should_try_diversified_orders(
+            n_groups,
+            n_nets,
+            n_cells,
+            original_best_routed,
+            alone_routable,
+        ) {
+            let mut fallback_orders = Vec::with_capacity(2);
+            let mut rotated = base_order.clone();
+            rotated.rotate_left(1);
+            fallback_orders.push(rotated);
+            let mut reversed = base_order.clone();
+            reversed.reverse();
+            fallback_orders.push(reversed);
+            fallback_orders.retain(|order| !candidates.contains(order));
+
+            let offset = candidates.len();
+            evaluated.extend(evaluate_orders(&fallback_orders, offset));
+            candidates.extend(fallback_orders);
+        }
 
         // Deterministic pick: most nets routed, then lowest true `u64` aggregate
         // caller-grid cost, then lexicographically lowest group ORDER (`order < bo`).
@@ -2133,6 +2213,17 @@ impl NegotiatedRouter {
             let order = &candidates[*idx];
             let better = match &best {
                 None => true,
+                Some((br, bc, bo)) if *idx >= original_candidate_count => {
+                    diversified_candidate_is_better(
+                        *routed,
+                        *total_cost,
+                        order,
+                        original_best_routed,
+                        *br,
+                        *bc,
+                        bo,
+                    )
+                }
                 Some((br, bc, bo)) => {
                     legalization_candidate_is_better(*routed, *total_cost, order, *br, *bc, bo)
                 }
@@ -4261,6 +4352,140 @@ mod tests {
     }
 
     #[test]
+    fn diversified_candidate_requires_strict_completion_gain() {
+        let original_order = [0, 1, 2];
+        let fallback_order = [1, 2, 0];
+
+        assert!(!diversified_candidate_is_better(
+            2,
+            1,
+            &fallback_order,
+            2,
+            2,
+            10,
+            &original_order,
+        ));
+        assert!(diversified_candidate_is_better(
+            3,
+            100,
+            &fallback_order,
+            2,
+            2,
+            10,
+            &original_order,
+        ));
+    }
+
+    #[test]
+    fn diversified_order_trigger_is_progress_and_resource_bounded() {
+        let eligible = |groups, nets, cells, routed, alone| {
+            should_try_diversified_orders(groups, nets, cells, routed, alone)
+        };
+
+        assert!(eligible(
+            ORDER_PORTFOLIO_MIN_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MIN_GROUPS - 1,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MAX_GROUPS + 1,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MIN_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS + 1,
+            ORDER_PORTFOLIO_CELL_CAP,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MIN_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP + 1,
+            5,
+            6,
+        ));
+        assert!(!eligible(
+            ORDER_PORTFOLIO_MIN_GROUPS,
+            ORDER_PORTFOLIO_MAX_NETS,
+            ORDER_PORTFOLIO_CELL_CAP,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn equal_completion_diversification_preserves_original_board_bytes() {
+        let dims = Dims::new(7, 7);
+        let mut grid = Grid::filled(dims, OBSTACLE);
+        for x in 0..7 {
+            grid.set(dims.idx(x, 3), 1);
+        }
+        for y in 0..7 {
+            grid.set(dims.idx(3, y), 1);
+        }
+        for &(x, y) in &[(0, 0), (6, 0), (0, 6), (6, 6)] {
+            grid.set(dims.idx(x, y), 1);
+        }
+        let nets = vec![
+            net("a", dims.idx(0, 3), dims.idx(6, 3)),
+            net("b", dims.idx(3, 0), dims.idx(3, 6)),
+            net("c", dims.idx(0, 0), dims.idx(0, 0)),
+            net("d", dims.idx(6, 0), dims.idx(6, 0)),
+            net("e", dims.idx(0, 6), dims.idx(0, 6)),
+            net("f", dims.idx(6, 6), dims.idx(6, 6)),
+        ];
+        let results = vec![
+            RouteResult {
+                net: "a".to_owned(),
+                path: (0..7).map(|x| dims.idx(x, 3)).collect(),
+                cost: 6,
+            },
+            RouteResult {
+                net: "c".to_owned(),
+                path: vec![dims.idx(0, 0)],
+                cost: 0,
+            },
+            RouteResult {
+                net: "d".to_owned(),
+                path: vec![dims.idx(6, 0)],
+                cost: 0,
+            },
+            RouteResult {
+                net: "e".to_owned(),
+                path: vec![dims.idx(0, 6)],
+                cost: 0,
+            },
+            RouteResult {
+                net: "f".to_owned(),
+                path: vec![dims.idx(6, 6)],
+                cost: 0,
+            },
+        ];
+        let expected = BoardRoute {
+            congestion: BoardRoute::congestion_from(dims, &results),
+            results,
+            unrouted: vec!["b".to_owned()],
+            groups: vec![0, 2, 3, 4, 5],
+        };
+
+        let actual = NegotiatedRouter::new().route(&grid, &nets).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn serial_portfolio_trigger_enforces_group_net_and_cell_bounds() {
         let incomplete = |n| board_with_costs(&[1], n);
         let complete = |n| board_with_costs(&vec![1; n], n);
@@ -6274,7 +6499,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_portfolio_retains_primary_when_serial_routes_fewer() {
+    fn serial_portfolio_selects_diversified_serial_when_it_routes_more() {
         let dims = Dims::with_layers(14, 14, 2);
         let grid = GridBuilder::new(dims, 1).build();
         let endpoints = [
@@ -6334,9 +6559,9 @@ mod tests {
             .board;
 
         assert_eq!((primary.results.len(), primary.total_cost()), (9, 120));
-        assert_eq!((serial.results.len(), serial.total_cost()), (8, 81));
-        assert!(!serial_candidate_is_better(&primary, &serial));
-        assert_eq!(router.route(&grid, &nets).unwrap(), primary);
+        assert_eq!((serial.results.len(), serial.total_cost()), (10, 117));
+        assert!(serial_candidate_is_better(&primary, &serial));
+        assert_eq!(router.route(&grid, &nets).unwrap(), serial);
     }
 
     #[test]

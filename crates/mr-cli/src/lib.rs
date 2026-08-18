@@ -2284,6 +2284,29 @@ mod tests {
         );
     }
 
+    /// An alternate deterministic legalization order can retain the rollout's full
+    /// completion without restoring either of its two invalid clearance findings.
+    #[test]
+    fn bug63_order_portfolio_routes_full_and_clean() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport63-274be2.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport63 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport63");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route bugreport63");
+        assert_eq!((summary.routed, summary.total), (12, 12));
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert!(
+            violations.is_empty(),
+            "portfolio result must stay DRC-clean: {violations:#?}"
+        );
+    }
+
     /// A net whose only corridor is walled off on the top layer. The wall sits on
     /// `"top"` only, so on a single layer the net cannot route; granting a second
     /// layer lets the negotiated router via down, cross, and via back up.
