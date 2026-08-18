@@ -502,6 +502,8 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
             },
             width,
             height,
+            shape: Some("rect".to_string()),
+            ccw_rotation_degrees: None,
             layers,
             connected_to: vec![format!("{reference}-{pin_id}")],
         });
@@ -540,6 +542,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         connections.push(Connection {
             name: net_name.clone(),
             root_connection_name: None,
+            rules: mr_srj::ConnectionRules::default(),
             points_to_connect: points,
         });
     }
@@ -577,6 +580,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         layer_count,
         min_trace_width: Some(min_trace_width_mm),
         min_clearance: Some(min_clearance_mm),
+        physical_rules: mr_srj::SimpleRoutePhysicalRules::default(),
         obstacles,
         connections,
         bounds,

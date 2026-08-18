@@ -3,10 +3,11 @@
 //! The continuous clearance legaliser handles movable wire vertices and rigid vias
 //! with local monotone nudges. A small residue remains when one interior through-via
 //! is boxed against several foreign features. This module tries one deliberately
-//! narrow topology-preserving portfolio: for at most eight vias that participate in
-//! an exact clearance finding, move the via by one clearance in each of eight compass
-//! directions. Every candidate is checked against the authoritative full-board DRC;
-//! at most one strictly lower-finding candidate is retained.
+//! narrow topology-preserving portfolio: a generic-clearance geometry prefilter
+//! selects at most eight vias, then moves each by one generic clearance in eight
+//! compass directions. Typed pair-specific or drill-only findings can therefore be
+//! left unproposed, but every proposed candidate is checked against the authoritative
+//! typed full-board DRC; at most one strictly lower-finding candidate is retained.
 
 use mr_drc::{dist, point_rect_gap, point_seg_dist, DrcBoard, DrcRules, Via, Violation};
 use mr_srj::{PcbTrace, RoutePoint, SimpleRouteJson};
@@ -78,7 +79,7 @@ pub(crate) fn repair_clearance_vias(
     }
 
     let before_board = drc_board::solution_to_drc_board(srj, &traces, rules, layers);
-    let before = before_board.check();
+    let before = drc_board::check_with_srj_rules(srj, &before_board);
     if before.is_empty() {
         return traces;
     }
@@ -122,7 +123,7 @@ pub(crate) fn repair_clearance_vias(
             }
 
             let candidate_board = drc_board::solution_to_drc_board(srj, &candidate, rules, layers);
-            let candidate_violations = candidate_board.check();
+            let candidate_violations = drc_board::check_with_srj_rules(srj, &candidate_board);
             // This repair is intentionally count-only for acceptance. Reuse the
             // authoritative comparator as a second guard so its semantics stay the
             // single source of truth for future result-shape changes.
@@ -149,9 +150,12 @@ pub(crate) fn repair_clearance_vias(
     best.map_or(traces, |(_, candidate)| candidate)
 }
 
-/// Exact via-clearance participation over the same public geometry primitives and
-/// net rules as `DrcBoard::check`. Via-through-plane and annular-ring findings are
-/// deliberately excluded: translating a via cannot change either invariant.
+/// Generic-clearance participation prefilter over the public DRC geometry.
+/// Pair-specific typed and via-hole thresholds are intentionally not projected
+/// here, so this helper may omit a repair opportunity; the authoritative typed
+/// full-board gate above still prevents an unsafe candidate from being accepted.
+/// Via-through-plane and annular-ring findings are also excluded because
+/// translating a via cannot change either invariant.
 fn clearance_violating_vias(board: &DrcBoard) -> Vec<usize> {
     let threshold = board.rules.clearance - GEOMETRY_EPS_MM;
     if threshold <= 0.0 {
@@ -506,6 +510,7 @@ mod tests {
             layer_count: 2,
             min_trace_width: Some(0.15),
             min_clearance: Some(0.15),
+            physical_rules: mr_srj::SimpleRoutePhysicalRules::default(),
             obstacles: Vec::new(),
             connections: Vec::new(),
             bounds: Bounds {
@@ -598,6 +603,7 @@ mod tests {
         srj.connections = vec![mr_srj::Connection {
             name: "n".into(),
             root_connection_name: None,
+            rules: mr_srj::ConnectionRules::default(),
             points_to_connect: vec![
                 Point {
                     x: -2.0,
@@ -662,6 +668,8 @@ mod tests {
             },
             width: 0.1,
             height: 0.1,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["inner1".into()],
             connected_to: Vec::new(),
         }];

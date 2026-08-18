@@ -783,6 +783,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
+ "mr-cli",
  "mr-core",
  "mr-cpu",
  "mr-srj",

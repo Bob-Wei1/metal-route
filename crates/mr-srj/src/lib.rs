@@ -67,6 +67,15 @@ pub struct Point {
     pub layer: Option<String>,
 }
 
+/// A board-outline vertex. Unlike routed points, outline vertices have no layer;
+/// keeping a dedicated type preserves the producer's `{x,y}` value shape instead
+/// of serializing an invented `"layer": null` member.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct OutlinePoint {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// Axis-aligned problem bounds in continuous coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +97,19 @@ pub struct Obstacle {
     pub center: Point,
     pub width: f64,
     pub height: f64,
+    /// Producer geometry discriminator. The supported typed-rule projection is
+    /// deliberately limited to axis-aligned `rect` and conservative `circle`
+    /// bounds; other shapes remain parseable but use the legacy route path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    /// Counter-clockwise rotation in degrees. Raster geometry is axis-aligned, so
+    /// a non-zero declared rotation fails the typed-rule coherence gate.
+    #[serde(
+        default,
+        rename = "ccwRotationDegrees",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ccw_rotation_degrees: Option<f64>,
     /// Layers this obstacle sits on (e.g. `["top"]`). Empty if unspecified.
     #[serde(default)]
     pub layers: Vec<String>,
@@ -95,6 +117,18 @@ pub struct Obstacle {
     /// (the harness emits `connectedTo`). Empty if unspecified.
     #[serde(default, rename = "connectedTo")]
     pub connected_to: Vec<String>,
+}
+
+/// Optional physical rules attached to one connection.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionRules {
+    /// Preferred routed copper width for this connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nominal_trace_width: Option<f64>,
+    /// Deprecated alias for [`Self::nominal_trace_width`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
 }
 
 /// One named connection: a list of pads/points that must all be electrically
@@ -111,7 +145,69 @@ pub struct Connection {
     /// problems, where each connection is its own net.
     #[serde(default)]
     pub root_connection_name: Option<String>,
+    /// Optional connection-level physical rules, flattened to the canonical SRJ
+    /// JSON field names.
+    #[serde(flatten)]
+    pub rules: ConnectionRules,
     pub points_to_connect: Vec<Point>,
+}
+
+/// Typed physical rule fields carried by modern SimpleRouteJson producers.
+/// Kept as a flattened sub-structure so legacy Rust construction sites can opt
+/// into all-new rule fields with one `Default::default()` member.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimpleRoutePhysicalRules {
+    /// Preferred board-wide routed copper width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nominal_trace_width: Option<f64>,
+    /// Generic obstacle/copper spacing used when a feature-pair rule is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_obstacle_margin: Option<f64>,
+    /// Minimum trace-edge to pad-edge spacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_trace_to_pad_edge_clearance: Option<f64>,
+    /// Minimum via-annulus-edge to pad-edge spacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_via_edge_to_pad_edge_clearance: Option<f64>,
+    /// Minimum via-drill-edge to via-drill-edge spacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_via_hole_edge_to_via_hole_edge_clearance: Option<f64>,
+    /// Minimum static pad-edge to static pad-edge spacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_pad_edge_to_pad_edge_clearance: Option<f64>,
+    /// Minimum trace-edge spacing to the board outline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_board_edge_clearance: Option<f64>,
+    /// Minimum routed via drill diameter (current camelCase spelling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_via_hole_diameter: Option<f64>,
+    /// Historical snake_case duplicate still emitted by some producers.
+    #[serde(
+        default,
+        rename = "min_via_hole_diameter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_via_hole_diameter_snake: Option<f64>,
+    /// Minimum routed via annular-pad diameter (current camelCase spelling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_via_pad_diameter: Option<f64>,
+    /// Historical snake_case duplicate still emitted by some producers.
+    #[serde(
+        default,
+        rename = "min_via_pad_diameter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_via_pad_diameter_snake: Option<f64>,
+    /// Deprecated camelCase alias for the via annular-pad diameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_via_diameter: Option<f64>,
+    /// Whether DRC repair may place a layer transition in a connected pad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_via_in_pad: Option<bool>,
+    /// Optional board polygon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outline: Vec<OutlinePoint>,
 }
 
 /// A tscircuit SimpleRouteJson routing problem.
@@ -128,11 +224,299 @@ pub struct SimpleRouteJson {
     /// rule (the harness emits `minClearance`) and feeds the design-rule check.
     #[serde(default)]
     pub min_clearance: Option<f64>,
+    /// Modern typed physical rules, flattened to their canonical SRJ field names.
+    #[serde(flatten)]
+    pub physical_rules: SimpleRoutePhysicalRules,
     #[serde(default)]
     pub obstacles: Vec<Obstacle>,
     #[serde(default)]
     pub connections: Vec<Connection>,
     pub bounds: Bounds,
+}
+
+/// A coherent, globally uniform physical rule profile that the current router
+/// can enforce without pretending heterogeneous connection widths are uniform.
+///
+/// SimpleRouteJson permits per-connection widths, while the negotiated router's
+/// clearance field is currently board-wide. [`SimpleRouteJson::uniform_physical_rules`]
+/// therefore returns `None` for mixed-width problems: those inputs retain the
+/// established route path until feature-pair widths are represented in the core
+/// router. The fields still parse and round-trip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UniformPhysicalRules {
+    pub trace_width_mm: f64,
+    pub obstacle_margin_mm: f64,
+    pub trace_to_pad_clearance_mm: f64,
+    pub via_to_pad_clearance_mm: f64,
+    pub pad_to_pad_clearance_mm: Option<f64>,
+    /// Resolved routed via-pad diameter. The supported projection selects the
+    /// declared minimum as its actual emitted geometry.
+    pub via_pad_diameter_mm: f64,
+    /// Resolved routed drill diameter (the declared minimum, since no larger
+    /// drill is needed by this projection).
+    pub via_hole_diameter_mm: f64,
+    pub via_hole_to_hole_clearance_mm: Option<f64>,
+}
+
+impl SimpleRouteJson {
+    /// Resolve the typed SRJ physical fields into the uniform subset the current
+    /// router can faithfully enforce.
+    ///
+    /// The profile is deliberately coherence-gated: all dynamic feature-pair
+    /// rules and via geometry must be present and finite, every supplied alias must
+    /// agree, the declared geometry must satisfy the annular-ring minimum, and every
+    /// connection must resolve to one common nominal width at or above
+    /// `minTraceWidth`. Every obstacle must also be connected, finite, axis-aligned,
+    /// and a supported rect/circle representation. Every terminal must sit in at
+    /// least one same-net obstacle on a recognized layer, and every obstacle that
+    /// covers that terminal must resolve to the connection's electrical group
+    /// (optionally alongside the supported `pcb_port_<digits>` producer metadata);
+    /// otherwise the raster own-pad exemption could admit bare or foreign copper.
+    /// Unclassified/richer geometry and incoherent terminals therefore fail closed.
+    /// Partial/invalid profiles return `None`, preserving the historical caller
+    /// defaults byte-for-byte.
+    pub fn uniform_physical_rules(&self) -> Option<UniformPhysicalRules> {
+        fn nonnegative(value: Option<f64>) -> Option<f64> {
+            value.filter(|v| v.is_finite() && *v >= 0.0)
+        }
+        fn positive(value: Option<f64>) -> Option<f64> {
+            value.filter(|v| v.is_finite() && *v > 0.0)
+        }
+        fn optional_nonnegative(value: Option<f64>) -> Option<Option<f64>> {
+            match value {
+                Some(value) if value.is_finite() && value >= 0.0 => Some(Some(value)),
+                Some(_) => None,
+                None => Some(None),
+            }
+        }
+
+        fn equal_positive_aliases(values: &[Option<f64>]) -> Option<Option<f64>> {
+            let mut resolved: Option<f64> = None;
+            for &value in values.iter().flatten() {
+                let value = value.is_finite().then_some(value).filter(|v| *v > 0.0)?;
+                if resolved.is_some_and(|prior| (value - prior).abs() > LINE_EPSILON) {
+                    return None;
+                }
+                resolved = Some(value);
+            }
+            Some(resolved)
+        }
+
+        if self.obstacles.iter().any(|obstacle| {
+            obstacle.connected_to.is_empty()
+                || obstacle.kind != "rect"
+                || !matches!(obstacle.shape.as_deref(), Some("rect" | "circle"))
+                || !obstacle.center.x.is_finite()
+                || !obstacle.center.y.is_finite()
+                || !obstacle.width.is_finite()
+                || !obstacle.height.is_finite()
+                || obstacle.width <= 0.0
+                || obstacle.height <= 0.0
+                || obstacle
+                    .ccw_rotation_degrees
+                    .is_some_and(|rotation| !rotation.is_finite() || rotation.abs() > LINE_EPSILON)
+        }) {
+            return None;
+        }
+
+        // `pad_cells_for_point` deliberately makes every obstacle whose bounding
+        // box contains an endpoint passable to that routed net. The typed profile
+        // may activate only when that exemption is justified by explicit
+        // electrical groups: a bare terminal has no pad boundary to enforce,
+        // while an overlapping foreign pad would otherwise be mistaken for an
+        // own pad. Multiple connection aliases may map to one root group, but a
+        // pad that names aliases from distinct groups is ambiguous and rejected.
+        let layers = LayerMap::standard(self.layer_count);
+        let mut alias_groups: HashMap<&str, std::collections::BTreeSet<&str>> = HashMap::new();
+        for connection in &self.connections {
+            let group = connection
+                .root_connection_name
+                .as_deref()
+                .filter(|root| !root.is_empty())
+                .unwrap_or(connection.name.as_str());
+            if group.is_empty() {
+                return None;
+            }
+            alias_groups
+                .entry(connection.name.as_str())
+                .or_default()
+                .insert(group);
+            if let Some(root) = connection
+                .root_connection_name
+                .as_deref()
+                .filter(|root| !root.is_empty())
+            {
+                alias_groups.entry(root).or_default().insert(group);
+            }
+        }
+        for connection in &self.connections {
+            let group = connection
+                .root_connection_name
+                .as_deref()
+                .filter(|root| !root.is_empty())
+                .unwrap_or(connection.name.as_str());
+            for point in &connection.points_to_connect {
+                if !point.x.is_finite() || !point.y.is_finite() {
+                    return None;
+                }
+                let layer = match point.layer.as_deref() {
+                    Some(name) => layers.index_of(name)?,
+                    None => 0,
+                };
+                let covering: Vec<&Obstacle> = self
+                    .obstacles
+                    .iter()
+                    .filter(|obstacle| {
+                        obstacle_layers(obstacle, &layers).contains(&layer)
+                            && point.x >= obstacle.center.x - obstacle.width / 2.0
+                            && point.x <= obstacle.center.x + obstacle.width / 2.0
+                            && point.y >= obstacle.center.y - obstacle.height / 2.0
+                            && point.y <= obstacle.center.y + obstacle.height / 2.0
+                    })
+                    .collect();
+                if covering.is_empty() {
+                    return None;
+                }
+                for obstacle in covering {
+                    let inside_shape = match obstacle.shape.as_deref() {
+                        Some("rect") => true,
+                        Some("circle") => {
+                            let dx = (point.x - obstacle.center.x) / (obstacle.width / 2.0);
+                            let dy = (point.y - obstacle.center.y) / (obstacle.height / 2.0);
+                            dx * dx + dy * dy <= 1.0 + LINE_EPSILON
+                        }
+                        _ => false,
+                    };
+                    if !inside_shape {
+                        return None;
+                    }
+                    let mut known_groups = std::collections::BTreeSet::new();
+                    for id in &obstacle.connected_to {
+                        if let Some(groups) = alias_groups.get(id.as_str()) {
+                            known_groups.extend(groups.iter().copied());
+                        } else {
+                            // Modern tscircuit endpoint pads additionally carry
+                            // their producer object id (for example
+                            // `pcb_port_93`). This narrow metadata spelling is
+                            // not an electrical alias; arbitrary unknown ids are
+                            // rejected because they could name foreign copper.
+                            let supported_metadata =
+                                id.strip_prefix("pcb_port_").is_some_and(|suffix| {
+                                    !suffix.is_empty()
+                                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                                });
+                            if !supported_metadata {
+                                return None;
+                            }
+                        }
+                    }
+                    if known_groups.len() != 1 || !known_groups.contains(group) {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let min_width = positive(self.min_trace_width)?;
+        let board_width = match self.physical_rules.nominal_trace_width {
+            Some(width) => Some(positive(Some(width))?),
+            None => None,
+        };
+        if board_width.is_some_and(|width| width + LINE_EPSILON < min_width) {
+            return None;
+        }
+        let mut common_width = board_width;
+        for connection in &self.connections {
+            let declared = equal_positive_aliases(&[
+                connection.rules.nominal_trace_width,
+                connection.rules.width,
+            ])?;
+            let width = match declared {
+                Some(width) => width,
+                None => board_width.unwrap_or(min_width),
+            };
+            if width + LINE_EPSILON < min_width {
+                return None;
+            }
+            if let Some(common) = common_width {
+                if (width - common).abs() > LINE_EPSILON {
+                    return None;
+                }
+            } else {
+                common_width = Some(width);
+            }
+        }
+        let common_width = common_width.unwrap_or(min_width);
+
+        // `minClearance` is metalroute's established board-wide rule. When a
+        // transitional producer emits both it and modern `defaultObstacleMargin`,
+        // retain that legacy precedence consistently across dynamic routing,
+        // raster fill geometry, and DRC instead of splitting the two paths.
+        let declared_obstacle_margin = nonnegative(self.physical_rules.default_obstacle_margin)?;
+        let obstacle_margin_mm = match self.min_clearance {
+            Some(clearance) => nonnegative(Some(clearance))?,
+            None => declared_obstacle_margin,
+        };
+        let trace_to_pad_clearance_mm =
+            nonnegative(self.physical_rules.min_trace_to_pad_edge_clearance)?;
+        let via_to_pad_clearance_mm =
+            nonnegative(self.physical_rules.min_via_edge_to_pad_edge_clearance)?;
+        let declared_via_pad_diameter_mm = equal_positive_aliases(&[
+            self.physical_rules.min_via_pad_diameter,
+            self.physical_rules.min_via_pad_diameter_snake,
+            self.physical_rules.min_via_diameter,
+        ])??;
+        let via_hole_diameter_mm = equal_positive_aliases(&[
+            self.physical_rules.min_via_hole_diameter,
+            self.physical_rules.min_via_hole_diameter_snake,
+        ])??;
+        // RoutePoint::Via does not serialize chosen geometry, so this projection
+        // uses the declared minima as its actual routed dimensions. Fail closed
+        // unless those dimensions already satisfy the authoritative annular rule.
+        const MIN_ANNULAR_RING_MM: f64 = 0.05;
+        let via_pad_diameter_mm = declared_via_pad_diameter_mm;
+        if (via_pad_diameter_mm - via_hole_diameter_mm) / 2.0 + LINE_EPSILON < MIN_ANNULAR_RING_MM {
+            return None;
+        }
+        let pad_to_pad_clearance_mm =
+            optional_nonnegative(self.physical_rules.min_pad_edge_to_pad_edge_clearance)?;
+        let via_hole_to_hole_clearance_mm = optional_nonnegative(
+            self.physical_rules
+                .min_via_hole_edge_to_via_hole_edge_clearance,
+        )?;
+        // Until obstacle shapes carry an explicit pad/keepout discriminator, pair
+        // rules may only specialize upward from the generic obstacle margin. This
+        // makes a mistakenly classified preserved trace/via/body conservative.
+        if trace_to_pad_clearance_mm + LINE_EPSILON < obstacle_margin_mm
+            || via_to_pad_clearance_mm + LINE_EPSILON < obstacle_margin_mm
+            || via_to_pad_clearance_mm + LINE_EPSILON < trace_to_pad_clearance_mm
+            || pad_to_pad_clearance_mm
+                .is_some_and(|clearance| clearance + LINE_EPSILON < obstacle_margin_mm)
+        {
+            return None;
+        }
+        // Connected obstacles can include preserved plated holes whose feature
+        // kind was not retained by this schema. When a hole rule is declared,
+        // require the statically enforced routed-via↔obstacle outer-pad spacing
+        // to dominate routed-drill↔fixed-drill spacing.
+        if via_hole_to_hole_clearance_mm.is_some_and(|clearance| {
+            via_pad_diameter_mm / 2.0 + via_to_pad_clearance_mm + LINE_EPSILON
+                < via_hole_diameter_mm / 2.0 + clearance
+        }) {
+            return None;
+        }
+
+        Some(UniformPhysicalRules {
+            trace_width_mm: common_width,
+            obstacle_margin_mm,
+            trace_to_pad_clearance_mm,
+            via_to_pad_clearance_mm,
+            pad_to_pad_clearance_mm,
+            via_pad_diameter_mm,
+            via_hole_diameter_mm,
+            via_hole_to_hole_clearance_mm,
+        })
+    }
 }
 
 /// Continuous ↔ grid-cell coordinate conversion. See module docs for the rules.
@@ -983,22 +1367,81 @@ pub fn rasterize_with_layers(
         srj,
         resolution,
         layers,
-        clearance_cells,
-        min_clearance_mm,
-        via_pad_mm,
-        model,
+        RasterRuleProjection {
+            clearance_cells,
+            generic_clearance_mm: min_clearance_mm,
+            trace_to_pad_clearance_mm: min_clearance_mm,
+            via_to_pad_clearance_mm: min_clearance_mm,
+            via_pad_mm,
+            trace_width_mm: None,
+            model,
+        },
     )
+}
+
+/// Rasterise the coherent typed SimpleRouteJson physical-rule subset supported by
+/// the current router.
+///
+/// Unlike [`rasterize_with_layers`]'s compatibility entry point, this keeps
+/// trace→pad and via→pad edge clearances distinct, uses the resolved nominal
+/// trace width for routing-channel geometry. `outline`, board-edge clearance, and
+/// `allowViaInPad` are deliberately not claimed by this projection: they parse and
+/// round-trip, but need dedicated core geometry/repair semantics before activation.
+/// Coherent supported projections opt directly into exact physical geometry:
+/// their values came from the board rather than an old cell-count approximation.
+pub fn rasterize_with_uniform_physical_rules(
+    srj: &SimpleRouteJson,
+    resolution: f64,
+    layers: LayerMap,
+    rules: UniformPhysicalRules,
+) -> RasterizedProblem {
+    let clearance_cells = if rules.obstacle_margin_mm > 0.0 && resolution > 0.0 {
+        (rules.obstacle_margin_mm / resolution).ceil() as u32
+    } else {
+        0
+    };
+    rasterize_with_layers_model(
+        srj,
+        resolution,
+        layers,
+        RasterRuleProjection {
+            clearance_cells,
+            generic_clearance_mm: rules.obstacle_margin_mm,
+            trace_to_pad_clearance_mm: rules.trace_to_pad_clearance_mm,
+            via_to_pad_clearance_mm: rules.via_to_pad_clearance_mm,
+            via_pad_mm: rules.via_pad_diameter_mm,
+            trace_width_mm: Some(rules.trace_width_mm),
+            model: ClearanceRasterModel::ExactPhysical,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RasterRuleProjection {
+    clearance_cells: u32,
+    generic_clearance_mm: f64,
+    trace_to_pad_clearance_mm: f64,
+    via_to_pad_clearance_mm: f64,
+    via_pad_mm: f64,
+    trace_width_mm: Option<f64>,
+    model: ClearanceRasterModel,
 }
 
 fn rasterize_with_layers_model(
     srj: &SimpleRouteJson,
     resolution: f64,
     layers: LayerMap,
-    clearance_cells: u32,
-    min_clearance_mm: f64,
-    via_pad_mm: f64,
-    model: ClearanceRasterModel,
+    rules: RasterRuleProjection,
 ) -> RasterizedProblem {
+    let RasterRuleProjection {
+        clearance_cells,
+        generic_clearance_mm,
+        trace_to_pad_clearance_mm,
+        via_to_pad_clearance_mm,
+        via_pad_mm,
+        trace_width_mm,
+        model,
+    } = rules;
     let layer_count = layers.len();
     // Non-uniform / Hanan grid: build per-axis lines through every pad endpoint and
     // obstacle edge (plus bounds + fill channels) so each pad lands on an exact node
@@ -1006,11 +1449,11 @@ fn rasterize_with_layers_model(
     // and `trace_route`). The design-rule track width / clearance drive the fill
     // channel threshold; both fall back to `resolution` when the problem omits them,
     // so a rule-less fixture still gets sensible routing lanes.
-    let track_w = srj
-        .min_trace_width
+    let track_w = trace_width_mm
+        .or(srj.min_trace_width)
         .filter(|w| *w > 0.0)
         .unwrap_or(resolution);
-    // Effective copper clearance the rasteriser will actually enforce. The bounded
+    // Effective generic copper clearance used to space fill channels. The bounded
     // rollout retains the historical ceil-rounded distance for ordinary boards and
     // chooses the exact physical rule only when the quantisation error is large enough
     // to erase a complete via-sized lane (see `select_clearance_raster_model`).
@@ -1021,9 +1464,21 @@ fn rasterize_with_layers_model(
     let rounded_clearance = (clearance_cells as f64 * resolution).max(0.0);
     let clearance = match model {
         ClearanceRasterModel::ExactPhysical
-            if min_clearance_mm.is_finite() && min_clearance_mm > 0.0 =>
+            if generic_clearance_mm.is_finite() && generic_clearance_mm >= 0.0 =>
         {
-            min_clearance_mm
+            generic_clearance_mm
+        }
+        ClearanceRasterModel::LegacyRounded | ClearanceRasterModel::ExactPhysical => {
+            rounded_clearance
+        }
+    };
+    // Static rectangular obstacles are pads in SimpleRouteJson. Keep their
+    // trace-edge rule separate from the generic trace↔trace/feature margin.
+    let pad_clearance = match model {
+        ClearanceRasterModel::ExactPhysical
+            if trace_to_pad_clearance_mm.is_finite() && trace_to_pad_clearance_mm >= 0.0 =>
+        {
+            trace_to_pad_clearance_mm
         }
         ClearanceRasterModel::LegacyRounded | ClearanceRasterModel::ExactPhysical => {
             rounded_clearance
@@ -1049,8 +1504,8 @@ fn rasterize_with_layers_model(
     // the clearance-off DEFAULT regime (`clearance == 0` with a declared trace width)
     // this stays exactly `track_w/2`, preserving the historical base grid and the
     // byte-identical `clearance_cells == 0` contract.
-    let track_block_mm = srj
-        .min_trace_width
+    let track_block_mm = trace_width_mm
+        .or(srj.min_trace_width)
         .filter(|w| *w > 0.0)
         .map_or(0.0, |w| w / 2.0);
     // D1 (foreign-pad clearance safety band): the bare `track_w/2` reserves only the
@@ -1062,8 +1517,9 @@ fn rasterize_with_layers_model(
     // nodes far enough out that a snapped/chamfered segment between them still clears the
     // pad. Only applied when clearance is active. `PAD_BAND_K` is a named constant the
     // integrator can joint-tune.
-    let pad_band_mm = if clearance > 0.0 {
-        srj.min_trace_width
+    let pad_band_mm = if pad_clearance > 0.0 {
+        trace_width_mm
+            .or(srj.min_trace_width)
             .filter(|w| *w > 0.0)
             .map_or(track_block_mm, |w| PAD_BAND_K * w)
     } else {
@@ -1083,7 +1539,7 @@ fn rasterize_with_layers_model(
     // tested regressed the subset (it over-blocks dense lanes), so it ships at 0.0 (off);
     // see the constant's doc for the sweep finding.
     let via_reserve_mm = VIA_RESERVE_FRAC * via_pad_mm / 2.0;
-    let pad_band_mm = if clearance > 0.0 && layer_count > 1 && via_reserve_mm > 0.0 {
+    let pad_band_mm = if pad_clearance > 0.0 && layer_count > 1 && via_reserve_mm > 0.0 {
         pad_band_mm.max(via_reserve_mm)
     } else {
         pad_band_mm
@@ -1091,7 +1547,7 @@ fn rasterize_with_layers_model(
     // Total distance every FOREIGN pad/obstacle reserves around itself. In the
     // clearance-off regime this is just the historical `track_w/2` (or 0 with no
     // declared width), preserving the byte-identical base grid.
-    let block_margin_mm = clearance + pad_band_mm;
+    let block_margin_mm = pad_clearance + pad_band_mm;
     // Foreign-pad clip margin for the own-pad ESCAPE halo (see `pad_cells_for_point`).
     // The base grid is inflated by `block_margin_mm`. Under the legacy rollout branch,
     // `clearance` is ceil-rounded and can exceed the rule the DRC actually enforces —
@@ -1112,12 +1568,14 @@ fn rasterize_with_layers_model(
         // problem omits one — which `clearance_cells` already `ceil`-rounded away). Fall
         // back to `srj.min_clearance` then the rounded `clearance`, and never exceed
         // `block_margin_mm` (the base-grid inflation the corridor lives in).
-        let true_clearance = if min_clearance_mm > 0.0 {
-            min_clearance_mm
+        let true_clearance = if trace_to_pad_clearance_mm > 0.0 {
+            trace_to_pad_clearance_mm
         } else {
-            srj.min_clearance.filter(|c| *c > 0.0).unwrap_or(clearance)
+            srj.min_clearance
+                .filter(|c| *c > 0.0)
+                .unwrap_or(pad_clearance)
         };
-        true_clearance.min(clearance) + pad_band_mm
+        true_clearance.min(pad_clearance) + pad_band_mm
     } else {
         0.0
     };
@@ -1126,8 +1584,8 @@ fn rasterize_with_layers_model(
     // gaps a coarser legacy `clearance` would skip — see `build_grid_lines`. It equals
     // the selected value under the exact branch, making the escape pass inert there.
     // Zero (clearance-off) also leaves the pass inert.
-    let escape_clearance = if min_clearance_mm > 0.0 {
-        min_clearance_mm
+    let escape_clearance = if trace_to_pad_clearance_mm > 0.0 {
+        trace_to_pad_clearance_mm
     } else {
         srj.min_clearance.filter(|c| *c > 0.0).unwrap_or(0.0)
     };
@@ -1143,7 +1601,7 @@ fn rasterize_with_layers_model(
         && via_pad_mm.is_finite()
         && via_pad_mm > 0.0
     {
-        clearance.max(0.0) + via_pad_mm / 2.0
+        via_to_pad_clearance_mm.max(0.0) + via_pad_mm / 2.0
     } else {
         0.0
     };
@@ -2761,6 +3219,604 @@ mod tests {
     }"#;
 
     #[test]
+    fn typed_physical_rules_accept_modern_and_legacy_via_spellings() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.12,
+            "defaultObstacleMargin": 0.05,
+            "minTraceToPadEdgeClearance": 0.06,
+            "minViaEdgeToPadEdgeClearance": 0.08,
+            "minViaHoleEdgeToViaHoleEdgeClearance": 0.09,
+            "minBoardEdgeClearance": 0.2,
+            "minViaHoleDiameter": 0.2,
+            "min_via_hole_diameter": 0.2,
+            "minViaPadDiameter": 0.45,
+            "min_via_pad_diameter": 0.45,
+            "allowViaInPad": false,
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 4.0, "y": 0.0},
+                {"x": 4.0, "y": 4.0}, {"x": 0.0, "y": 4.0}
+            ],
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [
+                {"type": "rect", "shape": "rect", "center": {"x": 0.5, "y": 0.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"], "connectedTo": ["n"]},
+                {"type": "rect", "shape": "rect", "center": {"x": 3.5, "y": 3.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"], "connectedTo": ["n"]}
+            ],
+            "connections": [{
+                "name": "n",
+                "nominalTraceWidth": 0.12,
+                "width": 0.12,
+                "pointsToConnect": [{"x": 0.5, "y": 0.5}, {"x": 3.5, "y": 3.5}]
+            }]
+        }))
+        .expect("modern producers may emit both via spellings");
+
+        assert_eq!(srj.physical_rules.min_via_hole_diameter, Some(0.2));
+        assert_eq!(srj.physical_rules.min_via_hole_diameter_snake, Some(0.2));
+        assert_eq!(srj.physical_rules.min_via_pad_diameter, Some(0.45));
+        assert_eq!(srj.physical_rules.min_via_pad_diameter_snake, Some(0.45));
+        assert_eq!(srj.physical_rules.outline.len(), 4);
+        let rules = srj.uniform_physical_rules().expect("coherent profile");
+        assert_eq!(rules.trace_width_mm, 0.12);
+        assert_eq!(rules.via_hole_diameter_mm, 0.2);
+        assert_eq!(rules.via_pad_diameter_mm, 0.45);
+        assert_eq!(rules.via_hole_to_hole_clearance_mm, Some(0.09));
+
+        let serialized = serde_json::to_value(&srj).unwrap();
+        assert_eq!(serialized["nominalTraceWidth"], 0.12);
+        assert_eq!(serialized["minViaHoleDiameter"], 0.2);
+        assert_eq!(serialized["min_via_hole_diameter"], 0.2);
+        assert_eq!(serialized["minViaPadDiameter"], 0.45);
+        assert_eq!(serialized["min_via_pad_diameter"], 0.45);
+        assert_eq!(serialized["connections"][0]["nominalTraceWidth"], 0.12);
+        assert_eq!(serialized["connections"][0]["width"], 0.12);
+        assert_eq!(
+            serialized["outline"],
+            serde_json::json!([
+                {"x": 0.0, "y": 0.0}, {"x": 4.0, "y": 0.0},
+                {"x": 4.0, "y": 4.0}, {"x": 0.0, "y": 4.0}
+            ]),
+            "outline vertices must not acquire routed-point layer keys"
+        );
+        let reparsed: SimpleRouteJson = serde_json::from_value(serialized).unwrap();
+        assert_eq!(reparsed, srj);
+    }
+
+    #[test]
+    fn absent_typed_fields_do_not_change_legacy_serialized_key_sets() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "minTraceWidth": 0.1,
+            "minClearance": 0.1,
+            "obstacles": [],
+            "connections": [{
+                "name": "legacy",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}
+                ]
+            }],
+            "bounds": {"minX": 0.0, "maxX": 1.0, "minY": 0.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(srj).unwrap();
+        let root_keys: std::collections::BTreeSet<_> =
+            serialized.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            root_keys,
+            [
+                "bounds",
+                "connections",
+                "layerCount",
+                "minClearance",
+                "minTraceWidth",
+                "obstacles",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+        let connection_keys: std::collections::BTreeSet<_> = serialized["connections"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            connection_keys,
+            ["name", "pointsToConnect", "rootConnectionName"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn typed_physical_rules_reject_mixed_connection_widths() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.05,
+            "minTraceToPadEdgeClearance": 0.05,
+            "minViaEdgeToPadEdgeClearance": 0.08,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.45,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "connections": [
+                {"name": "a", "nominalTraceWidth": 0.1,
+                 "pointsToConnect": [{"x": 0.5, "y": 0.5}, {"x": 3.5, "y": 0.5}]},
+                {"name": "b", "nominalTraceWidth": 0.2,
+                 "pointsToConnect": [{"x": 0.5, "y": 3.5}, {"x": 3.5, "y": 3.5}]}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "a board-wide router must not silently flatten heterogeneous widths"
+        );
+    }
+
+    #[test]
+    fn typed_physical_rules_reject_invalid_optional_supported_rules() {
+        let valid: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minPadEdgeToPadEdgeClearance": 0.11,
+            "minViaHoleEdgeToViaHoleEdgeClearance": 0.1,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0}
+        }))
+        .unwrap();
+        assert!(valid.uniform_physical_rules().is_some());
+
+        let mut negative_pad_rule = valid.clone();
+        negative_pad_rule
+            .physical_rules
+            .min_pad_edge_to_pad_edge_clearance = Some(-0.01);
+        assert!(
+            negative_pad_rule.uniform_physical_rules().is_none(),
+            "an invalid declared pad↔pad rule must fail closed"
+        );
+
+        let mut nan_hole_rule = valid;
+        nan_hole_rule
+            .physical_rules
+            .min_via_hole_edge_to_via_hole_edge_clearance = Some(f64::NAN);
+        assert!(
+            nan_hole_rule.uniform_physical_rules().is_none(),
+            "an invalid declared via-hole↔via-hole rule must fail closed"
+        );
+    }
+
+    #[test]
+    fn typed_physical_rules_validate_every_supplied_alias() {
+        let valid: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleDiameter": 0.2,
+            "min_via_hole_diameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "min_via_pad_diameter": 0.4,
+            "minViaDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [
+                {"type": "rect", "shape": "rect", "center": {"x": 0.5, "y": 0.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"], "connectedTo": ["n"]},
+                {"type": "rect", "shape": "rect", "center": {"x": 3.5, "y": 3.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"], "connectedTo": ["n"]}
+            ],
+            "connections": [{
+                "name": "n", "nominalTraceWidth": 0.1, "width": 0.1,
+                "pointsToConnect": [{"x": 0.5, "y": 0.5}, {"x": 3.5, "y": 3.5}]
+            }]
+        }))
+        .unwrap();
+        assert!(valid.uniform_physical_rules().is_some());
+
+        let mut invalid_shadowed_pad = valid.clone();
+        invalid_shadowed_pad
+            .physical_rules
+            .min_via_pad_diameter_snake = Some(-0.4);
+        assert!(invalid_shadowed_pad.uniform_physical_rules().is_none());
+
+        let mut conflicting_hole = valid.clone();
+        conflicting_hole.physical_rules.min_via_hole_diameter_snake = Some(0.21);
+        assert!(conflicting_hole.uniform_physical_rules().is_none());
+
+        let mut invalid_shadowed_width = valid.clone();
+        invalid_shadowed_width.connections[0].rules.width = Some(f64::NAN);
+        assert!(invalid_shadowed_width.uniform_physical_rules().is_none());
+
+        let mut conflicting_width = valid;
+        conflicting_width.connections[0].rules.width = Some(0.11);
+        assert!(conflicting_width.uniform_physical_rules().is_none());
+    }
+
+    #[test]
+    fn typed_physical_rules_resolve_annular_minimum_and_conservatively_cover_fixed_holes() {
+        let mut srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleEdgeToViaHoleEdgeClearance": 0.1,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.2,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0}
+        }))
+        .unwrap();
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "equal minimum pad/drill diameters cannot emit a legal annular ring"
+        );
+        srj.physical_rules.min_via_pad_diameter = Some(0.3);
+        let resolved = srj.uniform_physical_rules().unwrap();
+        assert_eq!(resolved.via_hole_diameter_mm, 0.2);
+        assert_eq!(resolved.via_pad_diameter_mm, 0.3);
+
+        // A connected obstacle may be a fixed plated hole whose kind was lost.
+        // Fail closed when routed-via↔pad spacing no longer dominates the
+        // declared drill-edge rule against that unknown feature.
+        srj.physical_rules
+            .min_via_hole_edge_to_via_hole_edge_clearance = Some(0.2);
+        assert!(srj.uniform_physical_rules().is_none());
+    }
+
+    #[test]
+    fn typed_physical_rules_reject_unclassified_obstacles() {
+        let mut srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.08,
+            "minTraceToPadEdgeClearance": 0.08,
+            "minViaEdgeToPadEdgeClearance": 0.08,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [{
+                "type": "rect", "shape": "rect", "center": {"x": 2.0, "y": 2.0},
+                "width": 0.2, "height": 0.2
+            }]
+        }))
+        .unwrap();
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "an unclassified obstacle must not inherit the narrower pad rule"
+        );
+
+        srj.obstacles[0].connected_to.push("pad_1".into());
+        assert!(srj.uniform_physical_rules().is_some());
+
+        let mut narrower_trace_rule = srj.clone();
+        narrower_trace_rule
+            .physical_rules
+            .min_trace_to_pad_edge_clearance = Some(0.07);
+        assert!(narrower_trace_rule.uniform_physical_rules().is_none());
+
+        let mut narrower_via_rule = srj.clone();
+        narrower_via_rule
+            .physical_rules
+            .min_via_edge_to_pad_edge_clearance = Some(0.07);
+        assert!(narrower_via_rule.uniform_physical_rules().is_none());
+
+        let mut via_rule_below_trace_rule = srj.clone();
+        via_rule_below_trace_rule
+            .physical_rules
+            .min_trace_to_pad_edge_clearance = Some(0.09);
+        assert!(via_rule_below_trace_rule.uniform_physical_rules().is_none());
+
+        srj.physical_rules.min_pad_edge_to_pad_edge_clearance = Some(0.07);
+        assert!(srj.uniform_physical_rules().is_none());
+    }
+
+    #[test]
+    fn typed_physical_rules_require_unambiguous_same_net_terminal_pads() {
+        let mut srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "connections": [{
+                "name": "edge", "rootConnectionName": "root",
+                "pointsToConnect": [
+                    {"x": 0.5, "y": 0.5, "layer": "top"},
+                    {"x": 3.5, "y": 3.5, "layer": "bottom"}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "bare endpoints cannot activate typed own-pad exemptions"
+        );
+
+        srj.obstacles = serde_json::from_value(serde_json::json!([
+            {"type": "rect", "shape": "rect", "center": {"x": 0.5, "y": 0.5},
+             "width": 0.2, "height": 0.2, "layers": ["top"],
+             "connectedTo": ["root", "pcb_port_7"]},
+            {"type": "rect", "shape": "circle", "center": {"x": 3.5, "y": 3.5},
+             "width": 0.2, "height": 0.2, "layers": ["bottom"], "connectedTo": ["edge"]}
+        ]))
+        .unwrap();
+        assert!(
+            srj.uniform_physical_rules().is_some(),
+            "either the connection or non-empty root alias identifies an own pad"
+        );
+
+        let mut unknown_metadata = srj.clone();
+        unknown_metadata.obstacles[0]
+            .connected_to
+            .push("mystery".into());
+        assert!(
+            unknown_metadata.uniform_physical_rules().is_none(),
+            "only the supported pcb_port_<digits> producer metadata may accompany a routed alias"
+        );
+
+        let mut same_root = srj.clone();
+        same_root.connections.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "sibling", "rootConnectionName": "root",
+                "pointsToConnect": [
+                    {"x": 0.5, "y": 0.5, "layer": "top"},
+                    {"x": 3.5, "y": 3.5, "layer": "bottom"}
+                ]
+            }))
+            .unwrap(),
+        );
+        assert!(
+            same_root.uniform_physical_rules().is_some(),
+            "different connection aliases in one root electrical group are coherent"
+        );
+
+        let mut ambiguous_groups = same_root;
+        ambiguous_groups.connections[1].root_connection_name = Some("other".into());
+        for obstacle in &mut ambiguous_groups.obstacles {
+            obstacle.connected_to.push("other".into());
+        }
+        assert!(
+            ambiguous_groups.uniform_physical_rules().is_none(),
+            "one covering pad cannot name aliases from unrelated electrical groups"
+        );
+
+        let mut circle_corner = srj.clone();
+        circle_corner.connections[0].points_to_connect[1].x = 3.6;
+        circle_corner.connections[0].points_to_connect[1].y = 3.6;
+        assert!(
+            circle_corner.uniform_physical_rules().is_none(),
+            "a circle bounding-box corner is not physical own-pad copper"
+        );
+
+        let foreign: Obstacle = serde_json::from_value(serde_json::json!({
+            "type": "rect", "shape": "rect", "center": {"x": 0.5, "y": 0.5},
+            "width": 0.1, "height": 0.1, "layers": ["top"],
+            "connectedTo": ["foreign"]
+        }))
+        .unwrap();
+        srj.obstacles.push(foreign);
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "an overlapping foreign pad would also be unmasked and must fail closed"
+        );
+
+        srj.obstacles.pop();
+        srj.connections[0].points_to_connect[0].layer = Some("unknown".into());
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "typed terminal ownership requires a recognized declared layer"
+        );
+    }
+
+    #[test]
+    fn typed_physical_rules_reject_geometry_the_axis_aligned_raster_cannot_model() {
+        let mut srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [{
+                "type": "rect", "shape": "rect",
+                "ccwRotationDegrees": 0.0,
+                "center": {"x": 2.0, "y": 2.0},
+                "width": 0.2, "height": 0.4,
+                "connectedTo": ["pad_1"]
+            }]
+        }))
+        .unwrap();
+        assert!(srj.uniform_physical_rules().is_some());
+        let round_trip: SimpleRouteJson =
+            serde_json::from_value(serde_json::to_value(&srj).unwrap()).unwrap();
+        assert_eq!(round_trip.obstacles[0].shape.as_deref(), Some("rect"));
+        assert_eq!(round_trip.obstacles[0].ccw_rotation_degrees, Some(0.0));
+
+        srj.obstacles[0].ccw_rotation_degrees = Some(45.0);
+        assert!(srj.uniform_physical_rules().is_none());
+        srj.obstacles[0].ccw_rotation_degrees = None;
+        srj.obstacles[0].shape = Some("oval".into());
+        assert!(srj.uniform_physical_rules().is_none());
+        srj.obstacles[0].shape = Some("circle".into());
+        assert!(srj.uniform_physical_rules().is_some());
+        srj.obstacles[0].center.x = f64::NAN;
+        assert!(srj.uniform_physical_rules().is_none());
+    }
+
+    #[test]
+    fn legacy_min_clearance_precedes_typed_default_obstacle_margin() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "minClearance": 0.04,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.05,
+            "minTraceToPadEdgeClearance": 0.06,
+            "minViaEdgeToPadEdgeClearance": 0.08,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.45,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0}
+        }))
+        .unwrap();
+        assert_eq!(
+            srj.uniform_physical_rules().unwrap().obstacle_margin_mm,
+            0.04
+        );
+    }
+
+    #[test]
+    fn typed_raster_keeps_generic_trace_and_pair_pad_clearances_distinct() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [{
+                "type": "rect", "shape": "rect", "center": {"x": 2.0, "y": 2.0},
+                "width": 0.2, "height": 0.2, "layers": ["top"],
+                "connectedTo": ["pad_probe"]
+            }],
+            "connections": [{
+                "name": "probe",
+                "pointsToConnect": [
+                    {"x": 2.24, "y": 2.0},
+                    {"x": 2.38, "y": 2.0},
+                    {"x": 3.5, "y": 3.5}
+                ]
+            }]
+        }))
+        .unwrap();
+        // These endpoints are Hanan-line geometry probes, not route terminals.
+        // Resolve the coherent board-rule projection without them, then exercise
+        // the lower-level raster API with the synthetic line locations intact.
+        let mut rule_source = srj.clone();
+        rule_source.connections.clear();
+        let rules = rule_source.uniform_physical_rules().unwrap();
+        assert_eq!(rules.obstacle_margin_mm, 0.04);
+        assert_eq!(rules.trace_to_pad_clearance_mm, 0.07);
+        assert_eq!(rules.via_to_pad_clearance_mm, 0.09);
+        let problem =
+            rasterize_with_uniform_physical_rules(&srj, 0.5, LayerMap::standard(2), rules);
+        let trace_pad_cell = problem.mapping.point_to_cell_layer((2.24, 2.0), 0);
+        assert!(
+            problem.grid.is_obstacle(trace_pad_cell),
+            "the trace probe is inside the 0.07 mm trace→pad band; a generic 0.04 mm band would leave it legal"
+        );
+        let via_pad_cell = problem.mapping.point_to_cell_layer((2.38, 2.0), 0);
+        assert!(
+            !problem.grid.is_obstacle(via_pad_cell),
+            "the via probe is outside the trace→pad centreline band"
+        );
+        assert!(
+            problem.grid.is_via_forbidden(via_pad_cell),
+            "the same probe is inside the wider via-annulus→pad band"
+        );
+
+        let fill_srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 0.2, "minY": 0.0, "maxY": 1.0},
+            "connections": [{
+                "name": "fill",
+                "pointsToConnect": [
+                    {"x": 0.0, "y": 0.5}, {"x": 0.2, "y": 0.5}
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut fill_rule_source = fill_srj.clone();
+        fill_rule_source.connections.clear();
+        let fill = rasterize_with_uniform_physical_rules(
+            &fill_srj,
+            0.5,
+            LayerMap::standard(2),
+            fill_rule_source.uniform_physical_rules().unwrap(),
+        );
+        assert!(
+            fill.mapping
+                .x_lines
+                .iter()
+                .any(|x| (*x - 0.1).abs() <= LINE_EPSILON),
+            "the 0.2 mm feature gap admits a fill lane under generic 0.04 mm clearance; trace→pad 0.07 mm would reject it"
+        );
+    }
+
+    #[test]
+    fn typed_via_pad_clearance_uses_an_exact_edge_boundary() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.05,
+            "minTraceToPadEdgeClearance": 0.05,
+            "minViaEdgeToPadEdgeClearance": 0.2,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [{
+                "type": "rect", "shape": "rect", "center": {"x": 2.0, "y": 2.0},
+                "width": 0.2, "height": 0.2, "layers": ["top"]
+                ,"connectedTo": ["pad_boundary"]
+            }],
+            "connections": [{
+                "name": "probes",
+                "pointsToConnect": [
+                    {"x": 2.499999, "y": 2.0},
+                    {"x": 2.5, "y": 2.0}
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut rule_source = srj.clone();
+        rule_source.connections.clear();
+        let problem = rasterize_with_uniform_physical_rules(
+            &srj,
+            0.5,
+            LayerMap::standard(2),
+            rule_source.uniform_physical_rules().unwrap(),
+        );
+        let just_inside = problem.mapping.point_to_cell_layer((2.499999, 2.0), 0);
+        let exact_boundary = problem.mapping.point_to_cell_layer((2.5, 2.0), 0);
+        assert!(problem.grid.is_via_forbidden(just_inside));
+        assert!(
+            !problem.grid.is_via_forbidden(exact_boundary),
+            "an annulus exactly at the declared edge clearance is legal"
+        );
+    }
+
+    #[test]
     fn clearance_rollout_trigger_has_physical_boundary_and_safe_zero_rule() {
         let true_clearance = 0.15;
         let via_pad = 0.45;
@@ -2851,19 +3907,29 @@ mod tests {
             &srj,
             resolution,
             layers.clone(),
-            1,
-            0.15,
-            0.45,
-            ClearanceRasterModel::LegacyRounded,
+            RasterRuleProjection {
+                clearance_cells: 1,
+                generic_clearance_mm: 0.15,
+                trace_to_pad_clearance_mm: 0.15,
+                via_to_pad_clearance_mm: 0.15,
+                via_pad_mm: 0.45,
+                trace_width_mm: None,
+                model: ClearanceRasterModel::LegacyRounded,
+            },
         );
         let exact = rasterize_with_layers_model(
             &srj,
             resolution,
             layers,
-            1,
-            0.15,
-            0.45,
-            ClearanceRasterModel::ExactPhysical,
+            RasterRuleProjection {
+                clearance_cells: 1,
+                generic_clearance_mm: 0.15,
+                trace_to_pad_clearance_mm: 0.15,
+                via_to_pad_clearance_mm: 0.15,
+                via_pad_mm: 0.45,
+                trace_width_mm: None,
+                model: ClearanceRasterModel::ExactPhysical,
+            },
         );
 
         assert_rasterized_problem_identical(&automatic, &legacy, "synthetic low-quant board");
@@ -2923,10 +3989,15 @@ mod tests {
                 &srj,
                 resolution,
                 layers,
-                clearance_cells,
-                DEFAULT_CLEARANCE_MM,
-                VIA_PAD_MM,
-                ClearanceRasterModel::LegacyRounded,
+                RasterRuleProjection {
+                    clearance_cells,
+                    generic_clearance_mm: DEFAULT_CLEARANCE_MM,
+                    trace_to_pad_clearance_mm: DEFAULT_CLEARANCE_MM,
+                    via_to_pad_clearance_mm: DEFAULT_CLEARANCE_MM,
+                    via_pad_mm: VIA_PAD_MM,
+                    trace_width_mm: None,
+                    model: ClearanceRasterModel::LegacyRounded,
+                },
             );
             assert_rasterized_problem_identical(&automatic, &legacy, fixture);
         }
@@ -3062,6 +4133,8 @@ mod tests {
             },
             width: 0.2,
             height: 0.2,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["top".into()],
             connected_to: vec!["foreign".into()],
         }];
@@ -3075,6 +4148,8 @@ mod tests {
                 },
                 width: 0.01,
                 height: 0.01,
+                shape: None,
+                ccw_rotation_degrees: None,
                 layers: vec!["top".into()],
                 connected_to: vec!["probe".into()],
             });
@@ -3083,10 +4158,12 @@ mod tests {
             layer_count: 2,
             min_trace_width: Some(0.15),
             min_clearance: Some(0.15),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles,
             connections: vec![Connection {
                 name: "probe".into(),
                 root_connection_name: None,
+                rules: ConnectionRules::default(),
                 points_to_connect: vec![
                     Point {
                         x: point.0,
@@ -3730,6 +4807,7 @@ mod tests {
             layer_count: 1,
             min_trace_width: Some(track_w),
             min_clearance: Some(clearance),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
@@ -3740,6 +4818,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3752,6 +4832,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3790,6 +4872,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3802,6 +4886,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3836,6 +4922,7 @@ mod tests {
             layer_count: 1,
             min_trace_width: Some(track_w),
             min_clearance: Some(escape),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
@@ -3846,6 +4933,8 @@ mod tests {
                     },
                     width: 1.6,
                     height: 1.6,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3858,6 +4947,8 @@ mod tests {
                     },
                     width: 1.6,
                     height: 1.6,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3899,6 +4990,7 @@ mod tests {
             layer_count: 1,
             min_trace_width: Some(track_w),
             min_clearance: Some(cl),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
@@ -3909,6 +5001,8 @@ mod tests {
                     },
                     width: 1.6,
                     height: 1.6,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3921,6 +5015,8 @@ mod tests {
                     },
                     width: 1.6,
                     height: 1.6,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3957,6 +5053,7 @@ mod tests {
             layer_count: 1,
             min_trace_width: Some(track_w),
             min_clearance: Some(clearance),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles: vec![
                 Obstacle {
                     kind: "rect".into(),
@@ -3967,6 +5064,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -3979,6 +5078,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 },
@@ -4037,6 +5138,8 @@ mod tests {
                     },
                     width: 0.4,
                     height: 0.4,
+                    shape: None,
+                    ccw_rotation_degrees: None,
                     layers: vec![],
                     connected_to: vec![],
                 });
@@ -4047,6 +5150,7 @@ mod tests {
             layer_count: 1,
             min_trace_width: Some(track_w),
             min_clearance: Some(clearance),
+            physical_rules: SimpleRoutePhysicalRules::default(),
             obstacles,
             connections: vec![],
             bounds: Bounds {
@@ -4202,6 +5306,8 @@ mod tests {
             },
             width: 2.4,
             height: 0.4,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["bottom".into()],
             connected_to: vec!["foreign-bottom".into()],
         };
@@ -4237,6 +5343,8 @@ mod tests {
                 },
                 width: 0.2,
                 height: 0.2,
+                shape: None,
+                ccw_rotation_degrees: None,
                 layers: vec!["top".into()],
                 connected_to: vec!["own-top".into()],
             },
@@ -4249,6 +5357,8 @@ mod tests {
                 },
                 width: 0.4,
                 height: 0.4,
+                shape: None,
+                ccw_rotation_degrees: None,
                 layers: vec!["bottom".into()],
                 connected_to: vec!["foreign-bottom".into()],
             },

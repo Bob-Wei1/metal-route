@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mr_core::LayerMap;
-use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via};
+use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation};
 use mr_srj::{PcbTrace, RoutePoint, SimpleRouteJson};
 
 use crate::{VIA_DRILL_MM, VIA_PAD_MM};
@@ -303,6 +303,10 @@ pub fn solution_to_drc_board(
     layers: u32,
 ) -> DrcBoard {
     let effective_layers = LayerMap::standard(layers);
+    let (via_pad_diameter, via_hole_diameter) = srj
+        .uniform_physical_rules()
+        .map(|physical| (physical.via_pad_diameter_mm, physical.via_hole_diameter_mm))
+        .unwrap_or((VIA_PAD_MM, VIA_DRILL_MM));
     let connectivity_aliases = connectivity_alias_map(&srj.obstacles);
     let mut segments: Vec<Segment> = Vec::new();
     let mut vias: Vec<Via> = Vec::new();
@@ -394,8 +398,8 @@ pub fn solution_to_drc_board(
                     vias.push(Via {
                         net: net.clone(),
                         center: (*x, *y),
-                        pad_diameter: VIA_PAD_MM,
-                        drill_diameter: VIA_DRILL_MM,
+                        pad_diameter: via_pad_diameter,
+                        drill_diameter: via_hole_diameter,
                         from_layer: from,
                         to_layer: to,
                         antipad_radius: None,
@@ -436,6 +440,23 @@ pub fn solution_to_drc_board(
         vias,
         rules,
     }
+}
+
+/// Check a projected SRJ solution with its feature-pair pad rules when the
+/// coherence gate is active; legacy and partial-rule inputs retain the historical
+/// single-clearance checker path.
+pub(crate) fn check_with_srj_rules(srj: &SimpleRouteJson, board: &DrcBoard) -> Vec<Violation> {
+    srj.uniform_physical_rules().map_or_else(
+        || board.check(),
+        |physical| {
+            board.check_with_pad_clearances(
+                physical.trace_to_pad_clearance_mm,
+                physical.via_to_pad_clearance_mm,
+                physical.pad_to_pad_clearance_mm,
+                physical.via_hole_to_hole_clearance_mm,
+            )
+        },
+    )
 }
 
 /// Quantise a coordinate to a fixed sub-micron grid so two vertices the router
@@ -515,6 +536,51 @@ mod tests {
             "connections": [],
         });
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn coherent_srj_projects_pair_specific_pad_clearances_into_drc() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.05,
+            "minTraceToPadEdgeClearance": 0.06,
+            "minViaEdgeToPadEdgeClearance": 0.08,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0}
+        }))
+        .unwrap();
+        let board = DrcBoard {
+            layers: vec![LayerKind::Signal],
+            segments: vec![],
+            pads: vec![Pad {
+                net: Some("pad".into()),
+                layer: 0,
+                center: (0.0, 0.0),
+                width: 0.2,
+                height: 0.2,
+            }],
+            vias: vec![Via {
+                net: "via".into(),
+                center: (0.37, 0.0),
+                pad_diameter: 0.4,
+                drill_diameter: 0.2,
+                from_layer: 0,
+                to_layer: 0,
+                antipad_radius: None,
+            }],
+            rules: DrcRules {
+                clearance: 0.05,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+        };
+        assert!(board.check().is_empty(), "generic 0.05 mm gap is satisfied");
+        let findings = check_with_srj_rules(&srj, &board);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].required, 0.08);
     }
 
     fn wire_on(x: f64, y: f64, layer: &str) -> RoutePoint {

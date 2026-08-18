@@ -8,8 +8,8 @@
 //! bun / the harness checked out, so router regressions are caught by
 //! `cargo test`.
 
-use mr_cli::{DEFAULT_CLEARANCE_MM, VIA_PAD_MM};
-use mr_core::{GridCoords, LayerMap, Router, ViaModel};
+use mr_cli::{check_srj_solution, route_problem, RouterKind, UnroutedReason};
+use mr_core::{LayerMap, Router};
 use mr_cpu::NegotiatedRouter;
 use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, ViolationClass};
 use mr_srj::{rasterize_with_layers, to_solution_layered, RoutePoint, SimpleRouteJson};
@@ -21,9 +21,6 @@ const SOLVE_LAYERS: u32 = 2;
 
 const MIN_RESOLUTION: f64 = 0.1;
 const TARGET_CELLS_PER_AXIS: f64 = 200.0;
-/// Mirrored from private `mr_cli::DEFAULT_TRACE_WIDTH` for the production-equivalent
-/// frontier projection below.
-const DEFAULT_TRACE_WIDTH_MM: f64 = 0.15;
 
 /// Mirror of `mr_server::choose_resolution` so the fixtures route at the same
 /// grid the live solver uses (kept in sync intentionally; the server owns the
@@ -81,11 +78,9 @@ fn srj29_sample021_bytes() -> Vec<u8> {
 /// Frontier contract from tscircuit's MIT-licensed SRJ29 sample 021: an exact
 /// eight-layer AM62L32-to-LPDDR4 board rather than a roomy synthetic BGA pair.
 ///
-/// The raw assertions intentionally pin fields that `SimpleRouteJson` does not yet
-/// model (typed clearances, via geometry, buses, differential pairs, and outline).
-/// Keeping them in the fixture prevents a future schema/constraint implementation
-/// from needing another upstream fetch. The typed assertions cover the projection
-/// metalroute already consumes today.
+/// The raw assertions pin unsupported bus/differential-pair metadata while the typed
+/// assertions prove the physical-rule fields project into one coherent uniform rule
+/// profile without losing the board outline or via-in-pad policy.
 #[test]
 fn srj29_sample021_preserves_frontier_contract_and_supported_projection() {
     let bytes = srj29_sample021_bytes();
@@ -108,6 +103,30 @@ fn srj29_sample021_preserves_frontier_contract_and_supported_projection() {
     assert_eq!(srj.layer_count, 8);
     assert_eq!(srj.min_trace_width, Some(0.08128));
     assert_eq!(srj.min_clearance, None);
+    assert_eq!(srj.physical_rules.nominal_trace_width, Some(0.08128));
+    assert_eq!(srj.physical_rules.default_obstacle_margin, Some(0.05));
+    assert_eq!(
+        srj.physical_rules.min_trace_to_pad_edge_clearance,
+        Some(0.05)
+    );
+    assert_eq!(
+        srj.physical_rules.min_via_edge_to_pad_edge_clearance,
+        Some(0.08128)
+    );
+    assert_eq!(srj.physical_rules.min_via_hole_diameter, Some(0.2032));
+    assert_eq!(srj.physical_rules.min_via_pad_diameter, Some(0.4572));
+    assert_eq!(srj.physical_rules.allow_via_in_pad, Some(false));
+    assert_eq!(srj.physical_rules.outline.len(), 4);
+    let rules = srj
+        .uniform_physical_rules()
+        .expect("sample021 has one coherent uniform physical profile");
+    assert_eq!(rules.trace_width_mm, 0.08128);
+    assert_eq!(rules.obstacle_margin_mm, 0.05);
+    assert_eq!(rules.trace_to_pad_clearance_mm, 0.05);
+    assert_eq!(rules.via_to_pad_clearance_mm, 0.08128);
+    assert_eq!(rules.pad_to_pad_clearance_mm, Some(0.1));
+    assert_eq!(rules.via_pad_diameter_mm, 0.4572);
+    assert_eq!(rules.via_hole_diameter_mm, 0.2032);
     assert_eq!(srj.obstacles.len(), 573);
     assert_eq!(srj.connections.len(), 33);
     assert!(srj
@@ -128,56 +147,64 @@ fn srj29_sample021_preserves_frontier_contract_and_supported_projection() {
     }));
 }
 
-/// End-to-end quality floor for the new dense BGA target. This intentionally uses
-/// metalroute's current default clearance because the source's typed clearance
-/// fields are preserved but are not represented by `SimpleRouteJson` yet. Every
-/// missed net routes in isolation, so failures are algorithmic congestion rather
-/// than a malformed fixture or an inadequate grid. The floor admits future
-/// improvements while preventing silent loss of the current 19 routed connections.
+/// The typed path is deliberately opt-in: a partial modern rule bag must not
+/// reinterpret any of the locked regression corpus. This makes the compatibility
+/// claim executable instead of relying on a field-frequency audit.
+#[test]
+fn locked_corpus_does_not_activate_uniform_typed_rules() {
+    fn collect_srj_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read corpus directory") {
+            let path = entry.expect("read corpus entry").path();
+            if path.is_dir() {
+                collect_srj_files(&path, out);
+            } else if path.to_string_lossy().ends_with(".srj.json") {
+                out.push(path);
+            }
+        }
+    }
+
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/corpus");
+    let mut fixtures = Vec::new();
+    collect_srj_files(&corpus, &mut fixtures);
+    fixtures.sort();
+    assert_eq!(fixtures.len(), 112, "locked corpus membership changed");
+    for fixture in fixtures {
+        let bytes = std::fs::read(&fixture).expect("read corpus fixture");
+        let srj: SimpleRouteJson = serde_json::from_slice(&bytes).expect("parse corpus fixture");
+        assert!(
+            srj.uniform_physical_rules().is_none(),
+            "{} unexpectedly activated the typed routing path",
+            fixture.display()
+        );
+    }
+}
+
+/// End-to-end quality floor for the dense BGA target using the supported subset of
+/// its declared physical rules. Every remaining miss routes in isolation, so it is algorithmic
+/// congestion rather than a malformed fixture or inadequate grid.
 #[test]
 #[ignore = "frontier benchmark; run in release"]
 fn srj29_sample021_routes_on_declared_eight_layer_stack() {
     let bytes = srj29_sample021_bytes();
     let srj: SimpleRouteJson = serde_json::from_slice(&bytes).expect("parse SimpleRouteJson");
-    let resolution =
-        (srj.bounds.max_x - srj.bounds.min_x).max(srj.bounds.max_y - srj.bounds.min_y) / 64.0;
-    let clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM);
-    let clearance_cells = (clearance / resolution).ceil() as u32;
-    let layers = LayerMap::standard(srj.layer_count);
-    let problem = rasterize_with_layers(
-        &srj,
-        resolution,
-        layers,
-        clearance_cells,
-        clearance,
-        VIA_PAD_MM,
-    );
-    let coords = GridCoords::from_lines(
-        problem.mapping.x_lines.clone(),
-        problem.mapping.y_lines.clone(),
-    );
-    let mut via_model = ViaModel::through_hole(srj.layer_count);
-    // Keep in sync with the production SRJ route: via radius + clearance + half
-    // of metalroute's current emitted trace width.
-    via_model.keepout_mm = VIA_PAD_MM / 2.0 + clearance + DEFAULT_TRACE_WIDTH_MM / 2.0;
-    let outcome = NegotiatedRouter::new()
-        .with_via_model(via_model)
-        .with_clearance_mm(clearance + DEFAULT_TRACE_WIDTH_MM)
-        .with_via_spacing_mm(VIA_PAD_MM + clearance)
-        .with_coords(coords)
-        .route_with_outcome(&problem.grid, &problem.nets)
-        .expect("route SRJ29 sample 021");
+    let (traces, summary, _) =
+        route_problem(&srj, None, RouterKind::Negotiated, Some(srj.layer_count))
+            .expect("route SRJ29 sample 021 through the production CLI path");
 
-    assert_eq!(problem.nets.len(), 33);
-    assert_eq!(problem.grid.dims.layers, 8);
+    assert_eq!((summary.routed, summary.total), (28, 33));
+    assert_eq!(summary.grid_layers, 8);
     assert!(
-        outcome.board.results.len() >= 19,
-        "SRJ29 sample 021 completion regressed below the 19/33 baseline: {:#?}",
-        outcome.board
+        summary
+            .unrouted
+            .iter()
+            .all(|(_, reason)| *reason == UnroutedReason::Congested),
+        "every remaining SRJ29 miss must remain routable in isolation: {:?}",
+        summary.unrouted
     );
+    let violations = check_srj_solution(&srj, &traces, srj.layer_count);
     assert!(
-        outcome.alone_routable.iter().all(|&routable| routable),
-        "every SRJ29 sample 021 net must remain routable in isolation"
+        violations.is_empty(),
+        "typed CLI route must satisfy the supported physical-rule projection: {violations:#?}"
     );
 }
 

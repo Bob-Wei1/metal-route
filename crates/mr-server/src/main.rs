@@ -14,8 +14,9 @@
 //! negotiated router can resolve crossings with through-vias even when a problem
 //! declares a single layer (the harness checks only connectivity + non-overlap).
 //! Defaults to [`mr_server::DEFAULT_SOLVE_LAYERS`]. `--clearance` (or `-c`, env
-//! `MR_CLEARANCE`) is the copper clearance budget in mm (trace↔trace and
-//! trace↔pad); unset = auto (one trace width), `0` = off. The router backend is a
+//! `MR_CLEARANCE`) is the legacy copper clearance override in mm; unset activates
+//! a coherent supported typed-rule projection when present (otherwise legacy auto),
+//! and `0` disables clearance. The router backend is a
 //! [`mr_cpu::NegotiatedRouter`] (PathFinder-style negotiated-congestion routing
 //! over Dijkstra), injected behind `Arc<dyn Router>` so a Metal backend can
 //! replace it later without touching this file.
@@ -25,8 +26,7 @@ use std::sync::Arc;
 
 use std::path::PathBuf;
 
-use mr_cpu::NegotiatedRouter;
-use mr_server::{RouterFactory, DEFAULT_SOLVE_LAYERS};
+use mr_server::{configured_negotiated_router, ConfiguredRouterFactory, DEFAULT_SOLVE_LAYERS};
 
 const DEFAULT_PORT: u16 = 1234;
 
@@ -40,8 +40,8 @@ const DEFAULT_WEB_DIR: &str = "web/dist";
 struct Opts {
     port: u16,
     solve_layers: u32,
-    /// Clearance budget in continuous units: `None` = auto (one trace width),
-    /// `Some(mm)` = fixed (`Some(0.0)` = clearance off).
+    /// Legacy clearance override: `None` = typed rules when coherently supported,
+    /// otherwise legacy auto; `Some(mm)` = fixed (`Some(0.0)` = clearance off).
     clearance_mm: Option<f64>,
     /// Root of the board corpus for the visualiser API.
     corpus_dir: PathBuf,
@@ -151,7 +151,7 @@ fn parse_clearance(val: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-/// Read the `MR_CLEARANCE` env var. Absent/empty => `None` (auto = one trace width).
+/// Read `MR_CLEARANCE`. Absent/empty leaves per-board typed/legacy auto policy active.
 fn env_clearance() -> Result<Option<f64>, String> {
     match std::env::var("MR_CLEARANCE") {
         Ok(v) if !v.is_empty() => Ok(Some(parse_clearance(&v)?)),
@@ -205,18 +205,13 @@ async fn main() {
     // Backend factory: a `NegotiatedRouter` at the per-problem clearance budget,
     // fed the problem's non-uniform (Hanan) grid coords so its geometric A* cost +
     // heuristic match the real cell spacing.
-    let make_router: RouterFactory = Arc::new(|mm, coords| {
-        Box::new(
-            NegotiatedRouter::new()
-                .with_clearance_mm(mm)
-                .with_coords(coords),
-        )
-    });
+    let make_router: ConfiguredRouterFactory =
+        Arc::new(|config| Box::new(configured_negotiated_router(config)));
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
     let clr = match opts.clearance_mm {
         Some(0.0) => "off".to_string(),
         Some(mm) => format!("{mm} units"),
-        None => "auto (1 trace width)".to_string(),
+        None => "auto (typed supported rules, else legacy)".to_string(),
     };
     println!(
         "mr-server listening on http://{addr} (POST /solve, GET /health, \
@@ -227,7 +222,7 @@ async fn main() {
         opts.web_dir.display(),
     );
 
-    if let Err(e) = mr_server::serve(
+    if let Err(e) = mr_server::serve_configured(
         addr,
         make_router,
         opts.solve_layers,

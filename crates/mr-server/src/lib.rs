@@ -43,11 +43,11 @@ use axum::{
     routing::{get, post},
     Json, Router as AxumRouter,
 };
-use mr_core::{GridCoords, LayerMap, RouteTrace, Router, RouterError};
+use mr_core::{GridCoords, LayerMap, RouteTrace, Router, RouterError, ViaModel};
 use mr_cpu::NegotiatedRouter;
 use mr_srj::{
-    rasterize_with_layers, to_solution_layered, Bounds, PcbTrace, RasterizedProblem,
-    SimpleRouteJson,
+    rasterize_with_layers, rasterize_with_uniform_physical_rules, to_solution_layered, Bounds,
+    PcbTrace, RasterizedProblem, SimpleRouteJson,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -82,8 +82,45 @@ pub const DEFAULT_SOLVE_LAYERS: u32 = 2;
 /// halo at `clearance_mm` over the same coords, so passing the real Hanan coords
 /// (rather than a uniform fallback) is what keeps cost/heuristic/spacing correct on
 /// the non-uniform grid.
+#[derive(Clone, Debug)]
+pub struct RouterConfig {
+    /// Foreign trace centreline spacing over the non-uniform grid.
+    pub clearance_mm: f64,
+    /// Dedicated foreign via centre-to-centre spacing.
+    pub via_spacing_mm: f64,
+    /// Net-independent drill-centre spacing, including within one routed net.
+    pub via_hole_spacing_mm: f64,
+    /// Symmetric committed-via↔planar-trace enforcement for coherent typed rules.
+    pub committed_via_to_trace_guard: bool,
+    /// Through/blind/buried transitions plus via-to-trace keepout.
+    pub via_model: ViaModel,
+    /// Physical Hanan line coordinates used by every geometric distance.
+    pub coords: GridCoords,
+}
+
+/// Backward-compatible backend factory used by the original public `app`/`serve`
+/// entry points. It receives only the historical generic clearance and grid
+/// coordinates.
 pub type RouterFactory =
     Arc<dyn Fn(f64, GridCoords) -> Box<dyn Router + Send + Sync> + Send + Sync>;
+
+/// Feature-aware backend factory used by the product path. Unlike
+/// [`RouterFactory`], this receives the coherent supported typed-rule projection.
+pub type ConfiguredRouterFactory =
+    Arc<dyn Fn(RouterConfig) -> Box<dyn Router + Send + Sync> + Send + Sync>;
+
+/// Build the production negotiated backend from a prepared per-board profile.
+/// `/api/trace`, the binary's `/solve` factory, and tests all share this function
+/// so none can silently omit typed via geometry or spacing.
+pub fn configured_negotiated_router(config: RouterConfig) -> NegotiatedRouter {
+    NegotiatedRouter::new()
+        .with_clearance_mm(config.clearance_mm)
+        .with_via_spacing_mm(config.via_spacing_mm)
+        .with_via_hole_spacing_mm(config.via_hole_spacing_mm)
+        .with_committed_via_to_trace_guard(config.committed_via_to_trace_guard)
+        .with_via_model(config.via_model)
+        .with_coords(config.coords)
+}
 
 /// Shared `/solve` state: the router factory plus the layer + clearance policy.
 ///
@@ -92,11 +129,11 @@ pub type RouterFactory =
 /// problems still get the extra layers vias need to resolve crossings.
 #[derive(Clone)]
 struct AppState {
-    make_router: RouterFactory,
+    make_router: ConfiguredRouterFactory,
     solve_layers: u32,
-    /// Clearance budget in continuous units. `None` = auto (one trace width, so
-    /// traces keep a real gap rather than merely not overlapping); `Some(mm)` =
-    /// a fixed budget, with `Some(0.0)` disabling clearance entirely.
+    /// Clearance budget in continuous units. `None` activates a coherent supported
+    /// typed-rule projection when available, otherwise the legacy auto policy;
+    /// `Some(mm)` is a fixed legacy budget, with `Some(0.0)` disabling clearance.
     clearance_mm: Option<f64>,
     /// Root directory of the board corpus, scanned by the `/api/boards*` routes.
     /// Boards live at `<corpus_dir>/<corpus>/<name>.srj.json`.
@@ -165,11 +202,8 @@ pub fn choose_resolution(srj: &SimpleRouteJson, override_res: Option<f64>) -> f6
 /// one identical rasterisation + clearance pipeline.
 struct Prepared {
     problem: RasterizedProblem,
-    /// The non-uniform (Hanan) grid line arrays, handed to the router so its
-    /// geometric cost + heuristic match the actual cell spacing.
-    coords: GridCoords,
-    /// Effective clearance budget in continuous units (after policy + override).
-    clearance_mm: f64,
+    /// Coherent supported per-board geometry handed to both router entry points.
+    router: RouterConfig,
     /// Emitted wire width in continuous units.
     trace_width: f64,
 }
@@ -177,9 +211,10 @@ struct Prepared {
 /// Shared rasterise-and-policy step for `/solve` and `/api/trace`.
 ///
 /// Chooses the resolution, layer budget (`max(layerCount, solve_layers)`), and
-/// clearance budget (explicit `clearance_policy` override, else auto = the larger of
-/// the problem's declared min-clearance and one trace width), then rasterises into a
-/// non-uniform Hanan grid and builds the matching [`GridCoords`].
+/// clearance budget (explicit `clearance_policy` override, else the coherent
+/// supported typed-rule projection when available, otherwise the legacy auto
+/// policy), then rasterises into a non-uniform Hanan grid and builds the matching
+/// [`GridCoords`].
 fn prepare(
     srj: &SimpleRouteJson,
     override_res: Option<f64>,
@@ -188,37 +223,100 @@ fn prepare(
 ) -> Prepared {
     let resolution = choose_resolution(srj, override_res);
     let effective_layers = srj.layer_count.max(solve_layers);
-    let trace_width = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
-    let clearance_mm =
-        clearance_policy.unwrap_or_else(|| srj.min_clearance.unwrap_or(0.0).max(trace_width));
-    // Convert the clearance to a cell halo radius `ceil(mm / resolution)`, fed to BOTH
-    // the rasteriser (inflates foreign pads + their halo) AND the router (prices a
-    // clearance halo around every net). `0` => off.
-    let clearance_cells = if clearance_mm > 0.0 && resolution > 0.0 {
-        (clearance_mm / resolution).ceil() as u32
-    } else {
-        0
+    // A server/request clearance override retains its established meaning and opts
+    // out of typed rules (notably, `0` still disables all clearance). With no
+    // override, only a coherent supported uniform projection activates the typed path.
+    let physical = clearance_policy
+        .is_none()
+        .then(|| srj.uniform_physical_rules())
+        .flatten();
+    let trace_width = physical
+        .map(|rules| rules.trace_width_mm)
+        .or(srj.min_trace_width)
+        .unwrap_or(DEFAULT_TRACE_WIDTH);
+    let edge_clearance_mm = clearance_policy.unwrap_or_else(|| {
+        physical.map_or_else(
+            || srj.min_clearance.unwrap_or(0.0).max(trace_width),
+            |rules| rules.obstacle_margin_mm,
+        )
+    });
+    let layers = LayerMap::standard(effective_layers);
+    let problem = match physical {
+        Some(rules) => rasterize_with_uniform_physical_rules(srj, resolution, layers, rules),
+        None => {
+            // Convert the legacy clearance to a cell halo radius `ceil(mm / resolution)`,
+            // fed to both the compatibility rasteriser and router. `0` => off.
+            let clearance_cells = if edge_clearance_mm > 0.0 && resolution > 0.0 {
+                (edge_clearance_mm / resolution).ceil() as u32
+            } else {
+                0
+            };
+            rasterize_with_layers(
+                srj,
+                resolution,
+                layers,
+                clearance_cells,
+                edge_clearance_mm,
+                0.0,
+            )
+        }
     };
-    let problem = rasterize_with_layers(
-        srj,
-        resolution,
-        LayerMap::standard(effective_layers),
-        clearance_cells,
-        clearance_mm,
-        // D2 (via-class foreign-pad reservation) is off here (no via-pad constant in
-        // this crate); matches the historical `/solve` behaviour.
-        0.0,
-    );
     let coords = GridCoords::from_lines(
         problem.mapping.x_lines.clone(),
         problem.mapping.y_lines.clone(),
     );
+    let (clearance_mm, via_spacing_mm, via_hole_spacing_mm, via_model) = physical.map_or_else(
+        || {
+            (
+                edge_clearance_mm,
+                0.0,
+                0.0,
+                ViaModel::through_hole(effective_layers),
+            )
+        },
+        |rules| {
+            let mut via_model = ViaModel::through_hole(effective_layers);
+            via_model.keepout_mm = rules.via_pad_diameter_mm / 2.0
+                + rules.trace_to_pad_clearance_mm
+                + rules.trace_width_mm / 2.0;
+            let via_spacing_mm = (rules.via_pad_diameter_mm + rules.obstacle_margin_mm).max(
+                rules.via_hole_diameter_mm + rules.via_hole_to_hole_clearance_mm.unwrap_or(0.0),
+            );
+            let via_hole_spacing_mm = rules
+                .via_hole_to_hole_clearance_mm
+                .map(|clearance| rules.via_hole_diameter_mm + clearance)
+                .unwrap_or(0.0);
+            (
+                rules.obstacle_margin_mm + rules.trace_width_mm,
+                via_spacing_mm,
+                via_hole_spacing_mm,
+                via_model,
+            )
+        },
+    );
     Prepared {
         problem,
-        coords,
-        clearance_mm,
+        router: RouterConfig {
+            clearance_mm,
+            via_spacing_mm,
+            via_hole_spacing_mm,
+            committed_via_to_trace_guard: physical.is_some(),
+            via_model,
+            coords,
+        },
         trace_width,
     }
+}
+
+/// De-rasterise the board identically for `/solve` and `/api/trace`.
+fn solution_from_board(prep: &Prepared, board: &mr_core::BoardRoute) -> Vec<PcbTrace> {
+    to_solution_layered(
+        board,
+        &prep.problem.mapping,
+        &prep.problem.pin_points,
+        prep.trace_width,
+        &prep.problem.layers,
+    )
 }
 
 /// The ordered layer names of an effective stackup (`["top", "bottom", ...]`).
@@ -244,19 +342,13 @@ async fn solve(
         state.solve_layers,
         state.clearance_mm,
     );
-    let router = (state.make_router)(prep.clearance_mm, prep.coords.clone());
+    let router = (state.make_router)(prep.router.clone());
     let board = match router.route(&prep.problem.grid, &prep.problem.nets) {
         Ok(b) => b,
         Err(e) => return router_error_response(e),
     };
 
-    let solution_soup = to_solution_layered(
-        &board,
-        &prep.problem.mapping,
-        &prep.problem.pin_points,
-        prep.trace_width,
-        &prep.problem.layers,
-    );
+    let solution_soup = solution_from_board(&prep, &board);
     (StatusCode::OK, Json(SolveResponse { solution_soup })).into_response()
 }
 
@@ -460,21 +552,13 @@ async fn trace(
     // The trace requires the concrete `NegotiatedRouter` (the generic `make_router`
     // factory only yields the `Router` trait, which has no `route_traced`). Build one
     // mirroring `main.rs`'s factory: clearance budget + the problem's Hanan coords.
-    let router = NegotiatedRouter::new()
-        .with_clearance_mm(prep.clearance_mm)
-        .with_coords(prep.coords.clone());
+    let router = configured_negotiated_router(prep.router.clone());
     let (board, trace) = match router.route_traced(&prep.problem.grid, &prep.problem.nets) {
         Ok(bt) => bt,
         Err(e) => return router_error_response(e),
     };
 
-    let solution = to_solution_layered(
-        &board,
-        &prep.problem.mapping,
-        &prep.problem.pin_points,
-        prep.trace_width,
-        &prep.problem.layers,
-    );
+    let solution = solution_from_board(&prep, &board);
     let resp = TraceResponse {
         trace,
         coords: CoordsDto {
@@ -509,11 +593,11 @@ fn internal_error(msg: String) -> Response {
 /// static-file fallback serving the built SPA from `web_dir` (any non-API path).
 /// `make_router` backs `/solve`; the trace route builds its own `NegotiatedRouter`.
 /// Routes on `solve_layers` layers (never fewer than a problem's declared
-/// `layerCount`) and applies the `clearance_mm` budget (`None` = auto: one trace
-/// width; `Some(0.0)` = clearance off). CORS is permissive so a separate Vite dev
-/// server can call the API.
-pub fn app(
-    make_router: RouterFactory,
+/// `layerCount`) and applies the `clearance_mm` policy (`None` = coherent supported
+/// typed rules when available, otherwise legacy auto; `Some(0.0)` = clearance off).
+/// CORS is permissive so a separate Vite dev server can call the API.
+pub fn app_configured(
+    make_router: ConfiguredRouterFactory,
     solve_layers: u32,
     clearance_mm: Option<f64>,
     corpus_dir: PathBuf,
@@ -538,9 +622,49 @@ pub fn app(
         .fallback_service(ServeDir::new(web_dir))
 }
 
+/// Build the application with the original generic-clearance router-factory API.
+/// Typed inputs are still parsed/rasterized coherently, but an old backend sees
+/// only the fields its public contract historically exposed. Use
+/// [`app_configured`] when a backend must honor typed via geometry and pair rules.
+pub fn app(
+    make_router: RouterFactory,
+    solve_layers: u32,
+    clearance_mm: Option<f64>,
+    corpus_dir: PathBuf,
+    web_dir: PathBuf,
+) -> AxumRouter {
+    let configured: ConfiguredRouterFactory = Arc::new(move |config| {
+        let RouterConfig {
+            clearance_mm,
+            coords,
+            ..
+        } = config;
+        make_router(clearance_mm, coords)
+    });
+    app_configured(configured, solve_layers, clearance_mm, corpus_dir, web_dir)
+}
+
 /// Bind `addr` and serve until shutdown, building backends via `make_router` and
 /// applying the `solve_layers` + `clearance_mm` policy, scanning `corpus_dir` for
 /// boards and serving the SPA from `web_dir`.
+pub async fn serve_configured(
+    addr: std::net::SocketAddr,
+    make_router: ConfiguredRouterFactory,
+    solve_layers: u32,
+    clearance_mm: Option<f64>,
+    corpus_dir: PathBuf,
+    web_dir: PathBuf,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        app_configured(make_router, solve_layers, clearance_mm, corpus_dir, web_dir),
+    )
+    .await
+}
+
+/// Serve with the original generic-clearance router-factory API. See [`app`] for
+/// the compatibility behavior and [`serve_configured`] for the typed product path.
 pub async fn serve(
     addr: std::net::SocketAddr,
     make_router: RouterFactory,
@@ -579,21 +703,15 @@ mod tests {
 
     /// Factory mirroring `main.rs`: builds a `NegotiatedRouter` at the requested
     /// clearance budget (in cells).
-    fn test_factory() -> RouterFactory {
-        Arc::new(|mm, coords| {
-            Box::new(
-                NegotiatedRouter::new()
-                    .with_clearance_mm(mm)
-                    .with_coords(coords),
-            )
-        })
+    fn test_factory() -> ConfiguredRouterFactory {
+        Arc::new(|config| Box::new(configured_negotiated_router(config)))
     }
 
     /// App wired to the test router at the default solve-layer budget, clearance
     /// off (fast + deterministic for the shape assertions below). The corpus / web
     /// dirs are placeholders the `/solve` + `/health` tests never touch.
     fn test_app() -> AxumRouter {
-        app(
+        app_configured(
             test_factory(),
             DEFAULT_SOLVE_LAYERS,
             Some(0.0),
@@ -605,6 +723,106 @@ mod tests {
     async fn body_json(resp: Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn typed_profile() -> SimpleRouteJson {
+        serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "minTraceWidth": 0.08,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.07,
+            "minViaEdgeToPadEdgeClearance": 0.09,
+            "minViaHoleEdgeToViaHoleEdgeClearance": 0.1,
+            "minPadEdgeToPadEdgeClearance": 0.11,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": 0.0, "maxX": 4.0, "minY": 0.0, "maxY": 4.0},
+            "obstacles": [
+                {"type": "rect", "shape": "rect", "center": {"x": 2.0, "y": 2.0},
+                 "width": 0.2, "height": 0.2, "layers": ["top"],
+                 "connectedTo": ["pad_probe"]},
+                {"type": "rect", "shape": "rect", "center": {"x": 0.5, "y": 0.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"],
+                 "connectedTo": ["n"]},
+                {"type": "rect", "shape": "rect", "center": {"x": 3.5, "y": 3.5},
+                 "width": 0.2, "height": 0.2, "layers": ["top"],
+                 "connectedTo": ["n"]}
+            ],
+            "connections": [{
+                "name": "n", "nominalTraceWidth": 0.1,
+                "pointsToConnect": [
+                    {"x": 0.5, "y": 0.5}, {"x": 3.5, "y": 3.5}
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn prepare_projects_coherent_typed_router_geometry_and_preserves_override() {
+        let srj = typed_profile();
+        let typed = prepare(&srj, Some(0.5), 2, None);
+        assert_eq!(typed.trace_width, 0.1);
+        assert!((typed.router.clearance_mm - 0.14).abs() < 1e-12);
+        assert!((typed.router.via_model.keepout_mm - 0.32).abs() < 1e-12);
+        assert!((typed.router.via_spacing_mm - 0.44).abs() < 1e-12);
+        assert!((typed.router.via_hole_spacing_mm - 0.3).abs() < 1e-12);
+        assert!(typed.router.committed_via_to_trace_guard);
+        assert_eq!(typed.router.via_model.layers, 2);
+        assert_eq!(typed.problem.grid.dims.layers, 2);
+        assert!(
+            !typed.problem.grid.via_forbidden.is_empty(),
+            "typed via→pad geometry must reach the server raster"
+        );
+
+        let overridden = prepare(&srj, Some(0.5), 2, Some(0.0));
+        assert_eq!(overridden.router.clearance_mm, 0.0);
+        assert_eq!(overridden.router.via_spacing_mm, 0.0);
+        assert_eq!(overridden.router.via_hole_spacing_mm, 0.0);
+        assert!(!overridden.router.committed_via_to_trace_guard);
+        assert_eq!(overridden.router.via_model.keepout_mm, 0.0);
+        assert!(
+            overridden.problem.grid.via_forbidden.is_empty(),
+            "the established explicit zero-clearance policy stays a full opt-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_app_factory_receives_exact_clearance_and_hanan_coords() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_by_factory = Arc::clone(&captured);
+        let legacy_factory: RouterFactory = Arc::new(move |clearance_mm, coords| {
+            *captured_by_factory.lock().unwrap() = Some((clearance_mm, coords.clone()));
+            Box::new(
+                NegotiatedRouter::new()
+                    .with_clearance_mm(clearance_mm)
+                    .with_coords(coords),
+            )
+        });
+        let app = app(
+            legacy_factory,
+            DEFAULT_SOLVE_LAYERS,
+            Some(0.37),
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(SAMPLE))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let envelope: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        let srj: SimpleRouteJson =
+            serde_json::from_value(envelope["simple_route_json"].clone()).unwrap();
+        let expected = prepare(&srj, None, DEFAULT_SOLVE_LAYERS, Some(0.37));
+        let (clearance_mm, coords) = captured.lock().unwrap().clone().unwrap();
+        assert!((clearance_mm - 0.37).abs() < 1e-12);
+        assert_eq!(coords, expected.router.coords);
     }
 
     #[tokio::test]
@@ -634,6 +852,50 @@ mod tests {
             );
             assert!(trace.get("route").is_some(), "trace must carry a route");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "frontier benchmark; run in release"]
+    async fn solve_routes_srj29_sample021_through_typed_product_path() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/frontier/srj29/sample021-am62l-lpddr4.srj.json");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture).unwrap()).unwrap();
+        let srj: SimpleRouteJson = serde_json::from_value(raw.clone()).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "simple_route_json": raw
+        }))
+        .unwrap();
+        let app = app_configured(
+            test_factory(),
+            DEFAULT_SOLVE_LAYERS,
+            None,
+            PathBuf::from("benchmarks/corpus"),
+            PathBuf::from("web/dist"),
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/solve")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let soup = json["solution_soup"].as_array().unwrap();
+        assert_eq!(soup.len(), 28, "typed /solve completion regressed");
+        assert!(soup
+            .iter()
+            .flat_map(|trace| trace["route"].as_array().unwrap())
+            .filter(|point| point["route_type"] == "wire")
+            .all(|point| { (point["width"].as_f64().unwrap() - 0.08128).abs() < 1e-12 }));
+        let solution: Vec<PcbTrace> =
+            serde_json::from_value(json["solution_soup"].clone()).unwrap();
+        let violations = mr_cli::check_srj_solution(&srj, &solution, srj.layer_count);
+        assert!(
+            violations.is_empty(),
+            "typed /solve soup must pass exact supported-rule DRC: {violations:#?}"
+        );
     }
 
     #[tokio::test]

@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
 use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
-use mr_srj::{rasterize_with_layers, to_solution_layered, Mapping, RoutePoint, SimpleRouteJson};
+use mr_srj::{
+    rasterize_with_layers, rasterize_with_uniform_physical_rules, to_solution_layered, Mapping,
+    RoutePoint, SimpleRouteJson,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
@@ -125,7 +128,10 @@ fn drc_severity_profiles(
 /// least one rank must improve. The strict equal-count rule rejects new violations,
 /// equal-score substitutions, and severity trade-offs instead of accepting geometry
 /// churn on count alone.
-fn drc_candidate_is_better(before: &[mr_drc::Violation], candidate: &[mr_drc::Violation]) -> bool {
+fn drc_candidate_is_not_worse(
+    before: &[mr_drc::Violation],
+    candidate: &[mr_drc::Violation],
+) -> bool {
     if candidate.len() != before.len() {
         return candidate.len() < before.len();
     }
@@ -135,7 +141,6 @@ fn drc_candidate_is_better(before: &[mr_drc::Violation], candidate: &[mr_drc::Vi
     if before.keys().ne(candidate.keys()) {
         return false;
     }
-    let mut improved = false;
     for (identity, before_severity) in &before {
         let candidate_severity = &candidate[identity];
         if candidate_severity.len() != before_severity.len() {
@@ -145,10 +150,15 @@ fn drc_candidate_is_better(before: &[mr_drc::Violation], candidate: &[mr_drc::Vi
             if after > before {
                 return false;
             }
-            improved |= after < before;
         }
     }
-    improved
+    true
+}
+
+fn drc_candidate_is_better(before: &[mr_drc::Violation], candidate: &[mr_drc::Violation]) -> bool {
+    drc_candidate_is_not_worse(before, candidate)
+        && (candidate.len() < before.len()
+            || drc_severity_profiles(before) != drc_severity_profiles(candidate))
 }
 
 /// `metalroute` — a PCB autorouter CLI.
@@ -548,6 +558,45 @@ pub fn route_problem(
     route_problem_impl(srj, resolution, router, layers, true)
 }
 
+/// Build and check the exact continuous board emitted for an SRJ route. Coherent
+/// supported typed projections use their trace↔pad, via↔pad, pad↔pad, and via
+/// geometry; legacy/partial inputs retain the historical single-clearance checker.
+pub fn check_srj_solution(
+    srj: &SimpleRouteJson,
+    traces: &[mr_srj::PcbTrace],
+    layers: u32,
+) -> Vec<mr_drc::Violation> {
+    let clearance = srj
+        .min_clearance
+        .or_else(|| {
+            srj.uniform_physical_rules()
+                .map(|rules| rules.obstacle_margin_mm)
+        })
+        .unwrap_or(DEFAULT_CLEARANCE_MM);
+    let board =
+        drc_board::solution_to_drc_board(srj, traces, drc::default_rules(clearance), layers);
+    drc_board::check_with_srj_rules(srj, &board)
+}
+
+/// Keep a topology-preserving geometry candidate only when the authoritative SRJ
+/// checker proves it cannot add a finding, substitute a different feature pair, or
+/// worsen any existing deficit. Used before later repair stages establish their
+/// own baseline.
+fn select_nonworsening_srj_geometry(
+    srj: &SimpleRouteJson,
+    original: Vec<mr_srj::PcbTrace>,
+    candidate: Vec<mr_srj::PcbTrace>,
+    layers: u32,
+) -> Vec<mr_srj::PcbTrace> {
+    let before = check_srj_solution(srj, &original, layers);
+    let after = check_srj_solution(srj, &candidate, layers);
+    if drc_candidate_is_not_worse(&before, &after) {
+        candidate
+    } else {
+        original
+    }
+}
+
 fn route_problem_impl(
     srj: &SimpleRouteJson,
     resolution: Option<f64>,
@@ -565,6 +614,17 @@ fn route_problem_impl(
     // Standard tscircuit naming (top/inner_N/bottom) applies for SimpleRouteJson.
     let layer_count = layers.unwrap_or(srj.layer_count).max(1);
     let layer_map = LayerMap::standard(layer_count);
+    // The coherent supported SRJ physical-rule projection is used only when it
+    // resolves to one uniform trace width. Partial or mixed-width inputs
+    // deliberately retain the established constants until the core router can
+    // price feature-pair widths.
+    let physical = srj.uniform_physical_rules();
+    let trace_width = physical
+        .map(|rules| rules.trace_width_mm)
+        .unwrap_or(DEFAULT_TRACE_WIDTH);
+    let via_pad_mm = physical
+        .map(|rules| rules.via_pad_diameter_mm)
+        .unwrap_or(VIA_PAD_MM);
     // Clearance enforcement on the SimpleRouteJson path (mirrors the DSN pipeline).
     // `min_clearance` is the copper-to-copper edge gap; `DEFAULT_TRACE_WIDTH` is the
     // width every emitted trace carries (see `to_solution_layered` below).
@@ -576,7 +636,11 @@ fn route_problem_impl(
     //     `clearance + track_w` (own half-width + clearance + foreign half-width), not
     //     the bare `clearance` — else two centred tracks `clearance` apart overlap
     //     copper by `track_w`.
-    let min_clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM).max(0.0);
+    let min_clearance = srj
+        .min_clearance
+        .or_else(|| physical.map(|rules| rules.obstacle_margin_mm))
+        .unwrap_or(DEFAULT_CLEARANCE_MM)
+        .max(0.0);
     let clearance_cells = if min_clearance > 0.0 && resolution > 0.0 {
         (min_clearance / resolution).ceil() as u32
     } else {
@@ -584,21 +648,34 @@ fn route_problem_impl(
     };
     // Zero edge clearance still forbids copper overlap, so both trace half-widths
     // remain part of the centreline rule even when `min_clearance == 0`.
-    let trace_halo_mm = min_clearance + DEFAULT_TRACE_WIDTH;
+    let trace_halo_mm = min_clearance + trace_width;
     // Two foreign via pads need both radii plus the copper edge clearance. This is
     // wider than the via-to-track keepout below by the difference between a via and
     // trace radius, so the negotiated router tracks it as a separate centre rule.
-    let via_spacing_mm = VIA_PAD_MM + min_clearance;
+    let via_spacing_mm = physical.map_or(VIA_PAD_MM + min_clearance, |rules| {
+        (rules.via_pad_diameter_mm + rules.obstacle_margin_mm)
+            .max(rules.via_hole_diameter_mm + rules.via_hole_to_hole_clearance_mm.unwrap_or(0.0))
+    });
+    let via_hole_spacing_mm = physical
+        .and_then(|rules| {
+            rules
+                .via_hole_to_hole_clearance_mm
+                .map(|clearance| rules.via_hole_diameter_mm + clearance)
+        })
+        .unwrap_or(0.0);
     // D2: thread the real signal-via pad diameter so the rasteriser can reserve a
     // via-class halo around foreign pads on via-allowed (multi-layer) stackups.
-    let problem = rasterize_with_layers(
-        srj,
-        resolution,
-        layer_map,
-        clearance_cells,
-        min_clearance,
-        VIA_PAD_MM,
-    );
+    let problem = match physical {
+        Some(rules) => rasterize_with_uniform_physical_rules(srj, resolution, layer_map, rules),
+        None => rasterize_with_layers(
+            srj,
+            resolution,
+            layer_map,
+            clearance_cells,
+            min_clearance,
+            via_pad_mm,
+        ),
+    };
     let total = problem.nets.len();
 
     // Only the negotiated backend places vias; give it a through-hole model over
@@ -607,7 +684,10 @@ fn route_problem_impl(
     // via pad radius + clearance + the foreign trace's half-width, so a committed via's
     // copper keeps full `clearance` from a foreign track's copper.
     let mut via_model = ViaModel::through_hole(problem.mapping.dims.layers);
-    via_model.keepout_mm = VIA_PAD_MM / 2.0 + min_clearance + DEFAULT_TRACE_WIDTH / 2.0;
+    let via_to_trace_clearance = physical
+        .map(|rules| rules.trace_to_pad_clearance_mm)
+        .unwrap_or(min_clearance);
+    via_model.keepout_mm = via_pad_mm / 2.0 + via_to_trace_clearance + trace_width / 2.0;
     // The board's continuous grid-line geometry, so the negotiated router prices
     // planar steps by their real length. On a uniform grid this is byte-identical to
     // the unit-hop fallback; on a non-uniform / Hanan grid it makes the cost track
@@ -628,6 +708,8 @@ fn route_problem_impl(
                 .with_via_model(via_model.clone())
                 .with_clearance_mm(trace_halo_mm)
                 .with_via_spacing_mm(via_spacing_mm)
+                .with_via_hole_spacing_mm(via_hole_spacing_mm)
+                .with_committed_via_to_trace_guard(physical.is_some())
                 .with_coords(coords.clone());
             #[cfg(target_os = "macos")]
             let outcome = if use_metal_isolated_provider(
@@ -654,13 +736,20 @@ fn route_problem_impl(
         &board,
         &problem.mapping,
         &problem.pin_points,
-        DEFAULT_TRACE_WIDTH,
+        trace_width,
         &problem.layers,
     );
     // Beautify the emitted geometry: pull staircases into diagonals and chamfer
-    // square corners. DRC-validated against all other copper/pads, so it never
-    // changes connectivity or introduces a clearance violation.
-    let traces = mr_srj::beautify_traces(traces, &srj.obstacles, min_clearance);
+    // square corners. A typed profile may require a larger trace↔pad gap than its
+    // generic obstacle margin, so establish the authoritative baseline on the RAW
+    // soup and retain the beautified candidate only when the complete supported
+    // projection is non-worsening. Legacy inputs keep their established path.
+    let beautified = mr_srj::beautify_traces(traces.clone(), &srj.obstacles, min_clearance);
+    let traces = if physical.is_some() {
+        select_nonworsening_srj_geometry(srj, traces, beautified, layer_count)
+    } else {
+        beautified
+    };
     // Exact-geometry clearance legalisation: the grid halo guards NODE positions, but
     // copper is the segments between nodes (plus endpoint snapping and 45° chamfers),
     // so the emitted geometry can still hold genuine different-net clearance shorts the
@@ -678,7 +767,6 @@ fn route_problem_impl(
     // net-view mismatch.
     let traces = if min_clearance > 0.0 {
         let layers = layers.unwrap_or(srj.layer_count).max(1);
-        let rules = drc::default_rules(min_clearance);
         // Tag each trace with the DRC's own electrical-net identity (`c<net>` at shared
         // connectivity pads, else the router group) so the legaliser's same-net immunity
         // and its internal gate agree with the authoritative checker — otherwise it would
@@ -692,9 +780,9 @@ fn route_problem_impl(
                 t
             })
             .collect();
-        let before = drc_board::solution_to_drc_board(srj, &traces, rules, layers).check();
+        let before = check_srj_solution(srj, &traces, layers);
         let legalised = mr_srj::legalize_clearance(traces.clone(), &srj.obstacles, min_clearance);
-        let after = drc_board::solution_to_drc_board(srj, &legalised, rules, layers).check();
+        let after = check_srj_solution(srj, &legalised, layers);
         if drc_candidate_is_better(&before, &after) {
             legalised
         } else {
@@ -1504,6 +1592,54 @@ mod tests {
 
         let material_change = [clearance_violation(0.100_002_0, ("A", "B"))];
         assert!(drc_candidate_is_better(&before, &material_change));
+    }
+
+    #[test]
+    fn typed_geometry_gate_rejects_a_new_trace_to_pad_violation() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "minTraceWidth": 0.1,
+            "nominalTraceWidth": 0.1,
+            "defaultObstacleMargin": 0.04,
+            "minTraceToPadEdgeClearance": 0.1,
+            "minViaEdgeToPadEdgeClearance": 0.1,
+            "minViaHoleDiameter": 0.2,
+            "minViaPadDiameter": 0.4,
+            "bounds": {"minX": -1.0, "maxX": 1.0, "minY": -1.0, "maxY": 1.0},
+            "obstacles": [{
+                "type": "rect", "shape": "rect", "center": {"x": 0.0, "y": 0.0},
+                "width": 0.2, "height": 0.2, "layers": ["top"],
+                "connectedTo": ["foreign_pad"]
+            }]
+        }))
+        .unwrap();
+        assert!(srj.uniform_physical_rules().is_some());
+        let trace_at = |x| {
+            mr_srj::PcbTrace::new(vec![
+                RoutePoint::Wire {
+                    x,
+                    y: -0.8,
+                    width: 0.1,
+                    layer: "top".into(),
+                },
+                RoutePoint::Wire {
+                    x,
+                    y: 0.8,
+                    width: 0.1,
+                    layer: "top".into(),
+                },
+            ])
+            .with_net("trace")
+        };
+        let original = vec![trace_at(0.3)];
+        let candidate = vec![trace_at(0.2)];
+        assert!(check_srj_solution(&srj, &original, 1).is_empty());
+        assert_eq!(check_srj_solution(&srj, &candidate, 1).len(), 1);
+        assert_eq!(
+            select_nonworsening_srj_geometry(&srj, original.clone(), candidate, 1),
+            original,
+            "a generic-margin geometry transform must not establish a worse typed baseline"
+        );
     }
 
     #[cfg(target_os = "macos")]

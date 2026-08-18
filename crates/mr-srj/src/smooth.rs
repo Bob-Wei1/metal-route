@@ -1369,6 +1369,8 @@ mod tests {
             },
             width: 0.2,
             height: 0.2,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["top".to_string()],
             connected_to: vec![],
         };
@@ -1402,6 +1404,8 @@ mod tests {
             },
             width: 0.2,
             height: 0.2,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["unknown-copper-layer".into()],
             connected_to: vec![],
         };
@@ -1563,6 +1567,8 @@ mod tests {
             },
             width: 0.2,
             height: 0.2,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["top".into()],
             connected_to: Vec::new(),
         };
@@ -1714,6 +1720,8 @@ mod tests {
             },
             width: 1.1,
             height: 0.6,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["top".into()],
             connected_to: vec![net.into()],
         };
@@ -1728,6 +1736,8 @@ mod tests {
             },
             width: 0.2,
             height: 0.2,
+            shape: None,
+            ccw_rotation_degrees: None,
             layers: vec!["top".into()],
             connected_to: Vec::new(),
         };

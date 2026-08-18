@@ -18,17 +18,11 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::drc::default_rules;
-use crate::drc_board::solution_to_drc_board;
 use crate::{
     default_resolution, parse_srj, route_problem, RouteDiagnostics, RouterKind, UnroutedReason,
 };
 use mr_drc::Violation;
 use mr_srj::{Obstacle, PcbTrace, RoutePoint, SimpleRouteJson};
-
-/// Copper-to-copper clearance (mm) assumed when a board omits `minClearance` —
-/// the same default the DSN ingest uses, so the corpus DRC mirrors `route-dsn`.
-use crate::DEFAULT_CLEARANCE_MM;
 
 /// Arguments for the `bench-corpus` subcommand.
 #[derive(Debug, clap::Parser)]
@@ -287,10 +281,8 @@ fn route_board(
             // benchmark never did this before, so clearance/via shorts were
             // produced but invisible. Build the physical board from the emitted
             // solution and check it.
-            let clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM);
-            let rules = default_rules(clearance);
             let layers = args.layers.unwrap_or(srj.layer_count);
-            let violations = solution_to_drc_board(srj, &traces, rules, layers).check();
+            let violations = crate::check_srj_solution(srj, &traces, layers);
             if std::env::var("DRC_DEBUG").is_ok() {
                 let same = violations.iter().filter(|v| v.nets.0 == v.nets.1).count();
                 eprintln!(
