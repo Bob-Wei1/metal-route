@@ -6,21 +6,21 @@ aggregate gains from remaining regression gates.
 
 ## Reproducible baseline
 
-Historical baseline revision: `98a39d0`. The previous measured candidate was
-`91abf42`, the isolated dense-via candidate is `90f2a42`, the coherent typed-SRJ
-projection is `e7477e8`, the accepted terminal-via baseline is `cd3706e`, and the
-accepted pre-outline dependency/dihedral portfolio is `64ca17a`. The current
-measured board-outline release is `4aaa3aa`. Every
+Historical baseline revision: `dab5185`. The previous measured candidate was
+`71766ea`, the isolated dense-via candidate is `56c69f6`, the coherent typed-SRJ
+projection is `1eac865`, the accepted terminal-via baseline is `f11b3d0`, and the
+accepted pre-outline dependency/dihedral portfolio is `56f134e`. The current
+measured board-outline release is `82bacd3`. Every
 corpus report in the comparisons below contains the same 112 board IDs and
 per-board net totals.
 The archived historical baseline used the former first-seen layer checker, so its
 exact route traces (including all 2,701 retained net tags) were replayed through
-the corrected checker at `5f4c832`. All non-DRC report fields remained
+the corrected checker at `47dfb4c`. All non-DRC report fields remained
 byte-for-byte identical. Its checker-comparable SHA-256 is
 `880d54d4fa34ba26fa70fdb1c9a3172962e87104a4876726a298362fbbfb5e35`.
 
-The isolated via-spacing A/B uses accepted pre-feature revision `480a539` as its
-baseline and `90f2a42` as its candidate. The corresponding report SHA-256 values
+The isolated via-spacing A/B uses accepted pre-feature revision `44f1ef4` as its
+baseline and `56c69f6` as its candidate. The corresponding report SHA-256 values
 are `8e200e19ecaf0867ef212e739c3a37c7a8ec645b543ffde86f2ca79276985903`
 and `defe7106f2562e4d89685f7c9f2aab4c6d7ddc43db399ca001085d13a6c22c51`.
 The canonical terminal-via baseline report SHA-256 is
@@ -45,13 +45,13 @@ each board `wall_ms`, then serializing compact sorted JSON with its trailing
 newline, both normalize to SHA-256
 `d7f9a956f29211a45d1e4f18a1472886b6b3f9da8108136e566ee6e971843441`.
 
-At `e7477e8`, none of the locked corpus boards activated the fail-closed typed
+At `1eac865`, none of the locked corpus boards activated the fail-closed typed
 profile (0/112). Its raw corpus report SHA-256 is
 `e5c7ded949efd41499e9de69c748a1062ca0d823a97aad6d489194b1a2ac786f`,
 and its timing-stripped semantics are byte-identical to the accepted legacy run
 at SHA-256
 `6e1722326a644051f19d0b3fc13b8d2fde2b8f0c0383df061122b5980b442819`.
-The earlier corpus, synthetic, and six-board preflight hashes belong to `91abf42`
+The earlier corpus, synthetic, and six-board preflight hashes belong to `71766ea`
 and are retained only as intermediate provenance:
 `6543f29685c9cf4b97528b2156473da98ffbb07f7fc246da32f81cdbd01b662d`,
 `4ca110b2b5f8fa14ba274e4c3b8cf0461a46dad4e9a4cd4b2bff34ec17920d65`
@@ -359,7 +359,7 @@ CPU-full-field-to-Metal ratio is 7.06–8.09× after setup is amortized. These r
 describe the measured operations above; they are not like-for-like algorithmic
 speedups.
 
-### Synthetic negotiated benchmark (intermediate `91abf42`)
+### Synthetic negotiated benchmark (intermediate `71766ea`)
 
 | Metric | Before | After |
 |--------|-------:|------:|
@@ -370,11 +370,11 @@ speedups.
 
 The completion result and mean cost are deterministic. That intermediate release
 sample took 0.97 s externally; report time excludes process startup. It was not
-remeasured at `90f2a42`, so these numbers are not presented as a current-final A/B.
+remeasured at `56c69f6`, so these numbers are not presented as a current-final A/B.
 
 ### Exact 112-board corpus
 
-The current `4aaa3aa` release enforces active outline and board-edge contracts.
+The current `82bacd3` release enforces active outline and board-edge contracts.
 Both full runs reproduce this deterministic raw result:
 
 | Metric | Current release |
@@ -394,7 +394,7 @@ identity audit rejects 37 of those routes across nine boards, so its physically
 valid baseline is 2,963 routes and 89 physically full boards. That makes the
 feature-aware acceptance table:
 
-| Physical metric | Pre-outline portfolio | `4aaa3aa` | Change |
+| Physical metric | Pre-outline portfolio | `82bacd3` | Change |
 |-----------------|----------------------:|----------:|-------:|
 | Safe routed nets | 2963/3167 | **2986/3167** | **+23** |
 | Physically fully routed boards | 89/112 | **90/112** | **+1** |
@@ -418,7 +418,7 @@ in “Reproducible baseline” above.
 
 ### Isolated feature-aware via-spacing rollout
 
-The accepted pre-feature report at `480a539` provides the narrower A/B for the
+The accepted pre-feature report at `44f1ef4` provides the narrower A/B for the
 dense-via work:
 
 | Metric | Accepted baseline | Dense-via final | Change |
@@ -492,7 +492,7 @@ its physical-site comparisons quadratic.
 
 ### Pre-outline bounded dependency and dihedral legalization portfolio
 
-Against the terminal-via baseline, the accepted `64ca17a` portfolio routes
+Against the terminal-via baseline, the accepted `56f134e` portfolio routes
 **2989/3167 → 3000/3167** nets and **92 → 94** boards fully. DRC improves
 **434 → 429**, clean boards hold at 76, fully-routed-clean boards rise
 **70 → 71**, and cost moves 377,164 → 379,530 with 11 more retained routes.
@@ -574,7 +574,7 @@ The legacy baseline report contained 1,493 findings under the old first-seen lay
 checker; that number is intentionally not used in the comparison table. Rechecking
 the byte-identical baseline routes with the corrected physical-layer/ownership
 semantics yields the checker-comparable 1,227 above. For historical provenance,
-the intermediate `91abf42` run moved `bugreport05` 86/228 → 80/228, cost 37,109
+the intermediate `71766ea` run moved `bugreport05` 86/228 → 80/228, cost 37,109
 → 39,288, and findings 15 → 12; its six-board preflight was 70/113 with 31
 findings. Those intermediate values are not substituted into either current-release
 table. Corpus `total_wall_ms` is a sum of overlapping board timers; external
