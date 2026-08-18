@@ -258,10 +258,13 @@ fn prepare(
             } else {
                 0
             };
-            // Keep compatibility routing and emitted soup on the same physical
-            // width even when a malformed legacy declaration falls back to the
-            // product default.
-            let raster_srj = if srj.min_trace_width == Some(trace_width) {
+            // Active board-edge routing must build its mask at the emitted
+            // physical width, even when a malformed declaration falls back to
+            // the product default. Unrelated inactive compatibility inputs keep
+            // their historical raster topology.
+            let raster_srj = if !board_edge_contract_is_active(srj)
+                || srj.min_trace_width == Some(trace_width)
+            {
                 Cow::Borrowed(srj)
             } else {
                 let mut normalized = srj.clone();
@@ -973,8 +976,6 @@ mod tests {
         let mut canonical = base.clone();
         canonical.min_trace_width = Some(DEFAULT_TRACE_WIDTH);
         let canonical_prep = prepare(&canonical, Some(1.0), 2, Some(0.0));
-        let canonical_legacy = without_board_edge_contract(&canonical);
-        let canonical_legacy_prep = prepare(&canonical_legacy, Some(1.0), 2, Some(0.0));
         assert!(!canonical_prep.problem.grid.board_constraint.is_empty());
 
         for declared_width in [None, Some(0.0)] {
@@ -995,20 +996,22 @@ mod tests {
                 canonical_prep.problem.mapping.y_lines
             );
 
-            // Production first evaluates the contract-cleared legacy portfolio
-            // member. It must retain the same width alignment even though the
-            // active marker is intentionally absent from that scoped clone.
+            // Production first evaluates the exact historical, contract-cleared
+            // portfolio member. Its raster remains untouched; only its final .15
+            // soup is validated against the active outline before selection.
             let legacy_srj = without_board_edge_contract(&srj);
             let legacy_prep = prepare(&legacy_srj, Some(1.0), 2, Some(0.0));
+            let historical_legacy =
+                rasterize_with_layers(&legacy_srj, 1.0, LayerMap::standard(2), 0, 0.0, 0.0);
             assert_eq!(legacy_prep.trace_width, DEFAULT_TRACE_WIDTH);
-            assert_eq!(legacy_prep.problem.grid, canonical_legacy_prep.problem.grid);
+            assert_eq!(legacy_prep.problem.grid, historical_legacy.grid);
             assert_eq!(
                 legacy_prep.problem.mapping.x_lines,
-                canonical_legacy_prep.problem.mapping.x_lines
+                historical_legacy.mapping.x_lines
             );
             assert_eq!(
                 legacy_prep.problem.mapping.y_lines,
-                canonical_legacy_prep.problem.mapping.y_lines
+                historical_legacy.mapping.y_lines
             );
 
             let router = configured_negotiated_router(prep.router.clone());
@@ -1032,6 +1035,36 @@ mod tests {
             )
             .unwrap());
         }
+    }
+
+    #[test]
+    fn inactive_absent_width_preserves_historical_raster_geometry() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 2,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "connections": [{
+                "name": "n",
+                "pointsToConnect": [
+                    {"x": 2.0, "y": 5.0, "layer": "top"},
+                    {"x": 8.0, "y": 5.0, "layer": "top"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let prepared = prepare(&srj, Some(1.0), 2, Some(0.0));
+        let historical = rasterize_with_layers(&srj, 1.0, LayerMap::standard(2), 0, 0.0, 0.0);
+        assert_eq!(prepared.trace_width, DEFAULT_TRACE_WIDTH);
+        assert_eq!(prepared.problem.grid, historical.grid);
+        assert_eq!(prepared.problem.mapping.x_lines, historical.mapping.x_lines);
+        assert_eq!(prepared.problem.mapping.y_lines, historical.mapping.y_lines);
+
+        let mut normalized = srj.clone();
+        normalized.min_trace_width = Some(DEFAULT_TRACE_WIDTH);
+        let normalized = prepare(&normalized, Some(1.0), 2, Some(0.0));
+        assert_ne!(
+            prepared.problem.mapping.x_lines, normalized.problem.mapping.x_lines,
+            "fixture must expose the inactive raster topology preserved by this gate"
+        );
     }
 
     #[tokio::test]
