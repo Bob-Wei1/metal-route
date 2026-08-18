@@ -21,6 +21,7 @@ pub mod bench;
 pub mod corpus;
 pub mod drc;
 mod drc_board;
+mod via_repair;
 use std::collections::HashMap;
 
 use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
@@ -543,6 +544,16 @@ pub fn route_problem(
     router: RouterKind,
     layers: Option<u32>,
 ) -> Result<(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics)> {
+    route_problem_impl(srj, resolution, router, layers, true)
+}
+
+fn route_problem_impl(
+    srj: &SimpleRouteJson,
+    resolution: Option<f64>,
+    router: RouterKind,
+    layers: Option<u32>,
+    repair_vias: bool,
+) -> Result<(Vec<mr_srj::PcbTrace>, Summary, RouteDiagnostics)> {
     let resolution = resolution.unwrap_or_else(|| default_resolution(srj));
     anyhow::ensure!(
         resolution.is_finite() && resolution > 0.0,
@@ -689,6 +700,21 @@ pub fn route_problem(
         } else {
             traces
         }
+    } else {
+        traces
+    };
+    // A bounded topology-preserving follow-up for the subset the vertex legaliser
+    // cannot reach: an interior via that still participates in an exact clearance
+    // finding. One pass evaluates at most 8 vias × 8 one-clearance translations,
+    // rigidly carrying its source/explicit landing anchors. Only a strictly lower
+    // authoritative full-board finding count is retained.
+    let traces = if repair_vias && min_clearance > 0.0 {
+        via_repair::repair_clearance_vias(
+            srj,
+            traces,
+            drc::default_rules(min_clearance),
+            layer_count,
+        )
     } else {
         traces
     };
@@ -1864,6 +1890,98 @@ mod tests {
         assert!(
             violations.is_empty(),
             "bugreport01 must be DRC-clean after own-pad-aware via repair: {violations:#?}"
+        );
+    }
+
+    type EndpointViaSignature = (
+        Option<String>,
+        RoutePoint,
+        RoutePoint,
+        Vec<(String, String)>,
+    );
+
+    fn endpoint_and_via_span_signature(traces: &[mr_srj::PcbTrace]) -> Vec<EndpointViaSignature> {
+        traces
+            .iter()
+            .map(|trace| {
+                let spans = trace
+                    .route
+                    .iter()
+                    .filter_map(|point| match point {
+                        RoutePoint::Via {
+                            from_layer,
+                            to_layer,
+                            ..
+                        } => Some((from_layer.clone(), to_layer.clone())),
+                        RoutePoint::Wire { .. } => None,
+                    })
+                    .collect();
+                (
+                    trace.net.clone(),
+                    trace.route.first().cloned().expect("non-empty trace"),
+                    trace.route.last().cloned().expect("non-empty trace"),
+                    spans,
+                )
+            })
+            .collect()
+    }
+
+    fn assert_real_via_repair(
+        relative_path: &str,
+        expected_routed: usize,
+        expected_before: usize,
+        expected_after: usize,
+    ) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative_path);
+        let bytes = std::fs::read(&path).expect("read checked-in via-repair fixture");
+        let srj = parse_srj(&bytes).expect("parse via-repair fixture");
+        let (before_traces, summary, _) =
+            route_problem_impl(&srj, None, RouterKind::Negotiated, None, false)
+                .expect("route before bounded via repair");
+        assert_eq!(
+            (summary.routed, summary.total),
+            (expected_routed, expected_routed)
+        );
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let before =
+            drc_board::solution_to_drc_board(&srj, &before_traces, rules, srj.layer_count).check();
+        assert_eq!(before.len(), expected_before, "unexpected fixture baseline");
+        let signature = endpoint_and_via_span_signature(&before_traces);
+
+        let repaired =
+            via_repair::repair_clearance_vias(&srj, before_traces, rules, srj.layer_count);
+        let after =
+            drc_board::solution_to_drc_board(&srj, &repaired, rules, srj.layer_count).check();
+        assert_eq!(after.len(), expected_after, "unexpected repaired DRC count");
+        assert!(drc_candidate_is_better(&before, &after));
+        assert_eq!(endpoint_and_via_span_signature(&repaired), signature);
+    }
+
+    /// Dense four-layer fixture: one exact one-clearance rigid via translation
+    /// removes three findings while introducing one milder finding (38 -> 36),
+    /// without changing any of its 26 routed nets, endpoints, or via spans.
+    #[test]
+    fn sample11_bounded_via_repair_reduces_exact_drc() {
+        assert_real_via_repair(
+            "benchmarks/corpus/srj15/sample11-region-reroute.srj.json",
+            26,
+            38,
+            36,
+        );
+    }
+
+    /// Small independent fixture for the same portfolio: eight exact candidates
+    /// move one implicated via and remove all three of its findings (5 -> 2).
+    #[test]
+    fn sample25_bounded_via_repair_reduces_exact_drc() {
+        assert_real_via_repair(
+            "benchmarks/corpus/srj15/sample25-region-reroute.srj.json",
+            5,
+            5,
+            2,
         );
     }
 
