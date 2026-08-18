@@ -17,6 +17,7 @@ use mr_drc::{DrcBoard, DrcRules, DrcSummary, LayerKind, Pad, Segment, Via, Viola
 use mr_ingest::dsn::{dsn_to_ingest, PlaneDef};
 use mr_srj::{Mapping, Obstacle};
 
+#[cfg(test)]
 use crate::{VIA_DRILL_MM, VIA_PAD_MM};
 
 /// Default plane antipad (relief radius) a via must carve in a foreign plane (mm).
@@ -43,7 +44,9 @@ pub fn default_rules(clearance: f64) -> DrcRules {
 ///   signal-layer indices are resolved to physical indices by name so a via's span
 ///   covers every physical layer (including planes) it really drills through.
 /// * `planes` binds each poured plane to the copper layer it fills; `obstacles` +
-///   `pin_nets` are the static pads and their nets.
+///   `pin_nets` are the static pads and their nets. `via_pad_diameter` and
+///   `via_drill_diameter` are the geometry selected from the DSN's declared via
+///   padstack (or the caller's documented fallback when none was declared).
 ///
 /// `model_plane_antipads` selects how a through-via crossing a *foreign* plane is
 /// modelled:
@@ -52,7 +55,7 @@ pub fn default_rules(clearance: f64) -> DrcRules {
 ///   `(plane "NET" (polygon ...))` poured zones, and a poured zone automatically
 ///   reliefs (carves an antipad around) a foreign through-via by the zone's
 ///   clearance. We model that by giving each via an `antipad_radius` of exactly
-///   `VIA_DRILL_MM/2 + rules.plane_antipad` — the relief the zone fill provides —
+///   `via_drill_diameter/2 + rules.plane_antipad` — the relief the zone fill provides —
 ///   so a well-formed via crossing a foreign plane is *not* reported as a short.
 ///   IMPORTANT / honesty: this antipad is a *model* of the zone-fill relief, not
 ///   geometry we emit. It physically exists only if the fabrication / zone-fill
@@ -74,6 +77,8 @@ pub fn build_drc_board(
     obstacles: &[Obstacle],
     pin_nets: &HashMap<String, String>,
     trace_width: f64,
+    via_pad_diameter: f64,
+    via_drill_diameter: f64,
     rules: DrcRules,
     model_plane_antipads: bool,
 ) -> Result<DrcBoard> {
@@ -138,7 +143,7 @@ pub fn build_drc_board(
     // rule (`drill/2 + plane_antipad`), so a well-formed via does NOT short a
     // foreign plane. `None` keeps the pessimistic bare-copper model where it does.
     let via_antipad: Option<f64> = if model_plane_antipads {
-        Some(VIA_DRILL_MM / 2.0 + rules.plane_antipad)
+        Some(via_drill_diameter / 2.0 + rules.plane_antipad)
     } else {
         None
     };
@@ -184,8 +189,8 @@ pub fn build_drc_board(
                 vias.push(Via {
                     net: net.clone(),
                     center: mapping.cell_center(path[i]),
-                    pad_diameter: VIA_PAD_MM,
-                    drill_diameter: VIA_DRILL_MM,
+                    pad_diameter: via_pad_diameter,
+                    drill_diameter: via_drill_diameter,
                     from_layer: p0.min(p1),
                     to_layer: p0.max(p1),
                     // Poured-zone relief (or `None` for the bare-copper model); see
@@ -389,6 +394,8 @@ mod tests {
             &[],
             &HashMap::new(),
             0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
             default_rules(0.15),
             model_plane_antipads,
         )
@@ -422,6 +429,8 @@ mod tests {
             &[],
             &HashMap::new(),
             0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
             default_rules(0.15),
             true,
         )
@@ -468,6 +477,8 @@ mod tests {
             &[],
             &HashMap::new(),
             0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
             default_rules(0.15),
             true,
         )
@@ -494,6 +505,8 @@ mod tests {
             &[],
             &HashMap::new(),
             0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
             default_rules(0.15),
             true,
         )
@@ -524,6 +537,8 @@ mod tests {
             &[],
             &HashMap::new(),
             0.15,
+            VIA_PAD_MM,
+            VIA_DRILL_MM,
             default_rules(0.15),
             true,
         )

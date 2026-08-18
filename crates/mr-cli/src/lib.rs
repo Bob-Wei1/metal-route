@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use mr_core::{BoardRoute, CellIdx, Grid, GridCoords, LayerMap, NetEndpoints, Router, ViaModel};
 use mr_cpu::{LeeRouter, NegotiatedRouter, RipUpRouter};
-use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, ParseStats};
+use mr_ingest::dsn::{dsn_to_ingest, DsnIngest, DsnViaGeometry, ParseStats};
 use mr_srj::{
     rasterize_with_layers, rasterize_with_uniform_physical_rules, to_solution_layered, Mapping,
     RoutePoint, SimpleRouteJson,
@@ -1278,14 +1278,13 @@ fn board_to_ses(
     unit: &str,
     divisor: f64,
     trace_width_mm: f64,
+    via_geometry: &DsnViaGeometry,
 ) -> String {
     let dims = mapping.dims;
     let to_raw = |mm: f64| (mm * units_per_mm).round() as i64;
     let width_raw = to_raw(trace_width_mm);
-    // Signal via: 0.45 mm pad / 0.2 mm drill (bon's default), encoded for the
-    // importer's `Via[..]_<size_um>:<drill_um>_um` regex.
-    const VIA_NAME: &str = "Via[0-7]_450:200_um";
-    let via_pad_raw = to_raw(VIA_PAD_MM);
+    let via_name = &via_geometry.padstack_name;
+    let via_pad_raw = to_raw(via_geometry.pad_diameter_mm);
 
     // Endpoint vertices snap to the exact port; interior vertices use cell centres.
     let point = |cell: CellIdx, endpoint: bool| -> (f64, f64) {
@@ -1315,9 +1314,11 @@ fn board_to_ses(
     out.push_str("  (routes\n");
     out.push_str(&format!("    (resolution {unit} {divisor})\n"));
     out.push_str("    (library_out\n");
-    out.push_str(&format!(
-        "      (padstack \"{VIA_NAME}\" (shape (circle F.Cu {via_pad_raw})))\n"
-    ));
+    out.push_str(&format!("      (padstack \"{via_name}\"\n"));
+    for layer in &via_geometry.layers {
+        out.push_str(&format!("        (shape (circle {layer} {via_pad_raw}))\n"));
+    }
+    out.push_str("      )\n");
     out.push_str("    )\n");
     out.push_str("    (network_out\n");
 
@@ -1362,7 +1363,7 @@ fn board_to_ses(
                     let (vx, vy) = mapping.cell_center(path[k]);
                     let (vrx, vry) = (to_raw(vx), to_raw(vy));
                     flush(&mut out, cur_layer, &run);
-                    out.push_str(&format!("        (via \"{VIA_NAME}\" {vrx} {vry})\n"));
+                    out.push_str(&format!("        (via \"{via_name}\" {vrx} {vry})\n"));
                     cur_layer = l;
                     let (x, y) = point(path[k], k == last);
                     run = vec![(to_raw(x), to_raw(y))];
@@ -1386,24 +1387,38 @@ fn count_vias(traces: &[mr_srj::PcbTrace]) -> usize {
         .count()
 }
 
-/// Restrict a parsed stackup to the top `n` layers, rebuilding a through-hole via
-/// model over them. `None` (or `n >= len`) keeps the full stackup and its model.
-///
-/// Retained as the canonical stackup-restriction helper; `route_dsn_problem`
-/// currently inlines the equivalent truncation over the signal-layer list.
-#[allow(dead_code)]
-fn apply_layer_override(
-    layer_map: LayerMap,
-    via_model: ViaModel,
-    n: Option<u32>,
-) -> (LayerMap, ViaModel) {
-    match n {
-        Some(n) if n >= 1 && n < layer_map.len() => {
-            let names: Vec<String> = (0..n).map(|i| layer_map.name(i).to_string()).collect();
-            (LayerMap::from_names(names), ViaModel::through_hole(n))
+/// Project a DSN via model from the full physical stack onto the signal layers
+/// the router actually uses. A routed adjacent-layer move is legal only when the
+/// declared via can cross every physical adjacent step between those two signal
+/// layers. This preserves blind/buried restrictions and also handles power-plane
+/// layers omitted from the routing grid.
+fn project_via_model(
+    declared: &ViaModel,
+    physical_layers: &LayerMap,
+    routed_layers: &LayerMap,
+) -> ViaModel {
+    let mut allowed = Vec::new();
+    for routed_lo in 0..routed_layers.len().saturating_sub(1) {
+        let Some(physical_a) = physical_layers.index_of(routed_layers.name(routed_lo)) else {
+            continue;
+        };
+        let Some(physical_b) = physical_layers.index_of(routed_layers.name(routed_lo + 1)) else {
+            continue;
+        };
+        let lo = physical_a.min(physical_b);
+        let hi = physical_a.max(physical_b);
+        if (lo..hi).all(|step| declared.is_step_legal(step, step + 1)) {
+            allowed.push((routed_lo, routed_lo + 1));
         }
-        _ => (layer_map, via_model),
     }
+
+    let mut projected = if allowed.len() as u32 == routed_layers.len().saturating_sub(1) {
+        ViaModel::through_hole(routed_layers.len())
+    } else {
+        ViaModel::with_allowed_steps(routed_layers.len(), declared.step_cost, allowed)
+    };
+    projected.step_cost = declared.step_cost;
+    projected
 }
 
 /// Core `route-dsn` logic: convert a parsed DSN to a problem, route it, and build
@@ -1431,6 +1446,8 @@ pub fn route_dsn_problem(
     let DsnIngest {
         mut srj,
         signal_layers,
+        via_model: declared_via_model,
+        via_geometry,
         stats,
         layer_map: physical_layers,
         planes,
@@ -1453,15 +1470,35 @@ pub fn route_dsn_problem(
         "resolution must be finite and positive, got {resolution}"
     );
 
-    // Route signal nets on the SIGNAL layers only (never on a poured power plane);
-    // vias bridge adjacent signal layers as through-vias. `--layers` caps how many
-    // signal layers are used. The via model is through-hole over those layers.
+    // Route signal nets on the SIGNAL layers only (never on a poured power plane).
+    // `--layers` caps how many signal layers are used; the DSN's declared via
+    // spans are projected onto that effective layer stack below.
     let mut signal_layers = signal_layers;
     if let Some(n) = layers {
         let n = (n as usize).clamp(1, signal_layers.len().max(1));
         signal_layers.truncate(n);
     }
     let layer_map = LayerMap::from_names(signal_layers);
+    let mut via_model = project_via_model(&declared_via_model, &physical_layers, &layer_map);
+
+    // Use the first declared, geometrically resolvable DSN via. Legacy inputs
+    // without one retain metalroute's documented 0.45/0.20 mm fallback.
+    let via_geometry = via_geometry.unwrap_or_else(|| DsnViaGeometry {
+        padstack_name: format!(
+            "Via[0-{}]_450:200_um",
+            physical_layers.len().saturating_sub(1)
+        ),
+        pad_diameter_mm: VIA_PAD_MM,
+        drill_diameter_mm: Some(VIA_DRILL_MM),
+        layers: (0..physical_layers.len())
+            .map(|layer| physical_layers.name(layer).to_string())
+            .collect(),
+    });
+    let via_pad_mm = via_geometry.pad_diameter_mm;
+    let via_drill_mm = via_geometry
+        .drill_diameter_mm
+        .filter(|diameter| diameter.is_finite() && *diameter > 0.0)
+        .unwrap_or_else(|| VIA_DRILL_MM.min(via_pad_mm / 2.0));
     // Clearance enforcement (M3): the DSN `(rule (clearance N))` is now honoured in
     // cell space. `clearance_cells = ceil(min_clearance / resolution)` is the
     // copper-to-copper halo width in cells. It is enforced in two places:
@@ -1484,13 +1521,12 @@ pub fn route_dsn_problem(
     // The width every emitted trace carries — the router's clearance halo is a
     // CENTRELINE-to-foreign-centreline distance, so it must budget both half-widths.
     let trace_w = srj.min_trace_width.unwrap_or(DEFAULT_TRACE_WIDTH);
-    let mut via_model = ViaModel::through_hole(layer_map.len());
     // Via annular-ring keepout in CONTINUOUS mm (the unit the router's halo code
     // expects): the via pad radius + clearance + the foreign trace's half-width, so a
     // committed via's copper keeps full `clearance` from a foreign track's copper. No
     // `/resolution` cell conversion — that was a unit bug on the non-uniform Hanan grid.
-    via_model.keepout_mm = VIA_PAD_MM / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
-    let via_spacing_mm = VIA_PAD_MM + stats.min_clearance_mm.max(0.0);
+    via_model.keepout_mm = via_pad_mm / 2.0 + stats.min_clearance_mm + trace_w / 2.0;
+    let via_spacing_mm = via_pad_mm + stats.min_clearance_mm.max(0.0);
     // D2: thread the real signal-via pad diameter for the via-class foreign-pad halo.
     let problem = rasterize_with_layers(
         &srj,
@@ -1498,7 +1534,7 @@ pub fn route_dsn_problem(
         layer_map,
         clearance_cells,
         stats.min_clearance_mm,
-        VIA_PAD_MM,
+        via_pad_mm,
     );
     let total_nets = problem.nets.len();
     let grid_w = problem.mapping.dims.w;
@@ -1578,6 +1614,7 @@ pub fn route_dsn_problem(
         &res_unit,
         res_divisor,
         trace_width,
+        &via_geometry,
     );
 
     // Build the physical DRC model: routed copper on the SIGNAL grid, mapped onto
@@ -1591,6 +1628,8 @@ pub fn route_dsn_problem(
         &srj.obstacles,
         &pin_nets,
         trace_width,
+        via_pad_mm,
+        via_drill_mm,
         drc::default_rules(stats.min_clearance_mm),
         model_plane_antipads,
     )?;
@@ -3404,12 +3443,29 @@ mod tests {
         assert!(project(8, 8, 1).to_string().contains("NO-GO"));
     }
 
+    #[test]
+    fn projected_via_model_preserves_declared_blind_buried_steps() {
+        let physical = LayerMap::from_names(vec![
+            "Top".into(),
+            "In1".into(),
+            "In2".into(),
+            "Bottom".into(),
+        ]);
+        let routed = physical.clone();
+        let declared = ViaModel::with_allowed_steps(4, 37, vec![(1, 2)]);
+        let projected = project_via_model(&declared, &physical, &routed);
+        assert_eq!(projected.step_cost, 37);
+        assert!(!projected.is_step_legal(0, 1));
+        assert!(projected.is_step_legal(1, 2));
+        assert!(!projected.is_step_legal(2, 3));
+    }
+
     /// A small synthetic DSN: 2 components on a 20x20mm board, one 2-pin net far
     /// from any obstacle, so the negotiated router should route it.
     const SYNTH_DSN: &str = r#"
     (pcb "rt.dsn"
       (parser (string_quote "))
-      (resolution mm 1000)
+      (resolution um 10)
       (structure
         (layer F.Cu (type signal))
         (boundary (path pcb 0 0 0 20000 0 20000 20000 0 20000 0 0))
@@ -3445,12 +3501,59 @@ mod tests {
     }
 
     #[test]
+    fn route_dsn_uses_declared_via_geometry_in_routing_drc_and_session() {
+        let dsn = r#"
+        (pcb "via-geometry.dsn"
+          (parser (string_quote "))
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "Via[0-1]_600:300_um")
+            (rule (width 150) (clearance 100)))
+          (placement
+            (component "top-pad" (place A 1000 1000 front 0))
+            (component "bottom-pad" (place B 9000 9000 front 0)))
+          (library
+            (image "top-pad" (pin "top" 1 0 0))
+            (image "bottom-pad" (pin "bottom" 1 0 0))
+            (padstack "top" (shape (circle Top 600)))
+            (padstack "bottom" (shape (circle Bottom 600)))
+            (padstack "Via[0-1]_600:300_um"
+              (shape (circle Top 600))
+              (shape (circle Bottom 600))))
+          (network (net "N" (pins A-1 B-1))))
+        "#;
+
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        let (report, traces, ses, drc) =
+            route_dsn_problem(ingest, "via-geometry", Some(0.5), &[], None, None, true).unwrap();
+        assert_eq!(report.routed_nets, 1);
+        assert!(traces.iter().any(|trace| trace
+            .route
+            .iter()
+            .any(|point| matches!(point, RoutePoint::Via { .. }))));
+        assert!(!drc.vias.is_empty());
+        assert!(drc.vias.iter().all(|via| {
+            (via.pad_diameter - 0.6).abs() < 1e-12 && (via.drill_diameter - 0.3).abs() < 1e-12
+        }));
+
+        // Input circle 600 is 0.6 mm. A resolution-10 session writes that as
+        // 6000 subunits while retaining the source padstack identity and layers.
+        assert!(ses.contains("(padstack \"Via[0-1]_600:300_um\""));
+        assert!(ses.contains("(shape (circle Top 6000))"));
+        assert!(ses.contains("(shape (circle Bottom 6000))"));
+        assert!(ses.contains("(via \"Via[0-1]_600:300_um\""));
+    }
+
+    #[test]
     fn route_dsn_skip_and_cap_filter_connections() {
         // Two nets; skip one by substring, cap should also apply.
         let dsn = r#"
         (pcb "f.dsn"
           (parser (string_quote "))
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (boundary (path pcb 0 0 0 20000 0 20000 20000 0 20000 0 0))

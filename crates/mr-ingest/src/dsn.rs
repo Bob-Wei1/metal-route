@@ -9,10 +9,13 @@
 //!
 //! # Coordinate units
 //!
-//! The `(resolution <unit> <divisor>)` header declares the unit and divisor used
-//! by every raw integer coordinate in the file. A raw value is converted to mm
-//! by `raw * unit_to_mm(unit) / divisor`. For the common `(resolution um 10)`
-//! header that is `raw / 10 / 1000` mm (raw values are in 0.1 µm).
+//! The unit in `(resolution <unit> <factor>)` declares the physical unit used by
+//! coordinates in the design. The factor is the precision Freerouting uses for
+//! its internal integer grid and for coordinates written to a session; it does
+//! **not** divide coordinates read from the DSN. A raw design value is therefore
+//! converted by `raw * unit_to_mm(unit)`. For the common `(resolution um 10)`
+//! header, `148313` is 148.313 mm on input, while the same position is written as
+//! `1483130` in a resolution-10 session.
 //!
 //! KiCad emits DSN with y pointing *up* but written as negative numbers; we keep
 //! coordinates exactly as written (only scaled to mm) since the router only cares
@@ -311,6 +314,10 @@ pub struct DsnIngest {
     pub signal_layers: Vec<String>,
     /// The via model resolved from the DSN via padstacks / structure rules.
     pub via_model: ViaModel,
+    /// Geometry of the first usable via padstack declared by `(structure (via
+    /// ...))`. `None` means the DSN did not provide a resolvable via padstack and
+    /// callers should retain their documented fallback geometry.
+    pub via_geometry: Option<DsnViaGeometry>,
     /// The DSN `(resolution <unit> <divisor>)` unit (e.g. `"um"`). Needed to write
     /// a coordinate-consistent Specctra session (`.ses`) back out.
     pub resolution_unit: String,
@@ -335,6 +342,23 @@ pub struct DsnIngest {
 pub struct PlaneDef {
     pub net: String,
     pub layer: String,
+}
+
+/// Physical geometry carried by one DSN via padstack.
+///
+/// Specctra padstacks carry the annular copper geometry directly. KiCad's DSN
+/// exporter carries the drill diameter in its conventional padstack name, e.g.
+/// `Via[0-1]_600:300_um`; DSN has no separate drill field for that padstack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsnViaGeometry {
+    /// Original padstack identifier, reused when writing the session.
+    pub padstack_name: String,
+    /// Conservative annular-pad diameter in millimetres.
+    pub pad_diameter_mm: f64,
+    /// Drill diameter decoded from a KiCad-style padstack name, when present.
+    pub drill_diameter_mm: Option<f64>,
+    /// Physical copper layers on which the padstack has shapes.
+    pub layers: Vec<String>,
 }
 
 impl DsnIngest {
@@ -390,7 +414,10 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
             .ok_or_else(|| anyhow!("DSN root is not a (pcb ...) form"))?
     };
 
-    // (resolution um 10) -> mm-per-rawunit.
+    // Freerouting's DSN reader treats the declared unit as the physical unit of
+    // input coordinates. The resolution factor only sets its internal integer
+    // precision and the precision of coordinates written to SES; it does not
+    // divide input geometry.
     let res = pcb
         .child_named("resolution")
         .ok_or_else(|| anyhow!("DSN missing (resolution ...) header"))?;
@@ -407,7 +434,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     if !divisor.is_finite() || divisor <= 0.0 {
         bail!("DSN resolution divisor must be positive and finite, got {divisor}");
     }
-    let mm_per_raw = unit_to_mm(unit)? / divisor;
+    let mm_per_raw = unit_to_mm(unit)?;
     let to_mm = |raw: f64| raw * mm_per_raw;
 
     let structure = pcb
@@ -550,7 +577,9 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
     // Via model: read the DSN via padstacks (their layer spans) and structure
     // rules. All-through-hole -> ViaModel::through_hole; declared blind/buried
     // spans -> a restricted model permitting exactly those adjacent steps.
-    let (via_model, vias_declared) = parse_via_model(pcb, structure, layer_count, &layer_map);
+    let via_names = declared_via_names(structure);
+    let (via_model, vias_declared) = parse_via_model(pcb, &via_names, layer_count, &layer_map);
+    let via_geometry = parse_via_geometry(&via_names, &pad_sizes, &layer_map);
     let vias_through_hole = via_model == ViaModel::through_hole(layer_count);
 
     let stats = ParseStats {
@@ -591,6 +620,7 @@ pub fn dsn_to_ingest(dsn_text: &str) -> Result<DsnIngest> {
         layer_map,
         signal_layers,
         via_model,
+        via_geometry,
         resolution_unit: unit.to_string(),
         resolution_divisor: divisor,
         stats,
@@ -790,14 +820,8 @@ fn pad_layer_names(declared: &[String], layer_map: &LayerMap) -> Vec<String> {
 ///   [`ViaModel::with_allowed_steps`] permitting exactly the adjacent steps those
 ///   spans cover (a span `[lo, hi]` contributes the steps `lo..hi`).
 /// - When no vias are declared, or spans are ambiguous, we default to through-hole.
-fn parse_via_model(
-    pcb: &Sexpr,
-    structure: &Sexpr,
-    layer_count: u32,
-    layer_map: &LayerMap,
-) -> (ViaModel, usize) {
-    // Names of via padstacks the structure says may be placed.
-    let via_names: Vec<String> = structure
+fn declared_via_names(structure: &Sexpr) -> Vec<String> {
+    structure
         .child_named("via")
         .and_then(|v| v.as_list())
         .map(|items| {
@@ -808,8 +832,45 @@ fn parse_via_model(
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
+/// Decode the drill suffix produced by KiCad, e.g. the `300` in
+/// `Via[0-1]_600:300_um`. The dimensions in that name are always micrometres;
+/// unlike DSN coordinates they are descriptive text and are not affected by the
+/// file's `(resolution ...)` factor.
+fn kicad_via_drill_mm(name: &str) -> Option<f64> {
+    let (_, drill) = name.rsplit_once(':')?;
+    let drill_um = drill.strip_suffix("_um")?.parse::<f64>().ok()?;
+    (drill_um.is_finite() && drill_um > 0.0).then_some(drill_um * 0.001)
+}
+
+fn parse_via_geometry(
+    via_names: &[String],
+    pad_sizes: &HashMap<String, PadSize>,
+    layer_map: &LayerMap,
+) -> Option<DsnViaGeometry> {
+    via_names.iter().find_map(|name| {
+        let pad = pad_sizes.get(name)?;
+        let diameter = pad.w.max(pad.h);
+        if !diameter.is_finite() || diameter <= 0.0 {
+            return None;
+        }
+        Some(DsnViaGeometry {
+            padstack_name: name.clone(),
+            pad_diameter_mm: diameter,
+            drill_diameter_mm: kicad_via_drill_mm(name),
+            layers: pad_layer_names(&pad.layers, layer_map),
+        })
+    })
+}
+
+fn parse_via_model(
+    pcb: &Sexpr,
+    via_names: &[String],
+    layer_count: u32,
+    layer_map: &LayerMap,
+) -> (ViaModel, usize) {
     // Padstack name -> layer names it touches, for via padstacks (incl. plated
     // shapes; we reuse the same library shape parsing).
     let library = pcb.child_named("library");
@@ -847,7 +908,7 @@ fn parse_via_model(
     };
 
     let mut spans: Vec<(u32, u32)> = Vec::new();
-    for name in &via_names {
+    for name in via_names {
         if let Some(span) = via_span(name) {
             spans.push(span);
         }
@@ -1220,17 +1281,16 @@ mod tests {
     /// A tiny synthetic board: 2 components, one net, with one rotated/back-side
     /// component to exercise the transform.
     ///
-    /// Resolution `um 1000` -> mm-per-raw = 0.001/1000 = 1e-6? No: unit_to_mm(um)
-    /// = 0.001, divisor 1000 -> 1e-6 mm per raw. We instead use `mm 1000` so raw
-    /// values are in micrometres-ish and easy to reason about: mm-per-raw =
-    /// 1/1000 = 0.001, i.e. raw is in µm. So raw 1000 = 1mm.
+    /// DSN coordinates are expressed directly in the declared physical unit;
+    /// the resolution factor controls session/internal precision only. Using
+    /// `um 10` keeps the coordinates easy to read: raw 1000 = 1 mm.
     const SYNTH: &str = r#"
     (pcb "synth.dsn"
       (parser
         (string_quote ")
         (space_in_quoted_tokens on)
       )
-      (resolution mm 1000)
+      (resolution um 10)
       (unit mm)
       (structure
         (layer F.Cu (type signal))
@@ -1316,6 +1376,32 @@ mod tests {
     }
 
     #[test]
+    fn resolution_factor_does_not_scale_input_but_sets_session_precision() {
+        let fixture = |factor: u32| {
+            format!(
+                r#"(pcb "units"
+                    (resolution um {factor})
+                    (structure
+                      (layer F.Cu (type signal))
+                      (boundary (rect pcb 1000 -2000 21000 8000))))"#
+            )
+        };
+
+        let one = dsn_to_ingest(&fixture(1)).unwrap();
+        let ten = dsn_to_ingest(&fixture(10)).unwrap();
+        assert_eq!(one.srj.bounds, ten.srj.bounds);
+        assert_eq!(ten.srj.bounds.min_x, 1.0);
+        assert_eq!(ten.srj.bounds.min_y, -2.0);
+        assert_eq!(ten.srj.bounds.max_x, 21.0);
+        assert_eq!(ten.srj.bounds.max_y, 8.0);
+
+        // Session coordinates use resolution-sized subunits: one millimetre is
+        // 1000 raw units at resolution 1 and 10000 at resolution 10.
+        assert_eq!(one.units_per_mm(), 1_000.0);
+        assert_eq!(ten.units_per_mm(), 10_000.0);
+    }
+
+    #[test]
     fn split_ref_pin_uses_last_dash() {
         assert_eq!(
             split_ref_pin("C1-2"),
@@ -1349,7 +1435,7 @@ mod tests {
         // fills — the binding the DRC checker needs to flag vias through a plane.
         const DSN: &str = r#"
         (pcb "p.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (layer In1.Cu (type power))
@@ -1410,10 +1496,10 @@ mod tests {
     #[test]
     fn parses_clearance_rule_alongside_width() {
         // A single (rule ...) block carrying both width and clearance. With
-        // (resolution mm 1000), raw is in µm: 200 raw -> 0.20mm.
+        // With unit `um`, 200 raw -> 0.20 mm; the factor does not scale input.
         let dsn = r#"
         (pcb "clr.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (boundary (rect pcb 0 0 10000 10000))
@@ -1432,7 +1518,7 @@ mod tests {
         // (rule (width N)) only -> clearance uses DEFAULT_CLEARANCE_MM.
         let dsn = r#"
         (pcb "noclr.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (boundary (rect pcb 0 0 10000 10000))
@@ -1451,7 +1537,7 @@ mod tests {
         // the structure-level rule wins, matching the width precedence.
         let dsn = r#"
         (pcb "ovr.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (rule (clearance 300))
           (structure
             (layer F.Cu (type signal))
@@ -1472,7 +1558,7 @@ mod tests {
         // separate structure rule blocks.
         let dsn = r#"
         (pcb "rules.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (rule (width 100) (clearance 300))
           (structure
             (layer F.Cu (type signal))
@@ -1493,7 +1579,7 @@ mod tests {
     fn asymmetric_pad_geometry_handles_quarter_turns_and_arbitrary_angles() {
         let dsn = r#"
         (pcb "rotated-pads.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (boundary (rect pcb 0 0 10000 10000)))
@@ -1552,7 +1638,7 @@ mod tests {
     fn multi_shape_padstack_uses_conservative_maximum_extents() {
         let dsn = r#"
         (pcb "multi-shape.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (layer B.Cu (type signal))
@@ -1614,7 +1700,7 @@ mod tests {
         // (pin PADSTACK (rotate 90) id x y) form must still yield the right pin.
         let dsn = r#"
         (pcb "r.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (boundary (rect pcb 0 0 10000 10000))
@@ -1661,9 +1747,9 @@ mod tests {
         )
         "#;
         let srj = dsn_to_srj(dsn).unwrap();
-        // um/10 -> 1e-4 mm per raw. 200000 -> 20mm. -100000 -> -10mm.
-        assert!((srj.bounds.max_x - 20.0).abs() < 1e-9);
-        assert!((srj.bounds.min_y + 10.0).abs() < 1e-9);
+        // Input coordinates remain whole micrometres despite resolution 10.
+        assert!((srj.bounds.max_x - 200.0).abs() < 1e-9);
+        assert!((srj.bounds.min_y + 100.0).abs() < 1e-9);
         assert!((srj.bounds.min_x - 0.0).abs() < 1e-9);
     }
 
@@ -1685,7 +1771,7 @@ mod tests {
     ///   stack), reused as the via padstack declared in `(structure (via ...))`.
     const MULTILAYER: &str = r#"
     (pcb "ml.dsn"
-      (resolution mm 1000)
+      (resolution um 10)
       (structure
         (layer F.Cu (type signal))
         (layer B.Cu (type signal))
@@ -1788,6 +1874,34 @@ mod tests {
         assert!(ingest.stats.vias_through_hole);
         // Every adjacent step legal (the through-hole semantics).
         assert!(ingest.via_model.is_step_legal(0, 1));
+        let geometry = ingest.via_geometry.expect("declared via geometry");
+        assert_eq!(geometry.padstack_name, "ps_th");
+        assert_eq!(geometry.pad_diameter_mm, 0.6);
+        assert_eq!(geometry.drill_diameter_mm, None);
+        assert_eq!(geometry.layers, vec!["F.Cu", "B.Cu"]);
+    }
+
+    #[test]
+    fn kicad_via_name_supplies_drill_and_padstack_supplies_annulus() {
+        let dsn = r#"
+        (pcb "kicad-via.dsn"
+          (resolution um 10)
+          (structure
+            (layer Top (type signal))
+            (layer Bottom (type signal))
+            (boundary (rect pcb 0 0 10000 10000))
+            (via "Via[0-1]_600:300_um"))
+          (library
+            (padstack "Via[0-1]_600:300_um"
+              (shape (circle Top 600))
+              (shape (circle Bottom 600)))))
+        "#;
+        let ingest = dsn_to_ingest(dsn).unwrap();
+        let geometry = ingest.via_geometry.expect("KiCad via geometry");
+        assert_eq!(geometry.padstack_name, "Via[0-1]_600:300_um");
+        assert_eq!(geometry.pad_diameter_mm, 0.6);
+        assert_eq!(geometry.drill_diameter_mm, Some(0.3));
+        assert_eq!(geometry.layers, vec!["Top", "Bottom"]);
     }
 
     #[test]
@@ -1796,7 +1910,7 @@ mod tests {
         // through-hole model over the declared layer count.
         let dsn = r#"
         (pcb "nv.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (layer In1.Cu (type signal))
@@ -1821,7 +1935,7 @@ mod tests {
         // a restricted model: only the (1,2) adjacent step is drillable.
         let dsn = r#"
         (pcb "bb.dsn"
-          (resolution mm 1000)
+          (resolution um 10)
           (structure
             (layer F.Cu (type signal))
             (layer In1.Cu (type signal))
