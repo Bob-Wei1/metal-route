@@ -46,7 +46,8 @@ use axum::{
 use mr_core::{GridCoords, LayerMap, RouteTrace, Router, RouterError};
 use mr_cpu::NegotiatedRouter;
 use mr_srj::{
-    rasterize_with_layers, to_solution_layered, Bounds, PcbTrace, RasterizedProblem, SimpleRouteJson,
+    rasterize_with_layers, to_solution_layered, Bounds, PcbTrace, RasterizedProblem,
+    SimpleRouteJson,
 };
 use serde::{Deserialize, Serialize};
 use tower_http::{cors::CorsLayer, services::ServeDir};
@@ -222,7 +223,9 @@ fn prepare(
 
 /// The ordered layer names of an effective stackup (`["top", "bottom", ...]`).
 fn layer_names(layers: &LayerMap) -> Vec<String> {
-    (0..layers.len()).map(|i| layers.name(i).to_string()).collect()
+    (0..layers.len())
+        .map(|i| layers.name(i).to_string())
+        .collect()
 }
 
 /// `POST /solve` handler.
