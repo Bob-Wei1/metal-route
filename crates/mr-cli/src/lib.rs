@@ -2097,17 +2097,17 @@ mod tests {
         assert_eq!(endpoint_and_via_span_signature(&repaired), signature);
     }
 
-    /// Dense four-layer fixture: the combined exact via masks and feature-aware
-    /// spacing route 25 of 26 nets with eleven residual findings. None admits a
-    /// beneficial rigid via translation, and all routed endpoints/spans stay fixed.
+    /// Dense four-layer fixture: feature-aware spacing routes all 26 nets with nine
+    /// accepted-rollout findings. None admits a beneficial rigid via translation,
+    /// and all routed endpoints/spans stay fixed.
     #[test]
     fn sample11_combined_clearance_guards_are_repair_stable() {
         assert_real_via_repair(
             "benchmarks/corpus/srj15/sample11-region-reroute.srj.json",
-            25,
             26,
-            11,
-            11,
+            26,
+            9,
+            9,
         );
     }
 
@@ -2121,6 +2121,30 @@ mod tests {
             5,
             0,
             0,
+        );
+    }
+
+    /// The final exact-mask rollout routes this board completely. Feature-aware
+    /// dynamic via spacing must preserve 12/12 while staying no worse than the
+    /// accepted rollout's five DRC findings (the combined route currently has 3).
+    #[test]
+    fn bug62_feature_aware_route_preserves_full_board_and_improves_drc() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/corpus/bug-reports/bugreport62-0f6ca4.srj.json"
+        );
+        let bytes = std::fs::read(path).expect("read checked-in bugreport62 fixture");
+        let srj = parse_srj(&bytes).expect("parse bugreport62");
+        let (traces, summary, _) =
+            route_problem(&srj, None, RouterKind::Negotiated, None).expect("route bugreport62");
+        assert_eq!((summary.routed, summary.total), (12, 12));
+
+        let rules = drc::default_rules(srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM));
+        let violations =
+            drc_board::solution_to_drc_board(&srj, &traces, rules, srj.layer_count).check();
+        assert!(
+            violations.len() <= 3,
+            "combined route must retain the observed DRC<=3 improvement: {violations:#?}"
         );
     }
 
