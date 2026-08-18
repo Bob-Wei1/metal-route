@@ -1254,6 +1254,7 @@ fn provider_path_is_valid(
     let mut seen = HashSet::with_capacity(path.len());
     for &cell in path {
         if !dims.contains(cell)
+            || grid.is_board_forbidden(cell)
             || (grid.is_obstacle(cell) && !passable_pads.contains(&cell))
             || !seen.insert(cell)
         {
@@ -1265,11 +1266,14 @@ fn provider_path_is_valid(
         let (ax, ay, al) = dims.xyz(step[0]);
         let (bx, by, bl) = dims.xyz(step[1]);
         if al == bl {
-            (ax.abs_diff(bx) == 1 && ay == by) || (ay.abs_diff(by) == 1 && ax == bx)
+            ((ax.abs_diff(bx) == 1 && ay == by) || (ay.abs_diff(by) == 1 && ax == bx))
+                && !grid.is_board_planar_step_forbidden(step[0], step[1])
         } else {
             ax == bx
                 && ay == by
                 && via_model.is_step_legal(al, bl)
+                && !grid.is_board_via_forbidden(step[0])
+                && !grid.is_board_via_forbidden(step[1])
                 && (!grid.is_via_forbidden(step[0]) || via_passable_pads.contains(&step[0]))
                 && (!grid.is_via_forbidden(step[1]) || via_passable_pads.contains(&step[1]))
         }
@@ -1343,6 +1347,8 @@ fn provider_alone_paths(
         if !net_pad_lists_are_valid(dims, net)
             || !dims.contains(net.src)
             || !dims.contains(net.dst)
+            || grid.is_board_forbidden(net.src)
+            || grid.is_board_forbidden(net.dst)
             || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
             || (grid.is_obstacle(net.dst) && !net.passable_pads.contains(&net.dst))
         {
@@ -1425,7 +1431,9 @@ impl NegotiatedRouter {
             // An endpoint is invalid only if out of bounds, or it sits on an
             // obstacle that is NOT one of this net's own (passable) pad cells.
             let endpoint_invalid = |c: CellIdx| {
-                !grid.dims.contains(c) || (grid.is_obstacle(c) && !net.passable_pads.contains(&c))
+                !grid.dims.contains(c)
+                    || grid.is_board_forbidden(c)
+                    || (grid.is_obstacle(c) && !net.passable_pads.contains(&c))
             };
             if endpoint_invalid(net.src) || endpoint_invalid(net.dst) {
                 return Err(RouterError::InvalidEndpoint {
@@ -2597,11 +2605,17 @@ fn route_negotiated(
         }
     };
     let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
+        if base.is_board_planar_step_forbidden(u, v) {
+            return OBSTACLE;
+        }
         let geometric = edge_cost(coords.manhattan_len(dims, u, v)) as u64;
         priced_with_base(v, geometric.saturating_mul(enter_weight(v) as u64))
     };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
+            return true;
+        }
+        if base.is_board_forbidden(c) {
             return true;
         }
         if c == src || c == dst {
@@ -2617,6 +2631,8 @@ fn route_negotiated(
     // already blocks the via.
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
         if via_model.is_step_legal(dims.layer_of(u), dims.layer_of(v))
+            && !base.is_board_via_forbidden(u)
+            && !base.is_board_via_forbidden(v)
             && (!base.is_via_forbidden(u) || sorted_contains(via_passable_pads, &u))
             && (!base.is_via_forbidden(v) || sorted_contains(via_passable_pads, &v))
         {
@@ -2702,7 +2718,8 @@ fn route_legal_once(
         }
     };
     let cost_fn = |u: CellIdx, v: CellIdx| -> Cost {
-        if via_guard.conflicts_planar_cell(u, own_group)
+        if base.is_board_planar_step_forbidden(u, v)
+            || via_guard.conflicts_planar_cell(u, own_group)
             || via_guard.conflicts_planar_cell(v, own_group)
         {
             return OBSTACLE;
@@ -2714,6 +2731,9 @@ fn route_legal_once(
     };
     let blocked_fn = |c: CellIdx| -> bool {
         if !window.contains(dims, c) {
+            return true;
+        }
+        if base.is_board_forbidden(c) {
             return true;
         }
         // Foreign-group COPPER cells are hard obstacles, even at this net's
@@ -2789,6 +2809,9 @@ fn route_legal_once(
     let via_step = |u: CellIdx, v: CellIdx| -> Option<Cost> {
         let (lu, lv) = (dims.layer_of(u), dims.layer_of(v));
         if !via_model.is_step_legal(lu, lv) {
+            return None;
+        }
+        if base.is_board_via_forbidden(u) || base.is_board_via_forbidden(v) {
             return None;
         }
         let plane = dims.w * dims.h;

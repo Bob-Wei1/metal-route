@@ -174,6 +174,8 @@ pub fn path_from_field(
         }
         for v in grid.dims.neighbors4(u) {
             if grid.is_obstacle(v)
+                || grid.is_board_forbidden(v)
+                || grid.is_board_planar_step_forbidden(u, v)
                 || du.saturating_add(grid.cost_at(v)) != dist[v as usize]
                 || hops[v as usize] != u32::MAX
             {
@@ -198,7 +200,11 @@ pub fn path_from_field(
         let mut next = None;
         for p in grid.dims.neighbors4(cur) {
             let dp = dist[p as usize];
-            if dp != Cost::MAX && dp.saturating_add(step) == need && hops[p as usize] == need_hops {
+            if dp != Cost::MAX
+                && !grid.is_board_planar_step_forbidden(p, cur)
+                && dp.saturating_add(step) == need
+                && hops[p as usize] == need_hops
+            {
                 next = Some(p);
                 break;
             }

@@ -876,6 +876,18 @@ fn build_grid_lines(
         ys.push(obs.center.y + obs.height / 2.0);
     }
 
+    // Board vertices are topology features too. Exact edge masks below carry the
+    // correctness invariant; adding these coordinates keeps non-convex turns from
+    // being hidden inside one long Hanan edge and gives the router lanes on both
+    // sides of every concavity. Malformed/non-finite outlines fail closed later and
+    // must not poison the sorted line arrays here.
+    for point in &srj.physical_rules.outline {
+        if point.x.is_finite() && point.y.is_finite() {
+            xs.push(point.x);
+            ys.push(point.y);
+        }
+    }
+
     // `xs` / `ys` are now the *feature* lines (pads, obstacle edges, bounds): these
     // are essential — dropping one moves a pad off-node and reintroduces the pad-exit
     // wiggle — so the budget enforcement below never touches them.
@@ -1725,6 +1737,20 @@ fn rasterize_with_layers_model(
             grid.via_forbidden = via_forbidden;
         }
     }
+    // The solution format carries no per-via diameter; metalroute's established
+    // signal-via default is 0.45 mm when the caller has no typed value. Use that
+    // same physical disk here instead of under-reserving with a zero/trace-sized
+    // fallback.
+    let board_via_pad_mm = if via_pad_mm.is_finite() && via_pad_mm > 0.0 {
+        via_pad_mm
+    } else {
+        0.45
+    };
+    apply_board_outline_constraint(
+        &mut grid,
+        &mapping,
+        BoardOutlineConstraint::from_srj(srj, track_w, board_via_pad_mm),
+    );
     let nets = decompose_connections(
         &srj.connections,
         &mapping,
@@ -1742,6 +1768,66 @@ fn rasterize_with_layers_model(
         layers,
         pin_points,
     }
+}
+
+/// Project exact continuous board geometry into the dependency-inverted masks the
+/// routers consume. A malformed active outline marks every node/edge illegal: the
+/// router then rejects its endpoints instead of silently routing against bounds.
+fn apply_board_outline_constraint(
+    grid: &mut Grid,
+    mapping: &Mapping,
+    constraint: Result<Option<BoardOutlineConstraint>, BoardOutlineError>,
+) {
+    let constraint = match constraint {
+        Ok(None) => return,
+        Ok(Some(constraint)) => constraint,
+        Err(_) => {
+            grid.board_constraint = vec![
+                Grid::BOARD_TRACE_NODE
+                    | Grid::BOARD_VIA_NODE
+                    | Grid::BOARD_EDGE_NEG_Y
+                    | Grid::BOARD_EDGE_NEG_X
+                    | Grid::BOARD_EDGE_POS_X
+                    | Grid::BOARD_EDGE_POS_Y;
+                mapping.dims.len()
+            ];
+            return;
+        }
+    };
+
+    let dims = mapping.dims;
+    let mut mask = vec![0u8; dims.len()];
+    for layer in 0..dims.layers {
+        for y in 0..dims.h {
+            for x in 0..dims.w {
+                let cell = dims.idx3(x, y, layer);
+                let point = (mapping.x_lines[x as usize], mapping.y_lines[y as usize]);
+                if !constraint.trace_point_is_legal(point) {
+                    mask[cell as usize] |= Grid::BOARD_TRACE_NODE;
+                }
+                if !constraint.via_point_is_legal(point) {
+                    mask[cell as usize] |= Grid::BOARD_VIA_NODE;
+                }
+                if x + 1 < dims.w {
+                    let right = dims.idx3(x + 1, y, layer);
+                    let right_point = (mapping.x_lines[x as usize + 1], point.1);
+                    if !constraint.trace_segment_is_legal(point, right_point) {
+                        mask[cell as usize] |= Grid::BOARD_EDGE_POS_X;
+                        mask[right as usize] |= Grid::BOARD_EDGE_NEG_X;
+                    }
+                }
+                if y + 1 < dims.h {
+                    let down = dims.idx3(x, y + 1, layer);
+                    let down_point = (point.0, mapping.y_lines[y as usize + 1]);
+                    if !constraint.trace_segment_is_legal(point, down_point) {
+                        mask[cell as usize] |= Grid::BOARD_EDGE_POS_Y;
+                        mask[down as usize] |= Grid::BOARD_EDGE_NEG_Y;
+                    }
+                }
+            }
+        }
+    }
+    grid.board_constraint = mask;
 }
 
 /// Resolve a [`Point`]'s grid layer from its optional named `layer`, defaulting to
@@ -5408,6 +5494,88 @@ mod tests {
         assert_eq!(first.nets.len(), 1);
         assert_eq!(first.mapping.dims.layers, 2);
         assert_ne!(first.nets[0].src, first.nets[0].dst);
+    }
+
+    #[test]
+    fn bugreport21_raster_mask_matches_exact_concave_outline_geometry() {
+        const FIXTURE: &str = include_str!(
+            "../../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+        );
+        let srj: SimpleRouteJson = serde_json::from_str(FIXTURE).unwrap();
+        let problem = rasterize_with_layers(&srj, 0.15, LayerMap::standard(2), 1, 0.15, 0.45);
+        let exact = BoardOutlineConstraint::from_srj(&srj, 0.15, 0.45)
+            .unwrap()
+            .unwrap();
+        assert!(problem.grid.has_board_constraints());
+        assert!(problem.mapping.x_lines.contains(&-2.0));
+        assert!(problem.mapping.x_lines.contains(&2.0));
+        assert!(problem.mapping.y_lines.contains(&2.0));
+
+        let dims = problem.mapping.dims;
+        for layer in 0..dims.layers {
+            for y in 0..dims.h {
+                for x in 0..dims.w {
+                    let cell = dims.idx3(x, y, layer);
+                    let point = (
+                        problem.mapping.x_lines[x as usize],
+                        problem.mapping.y_lines[y as usize],
+                    );
+                    assert_eq!(
+                        problem.grid.is_board_forbidden(cell),
+                        !exact.trace_point_is_legal(point),
+                        "trace node mismatch at {point:?}"
+                    );
+                    assert_eq!(
+                        problem.grid.is_board_via_forbidden(cell),
+                        !exact.via_point_is_legal(point),
+                        "via node mismatch at {point:?}"
+                    );
+                    if x + 1 < dims.w {
+                        let right = dims.idx3(x + 1, y, layer);
+                        let q = (problem.mapping.x_lines[x as usize + 1], point.1);
+                        assert_eq!(
+                            problem.grid.is_board_planar_step_forbidden(cell, right),
+                            !exact.trace_segment_is_legal(point, q),
+                            "horizontal edge mismatch at {point:?}->{q:?}"
+                        );
+                    }
+                    if y + 1 < dims.h {
+                        let down = dims.idx3(x, y + 1, layer);
+                        let q = (point.0, problem.mapping.y_lines[y as usize + 1]);
+                        assert_eq!(
+                            problem.grid.is_board_planar_step_forbidden(cell, down),
+                            !exact.trace_segment_is_legal(point, q),
+                            "vertical edge mismatch at {point:?}->{q:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_active_outline_raster_fails_closed() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 1,
+            "minTraceWidth": 0.2,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0},
+            "outline": [
+                {"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 10.0},
+                {"x": 0.0, "y": 10.0}, {"x": 10.0, "y": 0.0}
+            ],
+            "connections": [{
+                "name": "n",
+                "pointsToConnect": [{"x": 1.0, "y": 1.0}, {"x": 9.0, "y": 9.0}]
+            }]
+        }))
+        .unwrap();
+        let problem = rasterize(&srj, 0.2);
+        assert!(problem.grid.has_board_constraints());
+        assert!(problem
+            .grid
+            .board_constraint
+            .iter()
+            .all(|mask| mask & Grid::BOARD_TRACE_NODE != 0));
     }
 
     /// `enforce_budget` thins fill (keeping every feature line) until the product is

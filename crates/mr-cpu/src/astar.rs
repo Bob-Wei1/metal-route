@@ -70,14 +70,17 @@ impl AStarRouter {
             grid.dims,
             src,
             dst,
-            |_u, v| {
+            |u, v| {
+                if grid.is_board_planar_step_forbidden(u, v) {
+                    return mr_core::OBSTACLE;
+                }
                 if grid.is_obstacle(v) && passable_pads.contains(&v) {
                     1
                 } else {
                     grid.cost_at(v)
                 }
             },
-            |c| grid.is_obstacle(c) && !passable_pads.contains(&c),
+            |c| grid.is_board_forbidden(c) || (grid.is_obstacle(c) && !passable_pads.contains(&c)),
             |c| Self::manhattan(grid, c, dst, min_step),
             |_, _| None,
         )
@@ -102,6 +105,8 @@ impl Router for AStarRouter {
             }
             if !grid.dims.contains(net.src)
                 || !grid.dims.contains(net.dst)
+                || grid.is_board_forbidden(net.src)
+                || grid.is_board_forbidden(net.dst)
                 || (grid.is_obstacle(net.src) && !net.passable_pads.contains(&net.src))
                 || (grid.is_obstacle(net.dst) && !net.passable_pads.contains(&net.dst))
             {

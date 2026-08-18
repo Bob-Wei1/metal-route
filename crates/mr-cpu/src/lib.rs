@@ -193,6 +193,65 @@ mod contract_tests {
     }
 
     #[test]
+    fn every_router_rejects_malformed_board_mask_length() {
+        let dims = Dims::new(2, 2);
+        let malformed = Grid {
+            dims,
+            cost: vec![1; dims.len()],
+            via_forbidden: Vec::new(),
+            board_constraint: vec![0; dims.len() - 1],
+        };
+        let n = net("n", 0, 1);
+        for (name, router) in routers() {
+            assert_eq!(
+                router.route(&malformed, std::slice::from_ref(&n)),
+                Err(RouterError::MalformedGrid),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_router_honors_exact_board_edge_barrier() {
+        // Direct top-row step 0 -> 1 is forbidden while both endpoint nodes remain
+        // legal. Every router must take the lower four-hop detour; a node-only mask
+        // could not express this concave-boundary case.
+        let dims = Dims::new(3, 2);
+        let mut grid = Grid::filled(dims, 1);
+        grid.board_constraint = vec![0; dims.len()];
+        grid.board_constraint[0] |= Grid::BOARD_EDGE_POS_X;
+        grid.board_constraint[1] |= Grid::BOARD_EDGE_NEG_X;
+        let n = net("edge", 0, 2);
+        for (name, router) in routers() {
+            let board = router.route(&grid, std::slice::from_ref(&n)).unwrap();
+            assert_eq!(board.results[0].path, vec![0, 3, 4, 1, 2], "{name}");
+        }
+    }
+
+    #[test]
+    fn own_pad_exemption_cannot_reopen_board_boundary() {
+        let dims = Dims::new(2, 1);
+        let mut grid = GridBuilder::new(dims, 1).mark_rect(0, 0, 1, 0).build();
+        grid.board_constraint = vec![Grid::BOARD_TRACE_NODE, 0];
+        let n = NetEndpoints {
+            net: "pad-net".into(),
+            src: 0,
+            dst: 1,
+            passable_pads: vec![0, 1],
+            via_passable_pads: Vec::new(),
+        };
+        for (name, router) in routers() {
+            assert_eq!(
+                router.route(&grid, std::slice::from_ref(&n)),
+                Err(RouterError::InvalidEndpoint {
+                    net: "pad-net".into()
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn every_router_rejects_foreign_obstacle_endpoint() {
         let dims = Dims::new(2, 1);
         let mut grid = Grid::filled(dims, 1);

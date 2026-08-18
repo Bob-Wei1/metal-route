@@ -109,7 +109,9 @@ impl RipUpRouter {
             // obstacle that is NOT one of this net's own (passable) pad cells.
             // Sitting on one's own pad obstacle is valid (the router unmasks it).
             let endpoint_invalid = |c: CellIdx| {
-                !grid.dims.contains(c) || (grid.is_obstacle(c) && !net.passable_pads.contains(&c))
+                !grid.dims.contains(c)
+                    || grid.is_board_forbidden(c)
+                    || (grid.is_obstacle(c) && !net.passable_pads.contains(&c))
             };
             if endpoint_invalid(net.src) || endpoint_invalid(net.dst) {
                 return Err(RouterError::InvalidEndpoint {

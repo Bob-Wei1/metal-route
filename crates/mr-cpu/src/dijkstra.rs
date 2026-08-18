@@ -76,7 +76,7 @@ where
     let mut pred = vec![NO_PRED; n];
 
     // Source must be passable to start; an obstacle source yields an empty field.
-    if grid.is_obstacle(src) {
+    if grid.is_obstacle(src) || grid.is_board_forbidden(src) {
         return DijkstraField { dist, pred };
     }
 
@@ -93,7 +93,10 @@ where
             continue;
         }
         for v in grid.dims.neighbors4(u) {
-            if grid.is_obstacle(v) {
+            if grid.is_obstacle(v)
+                || grid.is_board_forbidden(v)
+                || grid.is_board_planar_step_forbidden(u, v)
+            {
                 continue;
             }
             let step = grid.cost_at(v);
