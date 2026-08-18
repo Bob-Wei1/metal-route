@@ -97,6 +97,12 @@ pub const CLEARANCE_PENALTY: Cost = 16 * SCALE;
 /// nothing, keeping the default router byte-identical to the pre-clearance behaviour.
 pub const CLEARANCE_NEG_WEIGHT: Cost = SCALE;
 
+// The fused Jacobi self stamp stores copper occupancy and clearance multiplicity
+// in one counter. That is algebraically exact only while both terms have the same
+// coefficient; fail at compile time rather than silently changing route prices if
+// either tuning constant diverges later.
+const _: () = assert!(CLEARANCE_NEG_WEIGHT == SCALE);
+
 /// Maximum negotiation iterations before falling through to legalization.
 pub const MAX_ITERS: u32 = 60;
 
@@ -109,6 +115,10 @@ pub const MAX_ITERS: u32 = 60;
 /// difference between ~85 s and a few seconds. The parallel path is deterministic
 /// (index-ordered merge) regardless of net count.
 const PARALLEL_NEGOTIATION_THRESHOLD: usize = 16;
+
+/// A full-grid congestion field pays off only when enough independent searches
+/// amortize its O(cells) construction. Smaller dirty batches keep the unfused path.
+const FUSED_JACOBI_MIN_DIRTY_NETS: usize = 32;
 
 /// Bounded deterministic portfolio: grouped medium-sized boards receive one
 /// additional all-serial negotiation candidate. Tiny boards already use serial
@@ -1042,6 +1052,9 @@ impl NegotiatedRouter {
         // (via the touched-cell lists) so no iteration pays an O(all cells) memset.
         let mut first_group: Vec<i64> = vec![-1; n_cells];
         let mut overused: Vec<bool> = vec![false; n_cells];
+        // Lazily allocated on the first sufficiently large Jacobi batch, then
+        // cleared and refilled so every later iteration reuses the same capacity.
+        let mut shared_congestion: Vec<u64> = Vec::new();
 
         for iter in 0..MAX_ITERS {
             let pfac: u32 = 1 + iter;
@@ -1083,6 +1096,24 @@ impl NegotiatedRouter {
                 let present_snap: &[u32] = &present;
                 let halo_snap: &[u32] = &present_halo;
                 let history_snap: &[u32] = &history;
+                // Every net in a large Jacobi batch sees the same immutable
+                // congestion snapshot. Fold only those shared congestion terms
+                // once; history remains a distinct addend in `route_negotiated`,
+                // so defensive self-subtraction can never consume it.
+                let fuse_jacobi_pricing = dirty.len() >= FUSED_JACOBI_MIN_DIRTY_NETS;
+                if fuse_jacobi_pricing {
+                    let present_factor = (pfac as u64) * (SCALE as u64);
+                    let halo_factor = (pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64);
+                    shared_congestion.clear();
+                    shared_congestion.extend(present_snap.iter().zip(halo_snap).map(
+                        |(&present, &halo)| {
+                            (present_factor * present as u64)
+                                .saturating_add(halo_factor * halo as u64)
+                        },
+                    ));
+                }
+                let shared_congestion_ref =
+                    fuse_jacobi_pricing.then_some(shared_congestion.as_slice());
                 let nets_ref = nets;
                 let windows_ref = &windows;
                 let via_ref = &via_model;
@@ -1108,7 +1139,9 @@ impl NegotiatedRouter {
                                 } = scratch;
                                 let net = &nets_ref[i];
                                 pad_set.load(&net.passable_pads);
-                                own_path.load(&paths[i]);
+                                if !fuse_jacobi_pricing {
+                                    own_path.load(&paths[i]);
+                                }
                                 own_halo.clear();
                                 for_each_halo_cell(
                                     dims,
@@ -1119,6 +1152,15 @@ impl NegotiatedRouter {
                                     via_ref,
                                     |c| own_halo.increment(c),
                                 );
+                                if fuse_jacobi_pricing {
+                                    // Copper and halo self-pricing have the same SCALE
+                                    // factor (compile-time asserted above). Count both
+                                    // in one stamp only for an amortizing fused batch.
+                                    for &c in &paths[i] {
+                                        own_halo.increment(c);
+                                    }
+                                }
+                                let own_path_ref = (!fuse_jacobi_pricing).then_some(&*own_path);
                                 // Route within the net's window; on failure, retry once on
                                 // the full board so the occasional global net still completes.
                                 // Pure read-only search over the snapshots.
@@ -1128,8 +1170,9 @@ impl NegotiatedRouter {
                                     coords_ref,
                                     &heuristic_costs,
                                     pad_set,
-                                    Some(own_path),
+                                    own_path_ref,
                                     Some(own_halo),
+                                    shared_congestion_ref,
                                     present_snap,
                                     halo_snap,
                                     history_snap,
@@ -1147,8 +1190,9 @@ impl NegotiatedRouter {
                                         coords_ref,
                                         &heuristic_costs,
                                         pad_set,
-                                        Some(own_path),
+                                        own_path_ref,
                                         Some(own_halo),
+                                        shared_congestion_ref,
                                         present_snap,
                                         halo_snap,
                                         history_snap,
@@ -1265,6 +1309,7 @@ impl NegotiatedRouter {
                         &pad_set,
                         None,
                         None,
+                        None,
                         &present,
                         &present_halo,
                         &history,
@@ -1282,6 +1327,7 @@ impl NegotiatedRouter {
                             &coords,
                             &heuristic_costs,
                             &pad_set,
+                            None,
                             None,
                             None,
                             &present,
@@ -1428,6 +1474,7 @@ impl NegotiatedRouter {
                     &pad_set,
                     None,
                     None,
+                    None,
                     &present,
                     &present_halo,
                     &history,
@@ -1445,6 +1492,7 @@ impl NegotiatedRouter {
                         &coords,
                         &heuristic_costs,
                         &pad_set,
+                        None,
                         None,
                         None,
                         &present,
@@ -1934,6 +1982,7 @@ fn route_negotiated(
     pads: &PadSet,
     own_path: Option<&PadSet>,
     own_halo: Option<&CountedCellSet>,
+    shared_congestion: Option<&[u64]>,
     present: &[u32],
     present_halo: &[u32],
     history: &[u32],
@@ -1958,13 +2007,22 @@ fn route_negotiated(
     let priced_with_base = |c: CellIdx, base_cost: u64| -> Cost {
         let ci = c as usize;
         let self_present = own_path.is_some_and(|set| set.contains(c)) as u32;
-        let foreign_present = present[ci].saturating_sub(self_present);
         let self_halo = own_halo.map_or(0, |set| set.count(c));
-        let foreign_halo = present_halo[ci].saturating_sub(self_halo);
-        let priced = base_cost
-            .saturating_add(history[ci] as u64)
-            .saturating_add((pfac as u64) * (SCALE as u64) * (foreign_present as u64))
-            .saturating_add((pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * (foreign_halo as u64));
+        let priced = if let Some(shared) = shared_congestion {
+            let foreign_congestion = shared[ci]
+                .saturating_sub((pfac as u64) * (SCALE as u64) * self_present as u64)
+                .saturating_sub((pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * self_halo as u64);
+            base_cost
+                .saturating_add(history[ci] as u64)
+                .saturating_add(foreign_congestion)
+        } else {
+            let foreign_present = present[ci].saturating_sub(self_present);
+            let foreign_halo = present_halo[ci].saturating_sub(self_halo);
+            base_cost
+                .saturating_add(history[ci] as u64)
+                .saturating_add((pfac as u64) * (SCALE as u64) * foreign_present as u64)
+                .saturating_add((pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * foreign_halo as u64)
+        };
         passable_search_cost(priced)
     };
     // Edge-aware planar base: the geometric length of the move `u -> v`, in the same
@@ -4383,6 +4441,7 @@ mod tests {
             &pads,
             Some(&own_path),
             Some(&own_halo),
+            None,
             &present,
             &present_halo,
             &zeros,
@@ -4393,6 +4452,49 @@ mod tests {
             &via_model,
             false,
         );
+
+        // The Jacobi fast path folds the immutable board-wide terms once and
+        // combines this net's copper + halo multiplicity into one counted stamp.
+        // It must be exactly equivalent to the unfused pricing above.
+        let pfac = 7u32;
+        let shared_congestion: Vec<u64> = present
+            .iter()
+            .zip(&present_halo)
+            .map(|(&p, &h)| {
+                (pfac as u64) * (SCALE as u64) * p as u64
+                    + (pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64) * h as u64
+            })
+            .collect();
+        let mut combined_self = CountedCellSet::new(dims.len());
+        combined_self.clear();
+        for_each_halo_cell(dims, &coords, &grid, &old_path, 1.0, &via_model, |c| {
+            combined_self.increment(c)
+        });
+        for &c in &old_path {
+            combined_self.increment(c);
+        }
+        let mut fused_buf = SearchBuf::new(dims.len());
+        let fused = route_negotiated(
+            &mut fused_buf,
+            &grid,
+            &coords,
+            &heuristic_costs,
+            &pads,
+            None,
+            Some(&combined_self),
+            Some(&shared_congestion),
+            &present,
+            &present_halo,
+            &zeros,
+            pfac,
+            src,
+            dst,
+            Window::full(dims),
+            &via_model,
+            false,
+        );
+        assert_eq!(fused, with_snapshot, "fused Jacobi pricing must be exact");
+
         let mut empty_buf = SearchBuf::new(dims.len());
         let without_snapshot = route_negotiated(
             &mut empty_buf,
@@ -4400,6 +4502,7 @@ mod tests {
             &coords,
             &heuristic_costs,
             &pads,
+            None,
             None,
             None,
             &zeros,
@@ -4416,6 +4519,250 @@ mod tests {
             with_snapshot, without_snapshot,
             "a net's old copper and repeated halo visits must contribute zero self-cost"
         );
+    }
+
+    #[test]
+    fn fused_jacobi_pricing_matches_unfused_randomized() {
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+
+            fn below(&mut self, bound: u32) -> u32 {
+                ((self.next() >> 32) as u32) % bound.max(1)
+            }
+        }
+
+        fn random_axis(rng: &mut Rng, count: u32) -> Vec<f64> {
+            let mut out = Vec::with_capacity(count as usize);
+            let mut value = 0.0;
+            for _ in 0..count {
+                out.push(value);
+                value += (rng.below(40) + 1) as f64 / 10.0;
+            }
+            out
+        }
+
+        let mut rng = Rng(0x4d59_5df4_d0f3_3173);
+        let mut saw_zero = false;
+        let mut saw_weighted = false;
+        let mut saw_obstacle = false;
+        let mut saw_multilayer = false;
+        let mut saw_restricted_via = false;
+        let mut saw_partial_window = false;
+        let mut saw_pad = false;
+        let mut saw_high_count = false;
+
+        for case in 0..512 {
+            let dims = Dims::with_layers(2 + rng.below(6), 2 + rng.below(6), 1 + rng.below(4));
+            saw_multilayer |= dims.layers > 1;
+
+            let mut grid = Grid::filled(dims, 1);
+            for cell in 0..dims.len() as CellIdx {
+                let cost = match rng.below(12) {
+                    0 | 1 => {
+                        saw_obstacle = true;
+                        OBSTACLE
+                    }
+                    2 => {
+                        saw_zero = true;
+                        0
+                    }
+                    3 | 4 => 1,
+                    _ => {
+                        saw_weighted = true;
+                        2 + rng.below(2_000)
+                    }
+                };
+                grid.set(cell, cost);
+            }
+
+            let src = rng.below(dims.len() as u32);
+            let dst = rng.below(dims.len() as u32);
+            let (sx, sy) = dims.xy(src);
+            let (dx, dy) = dims.xy(dst);
+            let min_x = sx.min(dx);
+            let min_y = sy.min(dy);
+            let max_x = sx.max(dx);
+            let max_y = sy.max(dy);
+            let window = Window {
+                x0: rng.below(min_x + 1),
+                y0: rng.below(min_y + 1),
+                x1: max_x + rng.below(dims.w - max_x),
+                y1: max_y + rng.below(dims.h - max_y),
+            };
+            saw_partial_window |= window != Window::full(dims);
+
+            let mut pad_cells = Vec::new();
+            for cell in 0..dims.len() as CellIdx {
+                if window.contains(dims, cell)
+                    && (grid.is_obstacle(cell) || rng.below(19) == 0)
+                    && rng.below(5) == 0
+                {
+                    pad_cells.push(cell);
+                }
+            }
+            if grid.is_obstacle(src) {
+                pad_cells.push(src);
+            }
+            if grid.is_obstacle(dst) {
+                pad_cells.push(dst);
+            }
+            pad_cells.sort_unstable();
+            pad_cells.dedup();
+            saw_pad |= !pad_cells.is_empty();
+            let mut pads = PadSet::new(dims.len());
+            pads.load(&pad_cells);
+
+            let coords = if case % 3 == 0 {
+                GridCoords::uniform(dims)
+            } else {
+                GridCoords::from_lines(random_axis(&mut rng, dims.w), random_axis(&mut rng, dims.h))
+            };
+            let heuristic_costs = ManhattanCosts::new(dims, &coords);
+
+            let via_model = if dims.layers > 1 && case % 2 == 0 {
+                saw_restricted_via = true;
+                let allowed = (0..dims.layers - 1)
+                    .filter(|_| rng.below(2) == 0)
+                    .map(|layer| (layer, layer + 1))
+                    .collect();
+                ViaModel::with_allowed_steps(
+                    dims.layers,
+                    1 + rng.below(ViaModel::DEFAULT_STEP_COST * 3),
+                    allowed,
+                )
+            } else {
+                let mut model = ViaModel::through_hole(dims.layers);
+                model.step_cost = 1 + rng.below(ViaModel::DEFAULT_STEP_COST * 3);
+                model
+            };
+
+            let pfac = 1 + rng.below(MAX_ITERS);
+            let mut present = vec![0u32; dims.len()];
+            let mut present_halo = vec![0u32; dims.len()];
+            let mut history = vec![0u32; dims.len()];
+            let mut own_cells = Vec::new();
+            let mut own_halo_counts = vec![0u32; dims.len()];
+
+            for cell in 0..dims.len() as CellIdx {
+                let ci = cell as usize;
+                let self_present = u32::from(rng.below(7) == 0);
+                if self_present != 0 {
+                    own_cells.push(cell);
+                }
+                let self_halo = if rng.below(31) == 0 {
+                    saw_high_count = true;
+                    1_000_000 + rng.below(1_000_000)
+                } else {
+                    rng.below(9)
+                };
+                own_halo_counts[ci] = self_halo;
+
+                let high_present = rng.below(23) == 0;
+                let high_halo = rng.below(23) == 0;
+                saw_high_count |= high_present || high_halo;
+                let foreign_present = if high_present {
+                    u32::MAX - self_present - rng.below(4_096)
+                } else {
+                    rng.below(32)
+                };
+                let foreign_halo = if high_halo {
+                    u32::MAX - self_halo - rng.below(4_096)
+                } else {
+                    rng.below(64)
+                };
+                present[ci] = foreign_present + self_present;
+                present_halo[ci] = foreign_halo + self_halo;
+                history[ci] = if rng.below(29) == 0 {
+                    u32::MAX - rng.below(4_096)
+                } else {
+                    rng.below(100_000)
+                };
+            }
+
+            let mut own_path = PadSet::new(dims.len());
+            own_path.load(&own_cells);
+            let mut own_halo = CountedCellSet::new(dims.len());
+            let mut combined_self = CountedCellSet::new(dims.len());
+            own_halo.clear();
+            combined_self.clear();
+            for cell in 0..dims.len() as CellIdx {
+                let ci = cell as usize;
+                let halo = own_halo_counts[ci];
+                let copper = u32::from(own_cells.binary_search(&cell).is_ok());
+                if halo != 0 {
+                    own_halo.stamp[ci] = own_halo.gen;
+                    own_halo.count[ci] = halo;
+                }
+                let combined = halo + copper;
+                if combined != 0 {
+                    combined_self.stamp[ci] = combined_self.gen;
+                    combined_self.count[ci] = combined;
+                }
+            }
+
+            let present_factor = (pfac as u64) * (SCALE as u64);
+            let halo_factor = (pfac as u64) * (CLEARANCE_NEG_WEIGHT as u64);
+            let shared_congestion: Vec<u64> = present
+                .iter()
+                .zip(&present_halo)
+                .map(|(&p, &h)| (present_factor * p as u64).saturating_add(halo_factor * h as u64))
+                .collect();
+            let has_zero_cost = grid.cost.contains(&0);
+
+            let mut unfused_buf = SearchBuf::new(dims.len());
+            let unfused = route_negotiated(
+                &mut unfused_buf,
+                &grid,
+                &coords,
+                &heuristic_costs,
+                &pads,
+                Some(&own_path),
+                Some(&own_halo),
+                None,
+                &present,
+                &present_halo,
+                &history,
+                pfac,
+                src,
+                dst,
+                window,
+                &via_model,
+                has_zero_cost,
+            );
+            let mut fused_buf = SearchBuf::new(dims.len());
+            let fused = route_negotiated(
+                &mut fused_buf,
+                &grid,
+                &coords,
+                &heuristic_costs,
+                &pads,
+                None,
+                Some(&combined_self),
+                Some(&shared_congestion),
+                &present,
+                &present_halo,
+                &history,
+                pfac,
+                src,
+                dst,
+                window,
+                &via_model,
+                has_zero_cost,
+            );
+            assert_eq!(fused, unfused, "randomized pricing mismatch in case {case}");
+        }
+
+        assert!(saw_zero && saw_weighted && saw_obstacle);
+        assert!(saw_multilayer && saw_restricted_via && saw_partial_window);
+        assert!(saw_pad && saw_high_count);
     }
 
     /// Determinism with active clearance: repeated runs must produce a byte-identical

@@ -264,6 +264,7 @@ where
     let mut heap: BinaryHeap<(Reverse<Cost>, Reverse<CellIdx>)> = BinaryHeap::new();
     heap.push((Reverse(heuristic(src)), Reverse(src)));
     let mut goal_cost: Option<Cost> = None;
+    let plane = dims.w * dims.h;
 
     while let Some((Reverse(prio), Reverse(u))) = heap.pop() {
         // With an admissible heuristic, no entry whose lower bound exceeds the
@@ -284,11 +285,13 @@ where
             continue;
         }
         // Inline the 4-neighbour enumeration in ascending CellIdx order (up, left,
-        // right, down) to avoid allocating + sorting a Vec on every expansion — the
-        // single hottest op in the negotiation loop. The neighbours stay on `u`'s
-        // own layer `l` (via `idx3`); on a single-layer grid `l == 0` and `idx3`
-        // reduces to the historical `idx`, so this path is byte-identical there.
-        let (x, y, l) = dims.xyz(u);
+        // right, down). Flat row/layer offsets avoid both an allocating neighbour
+        // Vec and repeated `idx3` multiplication in this hottest expansion loop.
+        // The order and resulting CellIdx values are exactly the canonical Dims
+        // mapping on every layer.
+        let layer = u / plane;
+        let planar = u % plane;
+        let x = planar % dims.w;
         let mut relax = |v: CellIdx| {
             if blocked_fn(v) {
                 return;
@@ -315,28 +318,28 @@ where
                 }
             }
         };
-        if y > 0 {
-            relax(dims.idx3(x, y - 1, l));
+        if planar >= dims.w {
+            relax(u - dims.w);
         }
         if x > 0 {
-            relax(dims.idx3(x - 1, y, l));
+            relax(u - 1);
         }
         if x + 1 < dims.w {
-            relax(dims.idx3(x + 1, y, l));
+            relax(u + 1);
         }
-        if y + 1 < dims.h {
-            relax(dims.idx3(x, y + 1, l));
+        if planar + dims.w < plane {
+            relax(u + dims.w);
         }
-        // Via (layer-changing) moves AFTER the four planar ones. `via_neighbors`
-        // is empty on a single-layer grid (so this is a no-op there) and otherwise
-        // returns the adjacent-layer cells at the same (x, y), lower layer first.
+        // Via (layer-changing) moves AFTER the four planar ones, adjacent lower
+        // layer first. Direct plane offsets reproduce `via_neighbors` without its
+        // per-expansion Vec allocation; single-layer grids remain a no-op.
         // A via step is priced by `via_step` itself (its returned cost), not by
         // `cost_fn(v)`, but still honours `blocked_fn(v)` first so it can never
         // land on a foreign pad or an out-of-window cell. Tie-break / first-writer
         // semantics are identical to the planar relax.
-        for v in dims.via_neighbors(u) {
+        let mut relax_via = |v: CellIdx| {
             if blocked_fn(v) {
-                continue;
+                return;
             }
             if let Some(step) = via_step(u, v) {
                 let nd = du.saturating_add(step);
@@ -357,6 +360,12 @@ where
                     }
                 }
             }
+        };
+        if layer > 0 {
+            relax_via(u - plane);
+        }
+        if layer + 1 < dims.layers {
+            relax_via(u + plane);
         }
     }
 
