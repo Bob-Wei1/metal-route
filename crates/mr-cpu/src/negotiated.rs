@@ -146,12 +146,6 @@ const RIPUP_PER_NET_CAP_EXTRA: usize = 4;
 /// when the net was placed, `None` when it could not be (dropped/unrouted).
 type Committed = Vec<Option<Vec<CellIdx>>>;
 
-/// Sparse owner map for committed via centres, keyed by the exact grid cell on
-/// each physical layer the via touches. Vias are sparse relative to board cells,
-/// so this avoids another full-grid allocation in every parallel legalization
-/// candidate while retaining O(1) membership tests inside a bounded geometric box.
-type ViaCenters = HashMap<CellIdx, i64>;
-
 /// Match the native DRC's geometric tolerance: a pair exactly at required spacing
 /// is legal, and only a centre distance below `required - epsilon` conflicts.
 const VIA_SPACING_EPS_MM: f64 = 1e-9;
@@ -166,6 +160,144 @@ const HALO_MIXED: i64 = -2;
 #[inline]
 fn halo_is_foreign(value: i64, own_group: i64) -> bool {
     value == HALO_MIXED || (value >= 0 && value != own_group)
+}
+
+/// Dense, group-aware exclusion field consulted only by candidate via steps.
+///
+/// Each cell records the sole group whose routed features forbid a foreign via
+/// centre there, [`HALO_FREE`] when no group does, or [`HALO_MIXED`] when several
+/// groups' exact Euclidean disks overlap. A candidate via therefore needs only two
+/// tag reads (one per touched layer), while planar moves deliberately ignore this
+/// field and continue to use the ordinary trace/via halo.
+struct ViaGuard {
+    tags: Vec<i64>,
+    via_trace_mm: f64,
+    via_via_mm: f64,
+}
+
+impl ViaGuard {
+    /// An unoccupied field for isolated searches. Physical feature-aware mode is
+    /// retained through `via_via_mm`, but no dense allocation is needed because
+    /// there are no committed foreign features to query.
+    fn unoccupied(via_trace_mm: f64, via_via_mm: f64) -> Self {
+        Self {
+            tags: Vec::new(),
+            via_trace_mm,
+            via_via_mm,
+        }
+    }
+
+    /// A committed-ownership field. Legacy callers that omit physical via-via
+    /// spacing keep an empty field and use the historical halo-ring guard.
+    fn dense(dims: Dims, via_trace_mm: f64, via_via_mm: f64) -> Self {
+        let tags = if dims.layers > 1 && via_via_mm > VIA_SPACING_EPS_MM {
+            vec![HALO_FREE; dims.len()]
+        } else {
+            Vec::new()
+        };
+        Self {
+            tags,
+            via_trace_mm,
+            via_via_mm,
+        }
+    }
+
+    #[inline]
+    fn feature_aware(&self) -> bool {
+        self.via_via_mm > VIA_SPACING_EPS_MM
+    }
+
+    #[inline]
+    fn conflicts_cell(&self, cell: CellIdx, own_group: i64) -> bool {
+        self.tags
+            .get(cell as usize)
+            .is_some_and(|&tag| halo_is_foreign(tag, own_group))
+    }
+
+    #[inline]
+    fn conflicts_step(&self, u: CellIdx, v: CellIdx, own_group: i64) -> bool {
+        self.conflicts_cell(u, own_group) || self.conflicts_cell(v, own_group)
+    }
+
+    fn clear(&mut self) {
+        self.tags.fill(HALO_FREE);
+    }
+
+    /// Stamp the exact union of this path's feature dilations. Every path cell
+    /// contributes the via-to-trace radius on its own layer; cells touched by a
+    /// layer-changing step contribute the wider via-to-via radius instead. Each path
+    /// cell is visited once, so a multi-step vertical run stamps its shared middle
+    /// layer exactly once.
+    fn stamp_path(&mut self, dims: Dims, coords: &GridCoords, path: &[CellIdx], group: i64) {
+        if self.tags.is_empty() {
+            return;
+        }
+
+        for (i, &cell) in path.iter().enumerate() {
+            let (cx, cy, layer) = dims.xyz(cell);
+            let is_via_neighbour = |other: CellIdx| {
+                let (ox, oy, other_layer) = dims.xyz(other);
+                ox == cx && oy == cy && other_layer != layer
+            };
+            // Inspect each path cell once. A shared middle layer in a multi-step
+            // vertical run has both a via predecessor and successor, but still
+            // contributes only this single (wider) disk.
+            let touches_via = (i > 0 && is_via_neighbour(path[i - 1]))
+                || (i + 1 < path.len() && is_via_neighbour(path[i + 1]));
+            let radius = if touches_via {
+                self.via_trace_mm.max(self.via_via_mm)
+            } else {
+                self.via_trace_mm
+            };
+            self.stamp_disk(dims, coords, cell, group, radius);
+        }
+    }
+
+    /// Stamp one exact Euclidean open disk. The same epsilon and strict comparison
+    /// as the native DRC keep a pair exactly at required spacing legal. Targets are
+    /// not filtered by base obstacles: a via-passable terminal still must respect a
+    /// nearby committed feature.
+    fn stamp_disk(
+        &mut self,
+        dims: Dims,
+        coords: &GridCoords,
+        center: CellIdx,
+        group: i64,
+        radius: f64,
+    ) {
+        if radius <= VIA_SPACING_EPS_MM {
+            return;
+        }
+        let threshold = (radius - VIA_SPACING_EPS_MM).max(0.0);
+        let threshold_sq = threshold * threshold;
+        let (cx, cy, layer) = dims.xyz(center);
+        let center_x = coords.x_of(cx);
+        let center_y = coords.y_of(cy);
+        let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, radius);
+        let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, radius);
+
+        for ny in y0..y1 {
+            if !geom_line_within(&coords.y_lines, dims.h, cy, ny, radius) {
+                continue;
+            }
+            let dy = coords.y_of(ny) - center_y;
+            for nx in x0..x1 {
+                if !geom_line_within(&coords.x_lines, dims.w, cx, nx, radius) {
+                    continue;
+                }
+                let dx = coords.x_of(nx) - center_x;
+                if dx * dx + dy * dy >= threshold_sq {
+                    continue;
+                }
+                let cell = dims.idx3(nx, ny, layer) as usize;
+                self.tags[cell] = match self.tags[cell] {
+                    HALO_FREE => group,
+                    existing if existing == group => existing,
+                    _ => HALO_MIXED,
+                };
+            }
+        }
+    }
 }
 
 /// Inclusive planar search rectangle for one isolated-net request.
@@ -1656,7 +1788,10 @@ impl NegotiatedRouter {
             // route (every net, plus the occasional expensive full-board fallback).
             let no_owner: Vec<i64> = Vec::new();
             let no_halo: Vec<i64> = Vec::new();
-            let no_via_centers = ViaCenters::new();
+            let no_via_guard = ViaGuard::unoccupied(
+                self.clearance_mm.max(via_model.keepout_mm),
+                self.via_spacing_mm,
+            );
             let alone: Vec<(Cost, Vec<CellIdx>)> = (0..n_nets)
                 .into_par_iter()
                 .map_init(
@@ -1673,14 +1808,13 @@ impl NegotiatedRouter {
                             &net.via_passable_pads,
                             &no_owner,
                             &no_halo,
-                            &no_via_centers,
+                            &no_via_guard,
                             -1,
                             net.src,
                             net.dst,
                             windows[i],
                             &via_model,
                             self.clearance_mm,
-                            self.via_spacing_mm,
                             has_zero_cost,
                         )
                         .or_else(|| {
@@ -1693,14 +1827,13 @@ impl NegotiatedRouter {
                                 &net.via_passable_pads,
                                 &no_owner,
                                 &no_halo,
-                                &no_via_centers,
+                                &no_via_guard,
                                 -1,
                                 net.src,
                                 net.dst,
                                 Window::full(dims),
                                 &via_model,
                                 self.clearance_mm,
-                                self.via_spacing_mm,
                                 has_zero_cost,
                             )
                         });
@@ -2195,18 +2328,18 @@ fn route_negotiated(
 ///   * `halo`  — foreign clearance / via-keepout halo. A cell owned by a foreign
 ///     group, or [`HALO_MIXED`] because multiple groups cover it, is a HARD obstacle
 ///     unless it is already this group's copper. Own-group halo costs nothing.
-///   * `via_centers` — sparse per-layer committed via centres. Only a candidate via
-///     step consults this map, using exact Euclidean `via_spacing_mm`; planar copper
-///     continues to use the narrower via-to-track `ViaModel::keepout_mm` halo.
+///   * `via_guard` — dense per-layer feature dilation consulted only by candidate
+///     via steps. It combines exact Euclidean via-to-trace and via-to-via spacing;
+///     planar copper continues to use the ordinary trace/via halo.
 ///   * `src`/`dst` stay forced-passable (a net's own pads must remain reachable).
 ///
 /// Every passable step is priced by its GEOMETRIC length (`edge_cost` from `coords`)
 /// rather than the grid's per-cell value, so the planar base ignores whether a cell
 /// is an unmasked own-pad or ordinary copper — its endpoints are always enterable and
 /// the search is confined to `window`. `owner`/`halo` may each be empty to mean "no
-/// owners / no halo" (the alone-path case). A zero `via_spacing_mm` selects the
+/// owners / no halo" (the alone-path case). A disabled [`ViaGuard`] selects the
 /// legacy generic-halo via guard for low-level callers that do not supply physical
-/// via geometry; production physical pipelines use the feature-aware centre maps.
+/// via geometry; production physical pipelines use the feature-aware dense field.
 /// Returns the windowed shortest path and its cost, or `None`.
 #[allow(clippy::too_many_arguments)]
 fn route_legal(
@@ -2218,14 +2351,13 @@ fn route_legal(
     via_passable_pads: &[CellIdx],
     owner: &[i64],
     halo: &[i64],
-    via_centers: &ViaCenters,
+    via_guard: &ViaGuard,
     own_group: i64,
     src: CellIdx,
     dst: CellIdx,
     window: Window,
     via_model: &ViaModel,
     clearance: f64,
-    via_spacing_mm: f64,
     has_zero_cost: bool,
 ) -> Option<(Vec<CellIdx>, Cost)> {
     let dims = base.dims;
@@ -2286,7 +2418,7 @@ fn route_legal(
     // around itself on both spanned layers. When this is <= 0 (clearance-off fast
     // path) the guard is skipped entirely and behaviour is byte-identical.
     let via_r = clearance.max(via_model.keepout_mm);
-    let feature_aware_via_guard = via_spacing_mm > VIA_SPACING_EPS_MM;
+    let feature_aware_via_guard = via_guard.feature_aware();
     // Compatibility for callers that have not supplied enough geometry to
     // distinguish vias from traces. Production physical pipelines opt into the
     // feature-aware branch and never scan an already-inflated halo. Endpoint
@@ -2337,18 +2469,7 @@ fn route_legal(
         }
         let (vx, vy, _) = dims.xyz(v);
         if feature_aware_via_guard {
-            if foreign_via_feature_conflict(
-                dims,
-                coords,
-                owner,
-                via_centers,
-                own_group,
-                vx,
-                vy,
-                [lu, lv],
-                via_r,
-                via_spacing_mm,
-            ) {
+            if via_guard.conflicts_step(u, v, own_group) {
                 return None;
             }
         } else if via_r > 0.0
@@ -2504,155 +2625,40 @@ fn geom_line_within(lines: &[f64], count: u32, seed: u32, candidate: u32, r: f64
     (at(candidate) - at(seed.min(count - 1))).abs() <= r
 }
 
-/// Feature-aware exact check for one candidate via against committed routed copper
-/// nodes and committed via centres on either layer of an adjacent via step.
-///
-/// One bounded [`geom_box`] broad phase covers the larger of the two radii, then an
-/// exact Euclidean test applies `via_trace_mm` to every foreign copper node and the
-/// wider `via_via_mm` only to cells recorded as foreign via centres. This avoids
-/// both a second scan and the old Minkowski-sum bug from scanning already-inflated
-/// halo cells. The square box is not itself the rule, so legal diagonal pairs pass.
-#[allow(clippy::too_many_arguments)]
-fn foreign_via_feature_conflict(
-    dims: Dims,
-    coords: &GridCoords,
-    owner: &[i64],
-    via_centers: &ViaCenters,
-    own_group: i64,
-    cx: u32,
-    cy: u32,
-    layers: [u32; 2],
-    via_trace_mm: f64,
-    via_via_mm: f64,
-) -> bool {
-    let check_copper = !owner.is_empty() && via_trace_mm > VIA_SPACING_EPS_MM;
-    let check_vias = !via_centers.is_empty() && via_via_mm > VIA_SPACING_EPS_MM;
-    if !check_copper && !check_vias {
-        return false;
-    }
-
-    let via_trace_sq = (via_trace_mm - VIA_SPACING_EPS_MM).max(0.0).powi(2);
-    let via_via_sq = (via_via_mm - VIA_SPACING_EPS_MM).max(0.0).powi(2);
-    let scan_mm = via_trace_mm.max(via_via_mm);
-    let center_x = coords.x_of(cx);
-    let center_y = coords.y_of(cy);
-    let (x0, x1) = geom_box(&coords.x_lines, dims.w, cx, scan_mm);
-    let (y0, y1) = geom_box(&coords.y_lines, dims.h, cy, scan_mm);
-
-    for layer in layers {
-        for ny in y0..y1 {
-            if !geom_line_within(&coords.y_lines, dims.h, cy, ny, scan_mm) {
-                continue;
-            }
-            let dy = coords.y_of(ny) - center_y;
-            for nx in x0..x1 {
-                if !geom_line_within(&coords.x_lines, dims.w, cx, nx, scan_mm) {
-                    continue;
-                }
-                let cell = dims.idx3(nx, ny, layer);
-                let dx = coords.x_of(nx) - center_x;
-                let distance_sq = dx * dx + dy * dy;
-                if check_copper {
-                    let committed_group = owner[cell as usize];
-                    if committed_group >= 0
-                        && committed_group != own_group
-                        && distance_sq < via_trace_sq
-                    {
-                        return true;
-                    }
-                }
-                if check_vias
-                    && via_centers
-                        .get(&cell)
-                        .is_some_and(|&group| halo_is_foreign(group, own_group))
-                    && distance_sq < via_via_sq
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// True when any layer-changing step in `path` would violate a committed foreign
-/// via's exact centre spacing. Used before reusing a negotiated path during
-/// legalization; freshly searched paths apply the identical predicate per via step.
+/// routed feature's exact via guard. Used before reusing a negotiated path during
+/// legalization; freshly searched paths apply the identical two-tag predicate per
+/// via step.
 fn path_has_foreign_via_conflict(
     dims: Dims,
-    coords: &GridCoords,
-    owner: &[i64],
-    via_centers: &ViaCenters,
+    via_guard: &ViaGuard,
     path: &[CellIdx],
     own_group: i64,
-    via_radii_mm: (f64, f64),
 ) -> bool {
-    // A caller that did not supply physical via spacing retains the historical
-    // generic-halo model. There is not enough geometry in `ViaModel::keepout_mm`
-    // alone to infer a sound via-via radius.
-    if via_radii_mm.1 <= VIA_SPACING_EPS_MM {
+    if !via_guard.feature_aware() {
         return false;
     }
     path.windows(2).any(|step| {
         let (ax, ay, al) = dims.xyz(step[0]);
         let (bx, by, bl) = dims.xyz(step[1]);
-        ax == bx
-            && ay == by
-            && al != bl
-            && foreign_via_feature_conflict(
-                dims,
-                coords,
-                owner,
-                via_centers,
-                own_group,
-                ax,
-                ay,
-                [al, bl],
-                via_radii_mm.0,
-                via_radii_mm.1,
-            )
+        ax == bx && ay == by && al != bl && via_guard.conflicts_step(step[0], step[1], own_group)
     })
-}
-
-/// Add all centres in one committed path to the sparse per-layer owner map.
-/// Consecutive steps in a multi-layer vertical run revisit their shared middle
-/// layer; map insertion is idempotent, so each `(x, y, layer, group)` is represented
-/// exactly once. Same-group/sibling vias remain mutually legal. A defensive mixed
-/// marker prevents either group from ignoring an impossible cross-group collision.
-fn stamp_via_centers(via_centers: &mut ViaCenters, dims: Dims, path: &[CellIdx], group: i64) {
-    for step in path.windows(2) {
-        let (ax, ay, al) = dims.xyz(step[0]);
-        let (bx, by, bl) = dims.xyz(step[1]);
-        if ax != bx || ay != by || al == bl {
-            continue;
-        }
-        for cell in [step[0], step[1]] {
-            via_centers
-                .entry(cell)
-                .and_modify(|owner| {
-                    if *owner != group {
-                        *owner = HALO_MIXED;
-                    }
-                })
-                .or_insert(group);
-        }
-    }
 }
 
 /// Fold a committed `path` into the ownership maps, separating HARD copper from the
 /// SOFT clearance halo so a net is never dropped merely for failing to honour
 /// spacing. This is the single place both legalizers commit copper.
 ///
-/// Two dense maps and one sparse map are written:
+/// Three dense maps are written:
 ///   * `owner` — the committed PATH cells (the actual copper). A foreign group's
 ///     `owner` cell is a HARD block: two distinct nets must never overlap.
 ///   * `halo`  — the clearance / via-keepout cells around the copper. A foreign
 ///     group's `halo` cell is a HARD block in [`route_legal`] (the committing pass):
 ///     copper may never be placed inside another net's required spacing, so a net
 ///     that cannot route clear is left unrouted/congested rather than violating.
-///   * `via_centers` — exact per-layer cells touched by committed vias. Candidate
-///     vias use this feature identity for the wider via-to-via centre rule without
-///     widening the ordinary via-to-track halo.
+///   * `via_guard` — exact Euclidean feature dilation used only by candidate vias.
+///     Track cells contribute the via-to-trace radius and via centres contribute
+///     the wider via-to-via radius without widening the ordinary planar halo.
 ///
 /// Exact stamping rule, applied for the committed `path` belonging to `group`:
 ///
@@ -2671,8 +2677,8 @@ fn stamp_via_centers(via_centers: &mut ViaCenters, dims: Dims, path: &[CellIdx],
 ///    the via spans, stamp a halo of radius `max(clearance, via_model.keepout_mm)`
 ///    under the identical rule — a via pad is wider than a track, so it reserves a
 ///    larger neighbourhood.
-/// 4. **Via centres.** Stamp each via endpoint layer into `via_centers`; repeated
-///    middle layers in a multi-step through-via run collapse to one sparse entry.
+/// 4. **Via guard.** Stamp the path's exact via-to-trace / via-to-via union into
+///    `via_guard`; repeated middle layers in a through-via run collapse to one disk.
 ///
 /// CRITICAL: when `clearance == 0.0` AND `via_model.keepout_mm == 0.0` this marks
 /// *exactly* the path cells into `owner` and writes NOTHING into `halo` (a radius-0
@@ -2685,7 +2691,7 @@ fn stamp_via_centers(via_centers: &mut ViaCenters, dims: Dims, path: &[CellIdx],
 fn stamp_owner(
     owner: &mut [i64],
     halo: &mut [i64],
-    via_centers: &mut ViaCenters,
+    via_guard: &mut ViaGuard,
     base: &Grid,
     dims: mr_core::Dims,
     coords: &GridCoords,
@@ -2753,9 +2759,9 @@ fn stamp_owner(
         }
     }
 
-    // Dedicated via centres are independent of the via-to-track halo above. The
-    // sparse map is always exact, but is only queried when `via_spacing_mm > 0`.
-    stamp_via_centers(via_centers, dims, path, group);
+    // Dedicated via guards are independent of the ordinary via-to-track halo above.
+    // The field is absent for legacy callers with no physical via-via spacing.
+    via_guard.stamp_path(dims, coords, path, group);
 }
 
 /// Rebuild legalization ownership after a rip.
@@ -2769,7 +2775,7 @@ fn stamp_owner(
 fn rebuild_owner_maps(
     owner: &mut [i64],
     halo: &mut [i64],
-    via_centers: &mut ViaCenters,
+    via_guard: &mut ViaGuard,
     base: &Grid,
     coords: &GridCoords,
     committed: &Committed,
@@ -2779,13 +2785,13 @@ fn rebuild_owner_maps(
 ) {
     owner.fill(-1);
     halo.fill(HALO_FREE);
-    via_centers.clear();
+    via_guard.clear();
     for (i, path) in committed.iter().enumerate() {
         if let Some(path) = path {
             stamp_owner(
                 owner,
                 halo,
-                via_centers,
+                via_guard,
                 base,
                 base.dims,
                 coords,
@@ -2837,10 +2843,11 @@ fn legalize_in_order(
     // halo cell is a HARD block in `route_legal` (the committing pass), so copper is
     // never placed inside another net's spacing — an unroutable net is dropped.
     let mut halo: Vec<i64> = vec![HALO_FREE; n_cells];
-    // Sparse committed via centres, separate from the via-to-track halo above.
-    let mut via_centers = ViaCenters::new();
-    let mut committed: Committed = vec![None; n_nets];
+    // Exact feature-aware exclusion field for candidate via centres, separate from
+    // the ordinary planar/via-to-track halo above.
     let via_trace_keepout_mm = clearance.max(via_model.keepout_mm);
+    let mut via_guard = ViaGuard::dense(dims, via_trace_keepout_mm, via_spacing_mm);
+    let mut committed: Committed = vec![None; n_nets];
 
     // Net indices committed by the group currently being placed; their paths are
     // folded into `owner` (with clearance halos) only after the whole group
@@ -2942,7 +2949,7 @@ fn legalize_in_order(
         // `&` snapshots.
         let owner_ref: &[i64] = &owner;
         let halo_ref: &[i64] = &halo;
-        let via_centers_ref = &via_centers;
+        let via_guard_ref = &via_guard;
         let coords_ref = coords;
         let mut phase_a: Vec<Option<Vec<CellIdx>>> = batch_nets
             .par_iter()
@@ -2958,15 +2965,7 @@ fn legalize_in_order(
                             let h = halo_ref[c as usize];
                             (o < 0 || o == gi) && !halo_is_foreign(h, gi)
                         })
-                        && !path_has_foreign_via_conflict(
-                            dims,
-                            coords_ref,
-                            owner_ref,
-                            via_centers_ref,
-                            cur,
-                            gi,
-                            (via_trace_keepout_mm, via_spacing_mm),
-                        );
+                        && !path_has_foreign_via_conflict(dims, via_guard_ref, cur, gi);
                     if clean {
                         Some(cur.clone())
                     } else {
@@ -2980,14 +2979,13 @@ fn legalize_in_order(
                             &net.via_passable_pads,
                             owner_ref,
                             halo_ref,
-                            via_centers_ref,
+                            via_guard_ref,
                             gi,
                             net.src,
                             net.dst,
                             windows[i],
                             via_model,
                             clearance,
-                            via_spacing_mm,
                             has_zero_cost,
                         )
                         .map(|(p, _)| p)
@@ -3003,19 +3001,7 @@ fn legalize_in_order(
             let gi = g as i64;
             for &i in &group_nets[g] {
                 let chosen = match std::mem::take(&mut phase_a[k]) {
-                    Some(p)
-                        if !path_has_foreign_via_conflict(
-                            dims,
-                            coords,
-                            &owner,
-                            &via_centers,
-                            &p,
-                            gi,
-                            (via_trace_keepout_mm, via_spacing_mm),
-                        ) =>
-                    {
-                        Some(p)
-                    }
+                    Some(p) if !path_has_foreign_via_conflict(dims, &via_guard, &p, gi) => Some(p),
                     Some(_) | None => {
                         pad_set.load(&nets[i].passable_pads);
                         route_legal(
@@ -3027,14 +3013,13 @@ fn legalize_in_order(
                             &nets[i].via_passable_pads,
                             &owner,
                             &halo,
-                            &via_centers,
+                            &via_guard,
                             gi,
                             nets[i].src,
                             nets[i].dst,
                             Window::full(dims),
                             via_model,
                             clearance,
-                            via_spacing_mm,
                             has_zero_cost,
                         )
                         .map(|(p, _)| p)
@@ -3051,7 +3036,7 @@ fn legalize_in_order(
                     stamp_owner(
                         &mut owner,
                         &mut halo,
-                        &mut via_centers,
+                        &mut via_guard,
                         grid,
                         dims,
                         coords,
@@ -3140,13 +3125,13 @@ fn ripup_legalize(
     // net that cannot route clear is left unrouted rather than violating spacing.
     let mut owner: Vec<i64> = vec![-1; n_cells];
     let mut halo: Vec<i64> = vec![HALO_FREE; n_cells];
-    let mut via_centers = ViaCenters::new();
+    let mut via_guard = ViaGuard::dense(dims, clearance.max(via_model.keepout_mm), via_spacing_mm);
     // Stamp the seeded commits into all ownership maps so the residue routes
     // against them.
     rebuild_owner_maps(
         &mut owner,
         &mut halo,
-        &mut via_centers,
+        &mut via_guard,
         grid,
         coords,
         &committed,
@@ -3199,7 +3184,7 @@ fn ripup_legalize(
     // deleting a first-owner scalar in place would lose a surviving reservation.
     let free_group_cells = |owner: &mut [i64],
                             halo: &mut [i64],
-                            via_centers: &mut ViaCenters,
+                            via_guard: &mut ViaGuard,
                             committed: &mut Committed,
                             group_ids: &[usize],
                             g: usize| {
@@ -3209,15 +3194,7 @@ fn ripup_legalize(
             }
         }
         rebuild_owner_maps(
-            owner,
-            halo,
-            via_centers,
-            grid,
-            coords,
-            committed,
-            group_ids,
-            clearance,
-            via_model,
+            owner, halo, via_guard, grid, coords, committed, group_ids, clearance, via_model,
         );
     };
 
@@ -3274,14 +3251,13 @@ fn ripup_legalize(
             &net.via_passable_pads,
             &owner,
             &halo,
-            &via_centers,
+            &via_guard,
             gi,
             net.src,
             net.dst,
             windows[i],
             via_model,
             clearance,
-            via_spacing_mm,
             has_zero_cost,
         )
         .or_else(|| {
@@ -3295,14 +3271,13 @@ fn ripup_legalize(
                     &net.via_passable_pads,
                     &owner,
                     &halo,
-                    &via_centers,
+                    &via_guard,
                     gi,
                     net.src,
                     net.dst,
                     Window::full(dims),
                     via_model,
                     clearance,
-                    via_spacing_mm,
                     has_zero_cost,
                 )
             } else {
@@ -3314,7 +3289,7 @@ fn ripup_legalize(
             stamp_owner(
                 &mut owner,
                 &mut halo,
-                &mut via_centers,
+                &mut via_guard,
                 grid,
                 dims,
                 coords,
@@ -3376,7 +3351,7 @@ fn ripup_legalize(
         free_group_cells(
             &mut owner,
             &mut halo,
-            &mut via_centers,
+            &mut via_guard,
             &mut committed,
             group_ids,
             victim,
@@ -3393,14 +3368,13 @@ fn ripup_legalize(
             &net.via_passable_pads,
             &owner,
             &halo,
-            &via_centers,
+            &via_guard,
             gi,
             net.src,
             net.dst,
             windows[i],
             via_model,
             clearance,
-            via_spacing_mm,
             has_zero_cost,
         )
         .or_else(|| {
@@ -3414,14 +3388,13 @@ fn ripup_legalize(
                     &net.via_passable_pads,
                     &owner,
                     &halo,
-                    &via_centers,
+                    &via_guard,
                     gi,
                     net.src,
                     net.dst,
                     Window::full(dims),
                     via_model,
                     clearance,
-                    via_spacing_mm,
                     has_zero_cost,
                 )
             } else {
@@ -3432,7 +3405,7 @@ fn ripup_legalize(
             stamp_owner(
                 &mut owner,
                 &mut halo,
-                &mut via_centers,
+                &mut via_guard,
                 grid,
                 dims,
                 coords,
@@ -6041,13 +6014,12 @@ mod tests {
             &[],
             &[],
             &[],
-            &ViaCenters::new(),
+            &ViaGuard::unoccupied(0.0, 0.0),
             -1,
             dims.idx(0, 0),
             dims.idx(1, 0),
             Window::full(dims),
             &ViaModel::through_hole(dims.layers),
-            0.0,
             0.0,
             false,
         );
@@ -6256,12 +6228,12 @@ mod tests {
         let group_ids = vec![0, 1];
         let mut owner = vec![-1; dims.len()];
         let mut halo = vec![HALO_FREE; dims.len()];
-        let mut via_centers = ViaCenters::new();
+        let mut via_guard = ViaGuard::dense(dims, 1.0, 0.0);
 
         rebuild_owner_maps(
             &mut owner,
             &mut halo,
-            &mut via_centers,
+            &mut via_guard,
             &grid,
             &coords,
             &committed,
@@ -6278,7 +6250,7 @@ mod tests {
         rebuild_owner_maps(
             &mut owner,
             &mut halo,
-            &mut via_centers,
+            &mut via_guard,
             &grid,
             &coords,
             &committed,
@@ -6292,23 +6264,24 @@ mod tests {
     }
 
     #[test]
-    fn multistep_via_centers_rebuild_once_per_layer_after_rip() {
-        let dims = Dims::with_layers(2, 1, 3);
+    fn multistep_via_guard_rebuilds_once_per_layer_after_rip() {
+        let dims = Dims::with_layers(3, 1, 3);
         let grid = Grid::filled(dims, 1);
-        let coords = GridCoords::from_lines(vec![0.0, 1.0], vec![0.0]);
+        let coords = GridCoords::from_lines(vec![0.0, 0.5, 1.0], vec![0.0]);
         let via_model = ViaModel::through_hole(3);
         let path0 = vec![dims.idx3(0, 0, 0), dims.idx3(0, 0, 1), dims.idx3(0, 0, 2)];
-        let path1 = vec![dims.idx3(1, 0, 0), dims.idx3(1, 0, 1), dims.idx3(1, 0, 2)];
+        let path1 = vec![dims.idx3(2, 0, 0), dims.idx3(2, 0, 1), dims.idx3(2, 0, 2)];
+        let overlap: Vec<_> = (0..3).map(|layer| dims.idx3(1, 0, layer)).collect();
         let mut committed: Committed = vec![Some(path0.clone()), Some(path1.clone())];
         let group_ids = vec![0, 1];
         let mut owner = vec![-1; dims.len()];
         let mut halo = vec![HALO_FREE; dims.len()];
-        let mut via_centers = ViaCenters::new();
+        let mut via_guard = ViaGuard::dense(dims, 0.0, 0.60);
 
         rebuild_owner_maps(
             &mut owner,
             &mut halo,
-            &mut via_centers,
+            &mut via_guard,
             &grid,
             &coords,
             &committed,
@@ -6317,42 +6290,43 @@ mod tests {
             &via_model,
         );
         assert_eq!(
-            via_centers.len(),
-            6,
-            "shared middle steps stamp idempotently"
+            via_guard
+                .tags
+                .iter()
+                .filter(|&&tag| tag != HALO_FREE)
+                .count(),
+            9,
+            "each layer has two centres and their mixed overlap"
         );
-        assert!(path0.iter().all(|cell| via_centers.get(cell) == Some(&0)));
-        assert!(path1.iter().all(|cell| via_centers.get(cell) == Some(&1)));
-        assert!(!foreign_via_feature_conflict(
+        assert!(path0.iter().all(|&cell| via_guard.tags[cell as usize] == 0));
+        assert!(path1.iter().all(|&cell| via_guard.tags[cell as usize] == 1));
+        assert!(overlap
+            .iter()
+            .all(|&cell| via_guard.tags[cell as usize] == HALO_MIXED));
+        assert!(!path_has_foreign_via_conflict(
             dims,
-            &coords,
-            &[],
-            &via_centers,
+            &via_guard,
+            &path0[..2],
             0,
-            0,
-            0,
-            [0, 1],
-            0.0,
-            0.60,
         ));
-        assert!(foreign_via_feature_conflict(
+        assert!(path_has_foreign_via_conflict(
             dims,
-            &coords,
-            &[],
-            &via_centers,
-            1,
+            &via_guard,
+            &path1[..2],
             0,
+        ));
+        assert!(path_has_foreign_via_conflict(
+            dims,
+            &via_guard,
+            &overlap[..2],
             0,
-            [0, 1],
-            0.0,
-            0.60,
         ));
 
         committed[0] = None;
         rebuild_owner_maps(
             &mut owner,
             &mut halo,
-            &mut via_centers,
+            &mut via_guard,
             &grid,
             &coords,
             &committed,
@@ -6360,9 +6334,119 @@ mod tests {
             0.0,
             &via_model,
         );
-        assert_eq!(via_centers.len(), 3);
-        assert!(path0.iter().all(|cell| !via_centers.contains_key(cell)));
-        assert!(path1.iter().all(|cell| via_centers.get(cell) == Some(&1)));
+        assert_eq!(
+            via_guard
+                .tags
+                .iter()
+                .filter(|&&tag| tag != HALO_FREE)
+                .count(),
+            6
+        );
+        assert!(path0
+            .iter()
+            .all(|&cell| via_guard.tags[cell as usize] == HALO_FREE));
+        assert!(path1.iter().all(|&cell| via_guard.tags[cell as usize] == 1));
+        assert!(overlap
+            .iter()
+            .all(|&cell| via_guard.tags[cell as usize] == 1));
+    }
+
+    #[test]
+    fn dense_via_guard_matches_brute_force_feature_union() {
+        // The truncated x coordinates deliberately trigger geom_box's defensive
+        // full-axis path: x positions become [0, 100, 2, 3, 4]. The oracle below
+        // knows nothing about geom_box and checks every cell directly in Euclidean
+        // space, pinning completeness as well as exact diagonal/boundary semantics.
+        let dims = Dims::with_layers(5, 3, 2);
+        let coords = GridCoords::from_lines(vec![0.0, 100.0], vec![0.0, 0.4, 0.8]);
+        let trace_mm = 0.55;
+        let via_mm = 0.85;
+        let via_path = vec![dims.idx3(3, 1, 0), dims.idx3(3, 1, 1)];
+        let trace_path = [dims.idx3(2, 0, 0), dims.idx3(3, 0, 0)];
+        let features = [(&via_path[..], 0_i64), (&trace_path[..], 1_i64)];
+
+        let mut guard = ViaGuard::dense(dims, trace_mm, via_mm);
+        for &(path, group) in &features {
+            guard.stamp_path(dims, &coords, path, group);
+        }
+
+        for candidate in 0..dims.len() as CellIdx {
+            let (cx, cy, cl) = dims.xyz(candidate);
+            let candidate_x = coords.x_of(cx);
+            let candidate_y = coords.y_of(cy);
+            let mut covering_groups = Vec::new();
+            for &(path, group) in &features {
+                for (i, &feature) in path.iter().enumerate() {
+                    let (fx, fy, fl) = dims.xyz(feature);
+                    if fl != cl {
+                        continue;
+                    }
+                    let is_via = (i > 0 && {
+                        let (px, py, pl) = dims.xyz(path[i - 1]);
+                        px == fx && py == fy && pl != fl
+                    }) || (i + 1 < path.len() && {
+                        let (nx, ny, nl) = dims.xyz(path[i + 1]);
+                        nx == fx && ny == fy && nl != fl
+                    });
+                    let radius = if is_via {
+                        trace_mm.max(via_mm)
+                    } else {
+                        trace_mm
+                    };
+                    let threshold = (radius - VIA_SPACING_EPS_MM).max(0.0);
+                    let dx = coords.x_of(fx) - candidate_x;
+                    let dy = coords.y_of(fy) - candidate_y;
+                    if dx * dx + dy * dy < threshold * threshold
+                        && !covering_groups.contains(&group)
+                    {
+                        covering_groups.push(group);
+                    }
+                }
+            }
+            let expected = match covering_groups.as_slice() {
+                [] => HALO_FREE,
+                [group] => *group,
+                _ => HALO_MIXED,
+            };
+            assert_eq!(guard.tags[candidate as usize], expected, "cell {candidate}");
+        }
+
+        // Repeating one sibling group's stamp is idempotent; a foreign feature at
+        // the same centre makes the tag mixed, so neither group may ignore it.
+        let centre = via_path[0];
+        guard.clear();
+        guard.stamp_path(dims, &coords, &via_path, 0);
+        guard.stamp_path(dims, &coords, &via_path, 0);
+        assert_eq!(guard.tags[centre as usize], 0);
+        guard.stamp_path(dims, &coords, &via_path, 1);
+        assert_eq!(guard.tags[centre as usize], HALO_MIXED);
+        assert!(guard.conflicts_cell(centre, 0));
+        assert!(guard.conflicts_cell(centre, 1));
+    }
+
+    #[test]
+    fn disabled_or_single_layer_via_guard_stays_unallocated() {
+        let dims = Dims::with_layers(100, 100, 4);
+        let coords = GridCoords::uniform(dims);
+        let path = [dims.idx3(50, 50, 0), dims.idx3(50, 50, 1)];
+        let mut guard = ViaGuard::dense(dims, 0.45, 0.0);
+        assert!(guard.tags.is_empty());
+        assert!(!guard.feature_aware());
+        guard.stamp_path(dims, &coords, &path, 0);
+        assert!(
+            guard.tags.is_empty(),
+            "disabled mode must not allocate lazily"
+        );
+        assert!(!path_has_foreign_via_conflict(dims, &guard, &path, 1));
+
+        let planar_dims = Dims::new(100, 100);
+        let mut planar = ViaGuard::dense(planar_dims, 0.45, 0.60);
+        assert!(planar.tags.is_empty());
+        planar.stamp_path(planar_dims, &GridCoords::uniform(planar_dims), &[0, 1], 0);
+        assert!(
+            planar.tags.is_empty(),
+            "single-layer routing must never allocate a guard it cannot query"
+        );
     }
 
     /// Prefix sums starting at 0.0 → a sorted line array of `gaps.len() + 1` lines.
