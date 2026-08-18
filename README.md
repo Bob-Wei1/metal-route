@@ -76,7 +76,7 @@ congestion + equal unrouted set, under the shared canonical tie-break):
   boundaries, and concurrent calls — **pass**. This is broad regression coverage,
   not an exhaustive proof over every cost grid.
 
-The Rust source suite now contains **429 test cases** (426 passing and three
+The Rust source suite now contains **470 test cases** (466 passing and four
 explicitly ignored frontier/performance/live-tool tests), up from 243, plus two
 passing doctests. The added cases
 targeted cross-router contracts, zero-cost cycles, weighted and multilayer ties,
@@ -84,7 +84,8 @@ physical clearance on non-uniform grids, actual rip-up displacement, SRJ/DSN
 layer and rotation semantics, deterministic DRC/oracle behavior, GPU batching and
 memory caps, fixed-fixture and fixed-seed Metal equivalence, exact via-spacing
 guards and exemption lookup, cached isolation diagnoses, parallel scheduling
-determinism, authoritative DRC acceptance, and topology-preserving via repair.
+determinism, coherent typed-SRJ rules, authoritative DRC acceptance, and
+topology-preserving interior and terminal-via repair.
 `research/test_score.py` adds 13 workload-identity, aggregate-consistency, and
 regression-gate tests for benchmark reports.
 
@@ -175,20 +176,25 @@ uses one checker contract rather than mixing historical semantics:
 | **total** | 2701/3167 (85.3%) | **2989/3167 (94.4%)** | 78 → **92** |
 
 Using the same corrected DRC checker on both route sets, exact-geometry findings
-fall **1227 → 443**, clean boards rise **49 → 72**, and fully-routed-clean
-boards rise **46 → 66**. Total route cost rises 340,055 → 377,164 while the
+fall **1227 → 434**, clean boards rise **49 → 76**, and fully-routed-clean
+boards rise **46 → 70**. Total route cost rises 340,055 → 377,164 while the
 router retains 288 additional nets, so cost is reported rather than treated as a
 like-for-like route-quality regression. The overall hardened scorer returns
 **`KEEP`** with exact workload identity, zero errors, improved completion in both
 groups, and improved aggregate DRC/clean-board gates.
 
-Across that original-to-final comparison, standard median board time falls
-**1.392 s → 0.089 s**, nearest-rank p95 **339.922 s → 64.224 s**, maximum
-**679.474 s → 96.231 s**, and the sum of overlapping board timers **4715.180 s
-→ 702.733 s**. End-to-end external elapsed falls **715.55 s → 99.52 s**.
+Timing is observational rather than an acceptance gate. Two release repeats of
+the current `9e5b40a` router had identical timing-stripped report semantics but
+different scheduler profiles: median board time was 0.079024/0.086278 s,
+nearest-rank p95 60.684370/64.411409 s, maximum 104.177673/96.042215 s, the sum
+of overlapping board timers 742.690/1150.046 s, and external elapsed
+109.78/96.19 s. The large swing in the overlapping timer sum makes a new speedup
+claim inappropriate; the deterministic completion, cost, and DRC result is the
+gate.
 
-The accepted pre-feature baseline at `21a0570` isolates the final via-spacing
-change from the earlier improvements. Against that baseline, routed nets improve
+The accepted pre-feature baseline at `21a0570` isolates the dense via-spacing
+change at `02a7f95` from the earlier improvements. Against that baseline, routed
+nets improve
 **2965 → 2989**, full boards **91 → 92**, DRC **483 → 443**, clean boards
 **68 → 72**, and fully-routed-clean boards **65 → 66**. Route cost is
 effectively flat at 377,159 → 377,164 while 24 more nets are retained. Per-group
@@ -204,10 +210,21 @@ For that isolated A/B, median and nearest-rank p95 move slightly the other way
 Ten boards gain 26 routed nets; `bugreport63` loses two while its DRC count improves
 2 → 0, for the net +24. DRC counts improve on 12 boards and worsen on six; the
 largest increases are `sample12` +20 and `sample16` +3, while `bugreport50` -18
-and `bugreport11` -16 are the largest reductions. The isolated baseline and final
-report SHA-256 values are respectively
+and `bugreport11` -16 are the largest reductions. The isolated baseline and
+dense-via report SHA-256 values are respectively
 `8e200e19ecaf0867ef212e739c3a37c7a8ec645b543ffde86f2ca79276985903`
 and `defe7106f2562e4d89685f7c9f2aab4c6d7ddc43db399ca001085d13a6c22c51`.
+
+The subsequent bounded terminal-via repair keeps the same completion and route
+cost while reducing DRC **443 → 434**, raising clean boards **72 → 76**, and
+raising fully-routed-clean boards **66 → 70**. It cleans `sample13`, `sample18`,
+`sample19`, and `sample23` (two findings each) and removes one of five findings
+from `sample44`; no board worsens. The canonical final report SHA-256 is
+`8e52c3ab9a17188e28ab73d4d4314774261ea9dbdca3ba0367a4f583ccabf35f`.
+Its timing-stripped semantics match the independent repeat at SHA-256
+`7e929cd433bd966d3b07a928d3b4b178e1e2d565e80916767ecf820f8a19230a`.
+Final group physical totals are 295 DRC findings/35 clean/29 fully-routed-clean
+for `bug-reports` and 139/41/41 for `srj15`.
 
 The physical rule is feature-aware: via-to-trace centre spacing is via radius +
 edge clearance + trace radius, while via-to-via centre spacing is both via radii
@@ -224,7 +241,11 @@ The principal earlier speed wins remain unique-cell SRJ pad-halo filtering, O(1)
 exact Hanan-distance heuristics, and fused Jacobi pricing with planar/via neighbor
 enumeration that avoids per-expansion allocation. Pad-ownership-aware smoothing
 and one bounded, board-wide DRC-scored via move contribute to the separate
-physical-quality work.
+physical-quality work. Interior vias retain the established one-clearance rigid
+moves; endpoint-adjacent vias can instead grow a short stationary-terminal
+dogleg, quantized from the exact generic-clearance deficit in quarter-clearance
+steps. Physical endpoints, trace order, reconstructed net labels, and ordered via
+spans are invariant, and only a full-board DRC reduction is accepted.
 Legacy unlabeled-pad ownership is inferred only from immutable trace endpoints,
 preventing a moved interior via from claiming a foreign pad during repair scoring.
 The DRC bridge now preserves the standard physical
@@ -232,6 +253,40 @@ layer stack, uses endpoint-side ownership for terminal vias, propagates declared
 connectivity across each routed group, and resolves only unambiguous fixed-pad
 aliases. The DRC exact-gap fast reject adds a smaller measured 10.8%
 microbenchmark improvement.
+
+### Coherent typed SimpleRouteJson subset
+
+The CLI route path and an unoverridden server `/solve` now activate modern
+physical fields only when they form one coherent, uniformly enforceable profile.
+The supported subset resolves board/per-connection trace width, generic
+`minClearance`/`defaultObstacleMargin`, trace↔pad (also used for via↔trace),
+via↔pad, optional pad↔pad and drill↔drill clearances, and exact declared
+routed via pad/hole diameters. Aliases must agree; via geometry must satisfy the
+annular minimum; pads must be finite, connected, unrotated rects or conservative
+circle bounds; and every terminal must be covered only by pads
+that resolve unambiguously to its electrical group. Partial, mixed-width, or
+ambiguous inputs fail closed to the established legacy policy.
+
+The projection deliberately does **not** claim board-outline/
+`minBoardEdgeClearance`, `allowViaInPad`, bus, or differential-pair enforcement.
+`outline`, `minBoardEdgeClearance`, and `allowViaInPad` parse and round-trip,
+while bus/differential declarations remain outside routing semantics. The SRJ29
+AM62L/LPDDR4 frontier fixture exercises the supported product path at 498×321×8:
+**28/33** connections routed, cost **4,841**, and zero findings under the
+supported typed DRC. Its solution SHA-256 is
+`e5ac13e3621c6f81152d51bd4b745de3128901978838308311fbfffcca79c262`.
+None of the locked 112 corpus boards satisfies the activation gate (0/112), and
+the pre-terminal typed-rule revision preserves the accepted legacy report's
+timing-stripped semantics exactly (SHA-256
+`6e1722326a644051f19d0b3fc13b8d2fde2b8f0c0383df061122b5980b442819`).
+
+Typed acceptance is authoritative, but bounded via-repair discovery still uses
+the generic clearance: pair-only or drill-only findings do not independently
+trigger discovery, though a generic-triggered move can reduce them incidentally.
+Adversarial inputs with unbounded distinct coincident via representations can
+also make the typed DRC broad phase quadratic. JSON compatibility remains
+backward-compatible; downstream Rust code using public struct literals must add
+the new fields (the workspace crates are still version 0.1).
 
 The run writes a self-contained SVG gallery (`benchmarks/runs/<ts>-corpus/index.html`,
 gitignored) rendering obstacles, routed traces, and vias per board — failures

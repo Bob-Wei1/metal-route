@@ -7,8 +7,10 @@ aggregate gains from remaining regression gates.
 ## Reproducible baseline
 
 Historical baseline revision: `325d44d`. The previous measured candidate was
-`7aee642`; the current dense-via candidate is `02a7f95`. Every corpus report in
-the comparisons below contains the same 112 board IDs and per-board net totals.
+`7aee642`, the isolated dense-via candidate is `02a7f95`, the coherent typed-SRJ
+projection is `f6c7fb0`, and the current measured router is `9e5b40a`. Every
+corpus report in the comparisons below contains the same 112 board IDs and
+per-board net totals.
 The archived historical baseline used the former first-seen layer checker, so its
 exact route traces (including all 2,701 retained net tags) were replayed through
 the corrected checker at `c6e08b1`. All non-DRC report fields remained
@@ -19,6 +21,19 @@ The isolated via-spacing A/B uses accepted pre-feature revision `21a0570` as its
 baseline and `02a7f95` as its candidate. The corresponding report SHA-256 values
 are `8e200e19ecaf0867ef212e739c3a37c7a8ec645b543ffde86f2ca79276985903`
 and `defe7106f2562e4d89685f7c9f2aab4c6d7ddc43db399ca001085d13a6c22c51`.
+The canonical current report SHA-256 is
+`8e52c3ab9a17188e28ab73d4d4314774261ea9dbdca3ba0367a4f583ccabf35f`;
+an independent repeat is
+`4749ed5f97fdd1dca69840bccc58f3c9befc02823be5a79ae6f02ef944ade345`.
+After removing timing fields, both current reports have semantic SHA-256
+`7e929cd433bd966d3b07a928d3b4b178e1e2d565e80916767ecf820f8a19230a`.
+
+At `f6c7fb0`, none of the locked corpus boards activated the fail-closed typed
+profile (0/112). Its raw corpus report SHA-256 is
+`e5c7ded949efd41499e9de69c748a1062ca0d823a97aad6d489194b1a2ac786f`,
+and its timing-stripped semantics are byte-identical to the accepted legacy run
+at SHA-256
+`6e1722326a644051f19d0b3fc13b8d2fde2b8f0c0383df061122b5980b442819`.
 The earlier corpus, synthetic, and six-board preflight hashes belong to `7aee642`
 and are retained only as intermediate provenance:
 `6543f29685c9cf4b97528b2156473da98ffbb07f7fc246da32f81cdbd01b662d`,
@@ -60,8 +75,8 @@ rerunning the baseline revision uses its legacy checker.
 
 ## Test expansion
 
-Rust test attributes increased from 243 to 429. The current workspace executes
-426 conventional tests, has three explicitly ignored frontier/performance/live-tool
+Rust test attributes increased from 243 to 470. The current workspace executes
+466 conventional tests, has four explicitly ignored frontier/performance/live-tool
 tests, and passes two doctests. Six Criterion route-benchmark smoke cases also pass
 but are not counted as tests. Thirteen Python tests cover the benchmark scorer.
 Important new families:
@@ -75,6 +90,8 @@ Important new families:
   equivalence, strict-boundary behavior, rip rebuilds, and normalized exemptions;
 - SRJ layer ownership, unknown-layer obstacles, width preservation, and DSN
   arbitrary-angle/multi-shape pad geometry;
+- fail-closed coherent typed-SRJ width, alias, terminal-pad, pair-clearance, via
+  geometry, drill-spacing, CLI, and server product-path contracts;
 - DRC spatial-index equivalence and total deterministic ordering;
 - fixed-fixture and deterministic fixed-seed Metal checks for weighted/zero/unit
   dispatch, chunk boundaries, memory limits, pad overrides, multilayer batches,
@@ -84,7 +101,7 @@ Important new families:
 - cached isolation diagnoses and bounded scratch reuse under nested concurrent
   routes;
 - exact DRC acceptance, compressed via-leg geometry, pad ownership, and bounded
-  topology-preserving via repair.
+  topology-preserving interior/stationary-terminal via repair.
 
 ## Implemented changes
 
@@ -104,6 +121,18 @@ Important new families:
   is via radius + copper edge clearance + trace radius, while via-to-via is both
   via radii + edge clearance. Exact Euclidean checks make a candidate exactly at
   the required distance legal; zero edge clearance still prevents copper overlap.
+- Modern SRJ fields project only when one coherent board-wide profile is
+  enforceable. Supported inputs resolve uniform board/per-connection trace width,
+  generic `minClearance`/`defaultObstacleMargin`, trace↔pad (also governing
+  via↔trace), via↔pad, optional pad↔pad and drill↔drill clearances, and exact
+  declared routed via pad/hole diameters. All supplied aliases must agree, via
+  geometry must satisfy the annular minimum, and pair-specific obstacle rules must
+  conservatively dominate the generic rule.
+- The typed gate fails closed unless pads are finite, connected, unrotated rects
+  or conservative circle bounds and every routed terminal is covered only by pads
+  that resolve unambiguously to its electrical group. Partial rules,
+  mixed connection widths, unsupported geometry, bare endpoints, or ambiguous
+  aliases retain the byte-stable legacy path.
 - Legalization pre-stamps committed trace cells and via landings into a dense,
   group-aware via-landing guard. Each cell is free, owned by one connection group,
   or mixed, so a candidate via needs two O(1) tag reads while same-group sharing
@@ -202,12 +231,15 @@ Important new families:
   findings is primary; equal-count candidates must preserve stable finding
   multiplicity and strictly improve 1 nm-quantized severity without worsening a
   rank.
-- A final bounded repair considers at most eight implicated, nonterminal, unshared
-  vias and eight one-clearance compass moves. It rigidly preserves anchors,
-  endpoints, trace order, and via spans, then retains at most one candidate and
-  only when the full-board DRC count strictly falls. Under the corrected checker,
-  checked-in regressions improve sample11 from 20 to 18 findings and sample25 from
-  3 to 0.
+- A final bounded repair considers at most eight implicated, unshared vias and
+  eight compass candidates each. Established interior-via candidates keep their
+  exact cap priority and one-clearance rigid move. Endpoint-adjacent vias instead
+  grow a stationary-terminal dogleg whose radius rounds the exact generic-rule
+  deficit up to a quarter-clearance step. Physical first/last endpoints, trace
+  order, reconstructed net labels, and ordered via spans remain invariant; at
+  most one candidate survives, only when authoritative full-board DRC strictly
+  falls. Pair-specific or drill-only findings may be reduced incidentally by a
+  generic-triggered move, but they do not independently trigger discovery.
 - DRC rejects pairs whose copper AABBs already prove enough separation before the
   exact geometry gap calculation; randomized indexed-vs-naive tests preserve exact
   results and the focused microbenchmark improved 10.8%.
@@ -256,23 +288,34 @@ remeasured at `02a7f95`, so these numbers are not presented as a current-final A
 |--------|-------:|------:|-------:|
 | Routed nets | 2701/3167 | **2989/3167** | +288 (+9.09 pp) |
 | Fully routed boards | 78/112 | **92/112** | +14 |
-| DRC findings | 1227 | **443** | -784 |
-| Clean boards | 49 | **72** | +23 |
-| Fully routed + clean | 46 | **66** | +20 |
+| DRC findings | 1227 | **434** | -793 |
+| Clean boards | 49 | **76** | +27 |
+| Fully routed + clean | 46 | **70** | +24 |
 | Total route cost | 340,055 | 377,164 | +10.91% with 288 more routes |
-| Median board time | 1.392271 s | **0.088734 s** | 15.69× faster |
-| Nearest-rank P95 | 339.922327 s | **64.224316 s** | 5.29× faster |
-| Maximum board time | 679.474124 s | **96.231495 s** | 7.06× faster |
-| Sum of board timers | 4715.180188 s | **702.733228 s** | 6.71× faster |
-| External elapsed | 715.55 s | **99.52 s** | 7.19× faster |
 
-For the even 112-board sample, median is the arithmetic mean of sorted observations
-56 and 57 (one-indexed), not either middle observation. Nearest-rank p95 is sorted
-observation 107.
+Timing is reported separately because repeated runs with identical deterministic
+semantics had materially different nested-parallel scheduler profiles:
+
+| Observation | Repeat 1 | Canonical repeat 2 |
+|-------------|---------:|-------------------:|
+| Median board time | 0.079024 s | 0.086278458 s |
+| Nearest-rank P95 | 60.684370 s | 64.411409 s |
+| Maximum board time | 104.177673 s | 96.042215 s |
+| Sum of overlapping board timers | 742.689849 s | 1150.046112 s |
+| External elapsed | 109.78 s | 96.19 s |
+
+For the even 112-board sample, median is the arithmetic mean of sorted
+observations 56 and 57 (one-indexed), not either middle observation. Nearest-rank
+p95 is sorted observation 107. The overlapping timer sum is especially sensitive
+to scheduler contention—it moves by more than 50% while external elapsed moves in
+the opposite direction—so no new speedup is inferred from these repeats.
 
 Per group, `srj15` improves 705/720 → 719/720 and 46 → 54 full boards;
-`bug-reports` improves 1996/2447 → 2270/2447 and 32 → 38 full boards. The
-hardened scorer returns `KEEP`: exact workload identity is unchanged, both groups
+its final physical totals are 139 DRC findings, 41 clean boards, and 41
+fully-routed-clean boards. `bug-reports` improves 1996/2447 → 2270/2447 and
+32 → 38 full boards, finishing with 295 DRC findings, 35 clean boards, and 29
+fully-routed-clean boards. The hardened scorer returns `KEEP`: exact workload
+identity is unchanged, both groups
 improve, errors remain zero, and aggregate DRC, clean-board, and
 fully-routed-clean gates improve. Total route cost is not compared as if the route
 sets were identical: the final retains 288 more nets.
@@ -309,6 +352,44 @@ are `sample12` +20 and `sample16` +3 findings; the largest gains are
 isolated A/B, while maximum, aggregate timer sum, and external elapsed improve.
 The hardened scorer still returns `KEEP` because both group completion rates are
 non-regressing and every aggregate acceptance gate passes.
+
+### Coherent typed-SRJ frontier and terminal-via repair
+
+The typed projection is intentionally narrower than the full modern SRJ schema.
+It enforces the coherent uniform subset described above: width, generic margin,
+trace↔pad/via↔trace, via↔pad, optional pad↔pad and drill↔drill clearances,
+and the exact declared routed via pad/hole geometry. `outline`,
+`minBoardEdgeClearance`, and `allowViaInPad` parse and round-trip but are not yet
+enforced; bus and differential-pair declarations remain outside routing
+semantics. JSON compatibility is retained, but adding the optional fields is a
+source-level change for downstream Rust struct literals (the workspace is still
+version 0.1).
+
+The SRJ29 AM62L/LPDDR4 frontier fixture activates that supported subset. The
+no-resolution release CLI uses a 498×321×8 grid and routes **28/33** connections
+at cost **4,841** with zero findings under the supported typed DRC. The configured
+server `/solve` pins the same completion and DRC contract. The CLI solution
+SHA-256 is
+`e5ac13e3621c6f81152d51bd4b745de3128901978838308311fbfffcca79c262`.
+This is not a full-SRJ claim: the fixture's outline, board-edge, via-in-pad, bus,
+and differential-pair constraints are not part of the asserted result.
+
+Relative to the typed corpus report, the bounded terminal-via repair preserves
+2989/3167 routed nets, 92 full boards, and cost 377,164 while moving DRC
+**443 → 434**, clean boards **72 → 76**, and fully-routed-clean boards
+**66 → 70**. `sample13`, `sample18`, `sample19`, and `sample23` each move from
+two findings to zero; `sample44` moves from five to four; no board worsens. A
+focused repeated `sample13` check moves from a 585.883 ms median to 590.813 ms
+(+0.84%) while becoming clean, so this is a physical-quality improvement rather
+than a speed claim.
+
+The accepted repair remains opportunistic: pair-only and drill-only findings do
+not independently trigger generic-clearance discovery, though a generic-triggered
+move may reduce them incidentally. Every accepted candidate is still graded by
+authoritative typed full-board DRC. The typed DRC broad phase is near-linear for
+ordinary router output, but an
+adversarial input with unbounded distinct coincident via representations can make
+its physical-site comparisons quadratic.
 
 The legacy baseline report contained 1,493 findings under the old first-seen layer
 checker; that number is intentionally not used in the comparison table. Rechecking
