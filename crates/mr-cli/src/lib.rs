@@ -2702,7 +2702,7 @@ mod tests {
             .expect("route bugreport09 with the bounded order portfolio");
         assert_eq!(
             (summary.routed, summary.total, summary.total_cost),
-            (26, 27, 2192)
+            (26, 27, 2724)
         );
 
         assert!(mr_srj::solution_respects_board_outline(
@@ -2715,7 +2715,7 @@ mod tests {
         let violations = check_srj_solution(&srj, &traces, srj.layer_count.max(1));
         assert_eq!(
             violations.len(),
-            2,
+            1,
             "the recovered route must retain the measured exact DRC improvement: {violations:#?}"
         );
         assert!(violations.iter().all(|finding| {

@@ -801,6 +801,21 @@ pub struct NegotiatedOutcome {
     pub alone_routable: Vec<bool>,
 }
 
+/// One internal routing candidate kept atomic through public portfolio selection.
+/// A trace is present exactly when the caller requested one.
+struct RoutedCandidate {
+    outcome: NegotiatedOutcome,
+    trace: Option<RouteTrace>,
+}
+
+/// The established result of one negotiation mode plus its optional, bounded
+/// final-stage completion candidate. Only Adaptive is allowed to populate
+/// `extended`; ForceSerial remains the established implementation exactly.
+struct VariantPortfolio {
+    established: NegotiatedOutcome,
+    extended: Option<RoutedCandidate>,
+}
+
 impl NegotiatedRouter {
     pub fn new() -> Self {
         Self {
@@ -1059,6 +1074,13 @@ fn serial_candidate_is_better(primary: &BoardRoute, serial: &BoardRoute) -> bool
     serial.results.len() > primary.results.len()
         || (serial.results.len() == primary.results.len()
             && serial.total_cost() < primary.total_cost())
+}
+
+/// The bounded extension is completion-only relative to the already-selected
+/// public established winner. Cost cannot break a tie because that would churn
+/// established Adaptive/ForceSerial bytes after their normal comparison.
+fn extended_candidate_is_better(established_public: &BoardRoute, extended: &BoardRoute) -> bool {
+    extended.results.len() > established_public.results.len()
 }
 
 fn empty_route_trace(dims: Dims) -> RouteTrace {
@@ -1446,7 +1468,7 @@ impl NegotiatedRouter {
         negotiation_mode: NegotiationMode,
         provided_alone: Option<&[Vec<CellIdx>]>,
         mut recorder: Option<&mut RouteTrace>,
-    ) -> Result<NegotiatedOutcome, RouterError> {
+    ) -> Result<VariantPortfolio, RouterError> {
         if !grid.is_well_formed() {
             return Err(RouterError::MalformedGrid);
         }
@@ -2305,7 +2327,7 @@ impl NegotiatedRouter {
         // TRACE: capture every candidate order's (routed, cost) BEFORE `evaluated` is
         // consumed by the `best_idx` match below. Sorted by candidate index so the
         // list is deterministic and aligns with `candidates`. Read-only.
-        let mut traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
+        let traced_candidates: Option<Vec<CandidateEval>> = recorder.as_ref().map(|_| {
             let mut idxs: Vec<&(usize, usize, u64, Committed)> = evaluated.iter().collect();
             idxs.sort_unstable_by_key(|(idx, _, _, _)| *idx);
             idxs.into_iter()
@@ -2318,7 +2340,7 @@ impl NegotiatedRouter {
                 })
                 .collect()
         });
-        let (best_routed, mut best_order, multi_committed) = match best_idx {
+        let (best_routed, best_order, multi_committed) = match best_idx {
             Some(idx) => {
                 let routed = best.as_ref().map(|b| b.0).unwrap_or(0);
                 // Reclaim the winning committed vec by index without cloning.
@@ -2343,7 +2365,7 @@ impl NegotiatedRouter {
         // re-places the stranded net, and re-enqueues the ripped nets — bounded by
         // a global rip budget so it always terminates. The result is used only if
         // it routes strictly more nets than the multi-order pass (never a regress).
-        let mut committed = if best_routed < n_nets {
+        let committed = if best_routed < n_nets {
             let rip = ripup_legalize(
                 grid,
                 &coords,
@@ -2376,19 +2398,22 @@ impl NegotiatedRouter {
         };
 
         // The established 6–16-group portfolio above remains structurally
-        // untouched. For only active exact-board masks in the newly admitted
-        // 17–18-group band, evaluate one additional final-stage candidate after the
-        // established result has already completed its ordinary rip-up pass. This
-        // makes the acceptance boundary the public final completion count:
-        // equal-completion alternate seeds cannot churn board or trace bytes merely
-        // because they beat pre-rip legalization. Inactive/legacy grids never enter
-        // this branch, preserving their established bytes across CLI and server.
+        // untouched. Adaptive alone may evaluate one bounded final-stage extension
+        // for active exact-board masks in the newly admitted 17–18-group band:
+        // at most four legalizations plus one rip-up. ForceSerial never duplicates
+        // that work. `route_impl` first performs the established cross-variant
+        // selection and only then admits this candidate on a strict public
+        // completion gain, so ties cannot churn board/alone/trace bytes. Its cost
+        // may exceed a hypothetical ForceSerial extension: leaving that second
+        // extension uncomputed is what keeps the resource cap literal.
         let established_routed = committed.iter().filter(|path| path.is_some()).count();
+        let mut extended = None;
         #[cfg(test)]
         let extended_order_portfolio = self.extended_order_portfolio;
         #[cfg(not(test))]
         let extended_order_portfolio = true;
-        if extended_order_portfolio
+        if negotiation_mode == NegotiationMode::Adaptive
+            && extended_order_portfolio
             && grid.has_board_constraints()
             && should_try_extended_diversified_orders(
                 n_groups,
@@ -2471,13 +2496,7 @@ impl NegotiatedRouter {
                     .filter(|path| path.is_some())
                     .count();
                 if extension_final_routed > established_routed {
-                    committed = extension_committed;
-                    best_order = extension_order;
-                    if let (Some(candidates), Some(extension)) =
-                        (&mut traced_candidates, extension_trace)
-                    {
-                        candidates.extend(extension);
-                    }
+                    extended = Some((extension_committed, extension_order, extension_trace));
                 }
             }
         }
@@ -2496,42 +2515,72 @@ impl NegotiatedRouter {
                 committed: committed.clone(),
             });
         }
-        // Assemble in input net order for determinism. Carry the router's actual
-        // electrical-net group id alongside each routed net (aligned 1:1 with
-        // `results`) so downstream DRC can grant same-net copper the exact same
-        // immunity the router permitted, rather than re-deriving grouping post-hoc.
-        let mut results: Vec<RouteResult> = Vec::new();
-        let mut groups: Vec<u32> = Vec::new();
-        let mut unrouted: Vec<String> = Vec::new();
-        for (i, net) in nets.iter().enumerate() {
-            match &committed[i] {
-                Some(path) => {
-                    results.push(RouteResult {
-                        net: net.net.clone(),
-                        path: path.clone(),
-                        cost: grid_path_cost(grid, net, path),
-                    });
-                    groups.push(group_ids[i] as u32);
+        let outcome_from = |committed: &Committed| {
+            // Assemble in input net order for determinism. Carry the router's
+            // actual electrical-net group id alongside each routed net (aligned
+            // 1:1 with `results`) so downstream DRC can grant same-net copper the
+            // exact same immunity the router permitted.
+            let mut results: Vec<RouteResult> = Vec::new();
+            let mut groups: Vec<u32> = Vec::new();
+            let mut unrouted: Vec<String> = Vec::new();
+            for (i, net) in nets.iter().enumerate() {
+                match &committed[i] {
+                    Some(path) => {
+                        results.push(RouteResult {
+                            net: net.net.clone(),
+                            path: path.clone(),
+                            cost: grid_path_cost(grid, net, path),
+                        });
+                        groups.push(group_ids[i] as u32);
+                    }
+                    None => unrouted.push(net.net.clone()),
                 }
-                None => unrouted.push(net.net.clone()),
             }
-        }
 
-        let congestion = BoardRoute::congestion_from(dims, &results);
-        Ok(NegotiatedOutcome {
-            board: BoardRoute {
-                results,
-                unrouted,
-                congestion,
-                groups,
+            let congestion = BoardRoute::congestion_from(dims, &results);
+            NegotiatedOutcome {
+                board: BoardRoute {
+                    results,
+                    unrouted,
+                    congestion,
+                    groups,
+                },
+                alone_routable: alone_path.iter().map(|path| !path.is_empty()).collect(),
+            }
+        };
+
+        let extended = extended.map(
+            |(extension_committed, extension_order, extension_candidates)| {
+                let trace = recorder.as_deref().map(|established_trace| {
+                    let mut trace = established_trace.clone();
+                    let legalization = trace
+                        .legalization
+                        .as_mut()
+                        .expect("established trace must include legalization");
+                    legalization.chosen_order = extension_order;
+                    legalization
+                        .candidates
+                        .extend(extension_candidates.unwrap_or_default());
+                    legalization.committed = extension_committed.clone();
+                    trace
+                });
+                RoutedCandidate {
+                    outcome: outcome_from(&extension_committed),
+                    trace,
+                }
             },
-            alone_routable: alone_path.iter().map(|path| !path.is_empty()).collect(),
+        );
+
+        Ok(VariantPortfolio {
+            established: outcome_from(&committed),
+            extended,
         })
     }
 
     /// Route the adaptive primary and, for the bounded grouped-board cohort, an
-    /// all-serial candidate. Candidate selection is deterministic and monotonic in
-    /// completion; an exact score tie retains the primary route.
+    /// all-serial candidate. The established variants are selected first with the
+    /// existing completion/cost comparator. A bounded Adaptive-only extension may
+    /// then replace that public winner solely on a strict final completion gain.
     fn route_impl(
         &self,
         grid: &Grid,
@@ -2567,7 +2616,8 @@ impl NegotiatedRouter {
             primary_recorder,
         )?;
 
-        let mut selected = primary;
+        let adaptive_extension = primary.extended;
+        let mut selected = primary.established;
         let mut selected_trace = primary_trace;
         if should_try_serial_candidate(grid.dims, nets.len(), has_named_group, &selected.board) {
             let mut serial_trace = empty_route_trace(grid.dims);
@@ -2576,17 +2626,33 @@ impl NegotiatedRouter {
             } else {
                 None
             };
-            let serial = self.route_variant(
-                grid,
-                nets,
-                &group_ids,
-                NegotiationMode::ForceSerial,
-                provided_alone.as_deref(),
-                serial_recorder,
-            )?;
+            let serial = self
+                .route_variant(
+                    grid,
+                    nets,
+                    &group_ids,
+                    NegotiationMode::ForceSerial,
+                    provided_alone.as_deref(),
+                    serial_recorder,
+                )?
+                .established;
             if serial_candidate_is_better(&selected.board, &serial.board) {
                 selected = serial;
                 selected_trace = serial_trace;
+            }
+        }
+
+        // Keep the established Adaptive/ForceSerial choice byte-for-byte on an
+        // equal-completion extension, regardless of extension cost. Board, alone
+        // diagnosis, and trace move together when the strict completion gate wins.
+        if let Some(extension) = adaptive_extension {
+            if extended_candidate_is_better(&selected.board, &extension.outcome.board) {
+                selected = extension.outcome;
+                if capture_trace {
+                    selected_trace = extension
+                        .trace
+                        .expect("traced extension must carry its matching trace");
+                }
             }
         }
 
@@ -4653,6 +4719,24 @@ mod tests {
     }
 
     #[test]
+    fn extended_candidate_requires_strict_public_completion_gain() {
+        let established_public = board_with_costs(&[100, 100], 3);
+        let fewer = board_with_costs(&[1], 3);
+        let equal_but_cheaper = board_with_costs(&[1, 1], 3);
+        let more_but_costlier = board_with_costs(&[u32::MAX, u32::MAX, u32::MAX], 3);
+
+        assert!(!extended_candidate_is_better(&established_public, &fewer));
+        assert!(!extended_candidate_is_better(
+            &established_public,
+            &equal_but_cheaper
+        ));
+        assert!(extended_candidate_is_better(
+            &established_public,
+            &more_but_costlier
+        ));
+    }
+
+    #[test]
     fn legalization_candidate_score_distinguishes_totals_above_cost_max() {
         let dims = Dims::new(3, 2);
         let mut grid = Grid::filled(dims, 1);
@@ -4950,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_order_final_tie_preserves_established_board_alone_and_trace_bytes() {
+    fn named_17_group_extended_tie_preserves_public_board_alone_and_trace_bytes() {
         let dims = Dims::new(13, 13);
         let mut grid = Grid::filled(dims, OBSTACLE);
         grid.board_constraint = vec![0; dims.len()];
@@ -4967,14 +5051,22 @@ mod tests {
         let isolated: Vec<_> = [0, 2, 10, 12]
             .into_iter()
             .flat_map(|y| [0, 2, 10, 12].into_iter().map(move |x| (x, y)))
-            .take(15)
             .collect();
         for (i, (x, y)) in isolated.into_iter().enumerate() {
             let cell = dims.idx(x, y);
             grid.set(cell, 1);
-            nets.push(net(&format!("d{i}"), cell, cell));
+            let name = if i < 2 {
+                format!("dummy#{i}")
+            } else {
+                format!("d{i}")
+            };
+            nets.push(net(&name, cell, cell));
         }
-        assert_eq!(nets.len(), ORDER_PORTFOLIO_MAX_GROUPS + 1);
+        let group_ids = connection_group_ids(&nets);
+        let n_groups = group_ids.iter().map(|group| group + 1).max().unwrap();
+        assert_eq!(nets.len(), ORDER_PORTFOLIO_MAX_GROUPS + 2);
+        assert_eq!(n_groups, ORDER_PORTFOLIO_MAX_GROUPS + 1);
+        assert!(has_named_subnet_group(&nets));
 
         let established_router = NegotiatedRouter::new().without_extended_order_portfolio();
         let established = established_router.route_with_outcome(&grid, &nets).unwrap();
@@ -4983,7 +5075,7 @@ mod tests {
         assert_eq!(established.board, established_board);
         assert_eq!(established.board.results.len(), nets.len() - 1);
         assert!(should_try_extended_diversified_orders(
-            nets.len(),
+            n_groups,
             nets.len(),
             dims.len(),
             established.board.results.len(),
@@ -5004,8 +5096,132 @@ mod tests {
                 .candidates
                 .len(),
             3,
-            "a rejected extension must not leak extra candidates into the trace"
+            "a rejected named-group extension must not leak candidates into the selected trace"
         );
+
+        let adaptive = extended_router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::Adaptive,
+                None,
+                None,
+            )
+            .unwrap();
+        let serial = extended_router
+            .route_variant(
+                &grid,
+                &nets,
+                &group_ids,
+                NegotiationMode::ForceSerial,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            serial.extended.is_none(),
+            "ForceSerial must stay established-only"
+        );
+        assert!(
+            adaptive.extended.is_none(),
+            "equal final completion must remain an internal no-op"
+        );
+        assert_eq!(
+            adaptive.established.board.results.len(),
+            serial.established.board.results.len(),
+            "fixture must exercise an equal-completion named cross-variant decision"
+        );
+        let expected_public =
+            if serial_candidate_is_better(&adaptive.established.board, &serial.established.board) {
+                &serial.established.board
+            } else {
+                &adaptive.established.board
+            };
+        assert_eq!(&extended_board, expected_public);
+    }
+
+    #[test]
+    fn adaptive_extended_gain_is_atomic_across_public_apis_and_provider() {
+        let dims = Dims::new(10, 10);
+        let mut grid = GridBuilder::new(dims, 1).build();
+        grid.board_constraint = vec![0; dims.len()];
+        let endpoints = [
+            (5, 3),
+            (89, 50),
+            (94, 70),
+            (93, 10),
+            (7, 29),
+            (92, 90),
+            (95, 19),
+            (97, 9),
+            (20, 30),
+            (2, 8),
+            (0, 96),
+            (49, 6),
+            (99, 4),
+            (69, 39),
+            (59, 80),
+            (40, 79),
+            (98, 1),
+        ];
+        let nets: Vec<_> = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(i, (src, dst))| net(&format!("n{i}"), src, dst))
+            .collect();
+        let group_ids = connection_group_ids(&nets);
+        assert_eq!(
+            group_ids.iter().map(|group| group + 1).max().unwrap(),
+            ORDER_PORTFOLIO_MAX_GROUPS + 1
+        );
+        assert!(!has_named_subnet_group(&nets));
+
+        let established = NegotiatedRouter::new()
+            .without_extended_order_portfolio()
+            .route_with_outcome(&grid, &nets)
+            .unwrap();
+        assert_eq!(
+            (
+                established.board.results.len(),
+                established.board.total_cost()
+            ),
+            (7, 32)
+        );
+
+        let router = NegotiatedRouter::new();
+        let board = router.route(&grid, &nets).unwrap();
+        let outcome = router.route_with_outcome(&grid, &nets).unwrap();
+        let (traced_board, trace) = router.route_traced(&grid, &nets).unwrap();
+        assert_eq!((board.results.len(), board.total_cost()), (8, 51));
+        assert_eq!(outcome.board, board);
+        assert_eq!(traced_board, board);
+        assert_eq!(outcome.alone_routable.len(), nets.len());
+        assert!(outcome.alone_routable.iter().all(|routable| *routable));
+        assert_eq!(
+            outcome.alone_routable,
+            trace
+                .nets
+                .iter()
+                .map(|net| !net.alone_path.is_empty())
+                .collect::<Vec<_>>()
+        );
+
+        let provider_paths = provider_paths_from_trace(&trace);
+        let outcome_provider = MockProvider::paths(provider_paths.clone());
+        let provided_outcome = router
+            .route_with_isolated_provider(&grid, &nets, &outcome_provider)
+            .unwrap();
+        assert_eq!(provided_outcome, outcome);
+        assert_eq!(outcome_provider.calls(), 1);
+
+        let trace_provider = MockProvider::paths(provider_paths);
+        let (provided_board, provided_trace) = router
+            .route_traced_with_isolated_provider(&grid, &nets, &trace_provider)
+            .unwrap();
+        assert_eq!(provided_board, board);
+        assert_trace_eq(&provided_trace, &trace);
+        assert_eq!(trace_provider.calls(), 1);
     }
 
     #[test]
@@ -6947,6 +7163,7 @@ mod tests {
                             None,
                         )
                         .unwrap()
+                        .established
                         .board
                 })
         };
@@ -7019,6 +7236,7 @@ mod tests {
                 Some(&mut primary_trace),
             )
             .unwrap()
+            .established
             .board;
         let serial = router
             .route_variant(
@@ -7030,6 +7248,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .established
             .board;
         assert_eq!((primary.results.len(), primary.total_cost()), (6, 129));
         assert_eq!((serial.results.len(), serial.total_cost()), (5, 88));
@@ -7128,6 +7347,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .established
             .board;
         let mut serial_trace = empty_route_trace(dims);
         let serial = router
@@ -7140,6 +7360,7 @@ mod tests {
                 Some(&mut serial_trace),
             )
             .unwrap()
+            .established
             .board;
 
         assert_eq!((primary.results.len(), primary.total_cost()), (9, 120));
