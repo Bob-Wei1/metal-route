@@ -389,14 +389,15 @@ pub fn parse_srj(bytes: &[u8]) -> Result<SimpleRouteJson> {
 
 /// Explicit opt-in for the experimental Metal isolated-net provider.
 ///
-/// Targeted CPU A* remained faster on five of eight representative real boards,
-/// including the largest one measured. Keep the proven CPU path as the default
-/// until a request-aware crossover rule has broader evidence.
+/// Warm cropped/ragged real-board A/Bs remained neutral or slower through 5.26M
+/// submitted window-cells. Keep the proven CPU path as the default until a
+/// request-aware crossover rule has repeated positive evidence.
 #[cfg(target_os = "macos")]
 const METAL_ISOLATED_ENV: &str = "METALROUTE_EXPERIMENTAL_METAL_ISOLATED";
 
-/// Minimum aggregate independent-field work that can amortize Metal setup,
-/// packing, and readback after the user has explicitly opted in.
+/// Coarse pre-request work floor after the user has explicitly opted in. The
+/// negotiated router has not built its per-net windows at this decision point;
+/// this only avoids obviously tiny experiments and is not an automatic crossover.
 #[cfg(target_os = "macos")]
 const METAL_ISOLATED_MIN_FIELD_WORK: usize = 1_000_000;
 
@@ -446,7 +447,7 @@ impl MetalIsolatedBackend for SystemMetalIsolatedBackend {
         windows: &[MetalWindow],
         edges: MetalEdgeCosts<'_>,
     ) -> std::result::Result<Vec<Option<MetalIsolatedRoute>>, RouterError> {
-        mr_metal::metal_route_isolated_batch(grid, nets, windows, edges)
+        mr_metal::metal_route_isolated_batch_ragged(grid, nets, windows, edges)
     }
 }
 
@@ -1791,7 +1792,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_adapter_preserves_exact_negotiated_output() {
+    fn ragged_metal_adapter_preserves_exact_output_and_static_mask_fallback() {
         let dims = mr_core::Dims::with_layers(9, 7, 3);
         let coords = GridCoords::from_lines(
             vec![0.0, 0.2, 0.7, 1.9, 2.0, 4.5, 4.7, 8.0, 8.1],
@@ -1838,9 +1839,27 @@ mod tests {
         assert_eq!(provider.calls.get(), 1);
         assert!(
             provider.succeeded.get(),
-            "the exact-output comparison must exercise a successful Metal batch"
+            "the exact-output comparison must exercise a successful ragged Metal batch"
         );
         assert_eq!(accelerated, cpu);
+
+        // The compact request intentionally does not encode per-net via-pad
+        // exemptions yet. A selected static-mask contract must therefore fail
+        // closed in mr-metal and make NegotiatedRouter rerun the complete
+        // isolated batch on CPU, preserving its exact output.
+        let mut masked_grid = grid.clone();
+        masked_grid.via_forbidden = vec![false; dims.len()];
+        let cpu = router.route_with_outcome(&masked_grid, &nets).unwrap();
+        let provider = RecordingSystemMetalProvider::default();
+        let fallback = router
+            .route_with_isolated_provider(&masked_grid, &nets, &provider)
+            .unwrap();
+        assert_eq!(provider.calls.get(), 1);
+        assert!(
+            !provider.succeeded.get(),
+            "a selected static via mask must fail the ragged request closed"
+        );
+        assert_eq!(fallback, cpu);
     }
 
     #[test]

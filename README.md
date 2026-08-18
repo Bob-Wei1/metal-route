@@ -121,11 +121,12 @@ grids avoid the weighted hop plane; committed fixed and fixed-seed cases check
 that weighted and zero-cost grids retain canonical CPU equivalence.
 
 Metal also exposes an exact weighted Hanan-edge isolated-route batch (including
-vias, windows, and passable pads) behind a dependency-inverted CPU provider. Its
-256×192×2, 48-net median-of-seven warm latency is 16.7–18.9 ms. Real-board A/Bs did
-**not** establish a reliable automatic crossover—five of eight representative
-boards were slower—so the production negotiated router keeps targeted CPU A* by
-default. Experimental offload is explicit with
+vias, windows, and passable pads) behind a dependency-inverted CPU provider. The
+experimental adapter packs each submitted window at its real cropped size and
+reconstructs compact paths on the GPU. Matched warm real-board A/Bs remained neutral
+or about 1–2% slower across 0.76M–5.26M submitted window-cells, so they did **not**
+establish a reliable automatic crossover and the production negotiated router keeps
+targeted CPU A* by default. Experimental offload is explicit with
 `METALROUTE_EXPERIMENTAL_METAL_ISOLATED=1`; GPU contention or any command failure
 immediately takes the exact whole-batch CPU fallback.
 
