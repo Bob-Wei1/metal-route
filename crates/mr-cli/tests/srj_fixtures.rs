@@ -8,7 +8,8 @@
 //! bun / the harness checked out, so router regressions are caught by
 //! `cargo test`.
 
-use mr_core::{LayerMap, Router};
+use mr_cli::{DEFAULT_CLEARANCE_MM, VIA_PAD_MM};
+use mr_core::{GridCoords, LayerMap, Router, ViaModel};
 use mr_cpu::NegotiatedRouter;
 use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, ViolationClass};
 use mr_srj::{rasterize_with_layers, to_solution_layered, RoutePoint, SimpleRouteJson};
@@ -20,6 +21,9 @@ const SOLVE_LAYERS: u32 = 2;
 
 const MIN_RESOLUTION: f64 = 0.1;
 const TARGET_CELLS_PER_AXIS: f64 = 200.0;
+/// Mirrored from private `mr_cli::DEFAULT_TRACE_WIDTH` for the production-equivalent
+/// frontier projection below.
+const DEFAULT_TRACE_WIDTH_MM: f64 = 0.15;
 
 /// Mirror of `mr_server::choose_resolution` so the fixtures route at the same
 /// grid the live solver uses (kept in sync intentionally; the server owns the
@@ -66,6 +70,114 @@ fn route_fixture_layers(name: &str, layers: u32) -> (usize, usize) {
         .route(&problem.grid, &problem.nets)
         .expect("route");
     (board.results.len(), problem.nets.len())
+}
+
+fn srj29_sample021_bytes() -> Vec<u8> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/frontier/srj29/sample021-am62l-lpddr4.srj.json");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Frontier contract from tscircuit's MIT-licensed SRJ29 sample 021: an exact
+/// eight-layer AM62L32-to-LPDDR4 board rather than a roomy synthetic BGA pair.
+///
+/// The raw assertions intentionally pin fields that `SimpleRouteJson` does not yet
+/// model (typed clearances, via geometry, buses, differential pairs, and outline).
+/// Keeping them in the fixture prevents a future schema/constraint implementation
+/// from needing another upstream fetch. The typed assertions cover the projection
+/// metalroute already consumes today.
+#[test]
+fn srj29_sample021_preserves_frontier_contract_and_supported_projection() {
+    let bytes = srj29_sample021_bytes();
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).expect("parse raw SRJ29 JSON");
+    let srj: SimpleRouteJson = serde_json::from_slice(&bytes).expect("parse SimpleRouteJson");
+
+    assert_eq!(raw["layerCount"], 8);
+    assert_eq!(raw["minTraceWidth"], 0.08128);
+    assert_eq!(raw["defaultObstacleMargin"], 0.05);
+    assert_eq!(raw["minTraceToPadEdgeClearance"], 0.05);
+    assert_eq!(raw["minBoardEdgeClearance"], 0.2);
+    assert_eq!(raw["minViaEdgeToPadEdgeClearance"], 0.08128);
+    assert_eq!(raw["minViaHoleDiameter"], 0.2032);
+    assert_eq!(raw["minViaPadDiameter"], 0.4572);
+    assert_eq!(raw["allowViaInPad"], false);
+    assert_eq!(raw["outline"].as_array().map(Vec::len), Some(4));
+    assert_eq!(raw["buses"].as_array().map(Vec::len), Some(3));
+    assert_eq!(raw["differentialPairs"].as_array().map(Vec::len), Some(3));
+
+    assert_eq!(srj.layer_count, 8);
+    assert_eq!(srj.min_trace_width, Some(0.08128));
+    assert_eq!(srj.min_clearance, None);
+    assert_eq!(srj.obstacles.len(), 573);
+    assert_eq!(srj.connections.len(), 33);
+    assert!(srj
+        .obstacles
+        .iter()
+        .all(|obstacle| obstacle.layers == ["top"]));
+    assert!(srj
+        .obstacles
+        .iter()
+        .all(|obstacle| !obstacle.connected_to.is_empty()));
+    assert!(srj.connections.iter().all(|connection| {
+        connection.root_connection_name.as_deref() == Some(connection.name.as_str())
+            && connection.points_to_connect.len() == 2
+            && connection
+                .points_to_connect
+                .iter()
+                .all(|point| point.layer.as_deref() == Some("top"))
+    }));
+}
+
+/// End-to-end quality floor for the new dense BGA target. This intentionally uses
+/// metalroute's current default clearance because the source's typed clearance
+/// fields are preserved but are not represented by `SimpleRouteJson` yet. Every
+/// missed net routes in isolation, so failures are algorithmic congestion rather
+/// than a malformed fixture or an inadequate grid. The floor admits future
+/// improvements while preventing silent loss of the current 19 routed connections.
+#[test]
+#[ignore = "frontier benchmark; run in release"]
+fn srj29_sample021_routes_on_declared_eight_layer_stack() {
+    let bytes = srj29_sample021_bytes();
+    let srj: SimpleRouteJson = serde_json::from_slice(&bytes).expect("parse SimpleRouteJson");
+    let resolution =
+        (srj.bounds.max_x - srj.bounds.min_x).max(srj.bounds.max_y - srj.bounds.min_y) / 64.0;
+    let clearance = srj.min_clearance.unwrap_or(DEFAULT_CLEARANCE_MM);
+    let clearance_cells = (clearance / resolution).ceil() as u32;
+    let layers = LayerMap::standard(srj.layer_count);
+    let problem = rasterize_with_layers(
+        &srj,
+        resolution,
+        layers,
+        clearance_cells,
+        clearance,
+        VIA_PAD_MM,
+    );
+    let coords = GridCoords::from_lines(
+        problem.mapping.x_lines.clone(),
+        problem.mapping.y_lines.clone(),
+    );
+    let mut via_model = ViaModel::through_hole(srj.layer_count);
+    // Keep in sync with the production SRJ route: via radius + clearance + half
+    // of metalroute's current emitted trace width.
+    via_model.keepout_mm = VIA_PAD_MM / 2.0 + clearance + DEFAULT_TRACE_WIDTH_MM / 2.0;
+    let outcome = NegotiatedRouter::new()
+        .with_via_model(via_model)
+        .with_clearance_mm(clearance + DEFAULT_TRACE_WIDTH_MM)
+        .with_coords(coords)
+        .route_with_outcome(&problem.grid, &problem.nets)
+        .expect("route SRJ29 sample 021");
+
+    assert_eq!(problem.nets.len(), 33);
+    assert_eq!(problem.grid.dims.layers, 8);
+    assert!(
+        outcome.board.results.len() >= 19,
+        "SRJ29 sample 021 completion regressed below the 19/33 baseline: {:#?}",
+        outcome.board
+    );
+    assert!(
+        outcome.alone_routable.iter().all(|&routable| routable),
+        "every SRJ29 sample 021 net must remain routable in isolation"
+    );
 }
 
 /// Single-net categories must route fully — the simplest possible contract.
