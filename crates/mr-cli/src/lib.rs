@@ -52,6 +52,104 @@ pub const DEFAULT_CLEARANCE_MM: f64 = 0.15;
 pub const VIA_PAD_MM: f64 = 0.45;
 pub const VIA_DRILL_MM: f64 = 0.2;
 
+/// Resolution used when comparing the severity of two authoritative DRC result
+/// sets. One nanometre is far below the router's useful geometric resolution but
+/// large enough to keep sub-nanometre distance jitter from turning a tie into an
+/// accepted geometry change.
+const DRC_SCORE_QUANTUM_MM: f64 = 1e-6;
+
+/// Stable identity available in the public DRC result. Location is deliberately
+/// excluded: moving a vertex or via changes the checker-reported feature centroid,
+/// even when it is the same physical finding being improved. Because `Violation`
+/// carries no feature ids, multiple physical pairs sharing this key are necessarily
+/// compared as a severity multiset rather than matched one by one.
+type DrcFindingIdentity = (u8, u32, String, String);
+
+fn drc_class_order(class: mr_drc::ViolationClass) -> u8 {
+    match class {
+        mr_drc::ViolationClass::Clearance => 0,
+        mr_drc::ViolationClass::ViaThroughPlane => 1,
+        mr_drc::ViolationClass::AnnularRing => 2,
+    }
+}
+
+fn drc_finding_identity(violation: &mr_drc::Violation) -> DrcFindingIdentity {
+    (
+        drc_class_order(violation.class),
+        violation.layer,
+        violation.nets.0.clone(),
+        violation.nets.1.clone(),
+    )
+}
+
+fn drc_severity(violation: &mr_drc::Violation) -> u64 {
+    let deficit = violation.required - violation.measured;
+    if !deficit.is_finite() {
+        return if deficit.is_sign_positive() {
+            u64::MAX
+        } else {
+            0
+        };
+    }
+    if deficit <= 0.0 {
+        return 0;
+    }
+    (deficit / DRC_SCORE_QUANTUM_MM).round() as u64
+}
+
+/// Quantised DRC severity profiles grouped by stable finding identity, worst first.
+/// Findings are already authoritative: `DrcBoard::check` has removed same-net pairs,
+/// including all known-net immunity. In particular, an empty serialized net name
+/// means "unknown", not "same net", so every returned finding remains in this map.
+fn drc_severity_profiles(
+    violations: &[mr_drc::Violation],
+) -> std::collections::BTreeMap<DrcFindingIdentity, Vec<u64>> {
+    let mut profiles = std::collections::BTreeMap::<DrcFindingIdentity, Vec<u64>>::new();
+    for violation in violations {
+        profiles
+            .entry(drc_finding_identity(violation))
+            .or_default()
+            .push(drc_severity(violation));
+    }
+    for severity in profiles.values_mut() {
+        severity.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    profiles
+}
+
+/// Whether a candidate is an unambiguous authoritative DRC improvement.
+///
+/// Fewer findings remains the primary objective. At equal count, identities and
+/// multiplicities must be unchanged, no worst-first severity rank may worsen, and at
+/// least one rank must improve. The strict equal-count rule rejects new violations,
+/// equal-score substitutions, and severity trade-offs instead of accepting geometry
+/// churn on count alone.
+fn drc_candidate_is_better(before: &[mr_drc::Violation], candidate: &[mr_drc::Violation]) -> bool {
+    if candidate.len() != before.len() {
+        return candidate.len() < before.len();
+    }
+
+    let before = drc_severity_profiles(before);
+    let candidate = drc_severity_profiles(candidate);
+    if before.keys().ne(candidate.keys()) {
+        return false;
+    }
+    let mut improved = false;
+    for (identity, before_severity) in &before {
+        let candidate_severity = &candidate[identity];
+        if candidate_severity.len() != before_severity.len() {
+            return false;
+        }
+        for (after, before) in candidate_severity.iter().zip(before_severity) {
+            if after > before {
+                return false;
+            }
+            improved |= after < before;
+        }
+    }
+    improved
+}
+
 /// `metalroute` — a PCB autorouter CLI.
 #[derive(Debug, Parser)]
 #[command(name = "metalroute", version, about = "metalroute PCB autorouter")]
@@ -563,9 +661,10 @@ pub fn route_problem(
     // AUTHORITATIVE GATE: the legaliser lives in `mr-srj` and reconstructs net identity
     // from `PcbTrace::net` (the router's `g<group>` labels), which can differ from the
     // DRC's `c<connectivity_net>` relabelling at shared junction pads. So we gate the
-    // pass against the REAL DRC here: keep the legalised geometry only if it does not
-    // increase the authoritative different-net violation count. This guarantees the pass
-    // can never regress a board, regardless of any net-view mismatch.
+    // pass against the REAL DRC here: fewer complete authoritative findings wins;
+    // equal-count geometry is kept only for a strict, quantised same-identity severity
+    // improvement. This prevents equal-count regression or churn regardless of any
+    // net-view mismatch.
     let traces = if min_clearance > 0.0 {
         let layers = layers.unwrap_or(srj.layer_count).max(1);
         let rules = drc::default_rules(min_clearance);
@@ -582,18 +681,10 @@ pub fn route_problem(
                 t
             })
             .collect();
-        let before = drc_board::solution_to_drc_board(srj, &traces, rules, layers)
-            .check()
-            .iter()
-            .filter(|v| v.nets.0 != v.nets.1)
-            .count();
+        let before = drc_board::solution_to_drc_board(srj, &traces, rules, layers).check();
         let legalised = mr_srj::legalize_clearance(traces.clone(), &srj.obstacles, min_clearance);
-        let after = drc_board::solution_to_drc_board(srj, &legalised, rules, layers)
-            .check()
-            .iter()
-            .filter(|v| v.nets.0 != v.nets.1)
-            .count();
-        if after <= before {
+        let after = drc_board::solution_to_drc_board(srj, &legalised, rules, layers).check();
+        if drc_candidate_is_better(&before, &after) {
             legalised
         } else {
             traces
@@ -1296,6 +1387,96 @@ pub fn run_route_dsn(args: &RouteDsnArgs) -> Result<DsnReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clearance_violation(measured: f64, nets: (&str, &str)) -> mr_drc::Violation {
+        mr_drc::Violation {
+            class: mr_drc::ViolationClass::Clearance,
+            layer: 0,
+            location: (0.0, 0.0),
+            nets: (nets.0.into(), nets.1.into()),
+            measured,
+            required: 0.2,
+        }
+    }
+
+    #[test]
+    fn authoritative_drc_comparator_counts_unknown_net_findings() {
+        // `("", "")` is the serialized representation of two independent unknown
+        // pads. The DRC intentionally considers them foreign, so the gate must not
+        // mistake the equal strings for a same-net pair and filter the finding out.
+        let unknown_pair = clearance_violation(0.05, ("", ""));
+        assert!(drc_candidate_is_better(&[unknown_pair], &[]));
+        assert!(!drc_candidate_is_better(
+            &[],
+            &[clearance_violation(0.05, ("", ""))]
+        ));
+    }
+
+    #[test]
+    fn authoritative_drc_comparator_requires_strict_equal_count_improvement() {
+        let before = [
+            clearance_violation(0.05, ("A", "B")),
+            clearance_violation(0.15, ("C", "D")),
+        ];
+
+        // A uniformly smaller deficit is a useful equal-count repair.
+        let improved = [
+            clearance_violation(0.06, ("A", "B")),
+            clearance_violation(0.16, ("C", "D")),
+        ];
+        assert!(drc_candidate_is_better(&before, &improved));
+        let mut moved_improvement = improved.clone();
+        moved_improvement[0].location = (0.25, -0.10);
+        assert!(
+            drc_candidate_is_better(&before, &moved_improvement),
+            "the same net-pair finding may move while its severity improves"
+        );
+
+        // A new/worse worst finding is not hidden by improving the other one.
+        let traded = [
+            clearance_violation(0.04, ("A", "B")),
+            clearance_violation(0.19, ("C", "D")),
+        ];
+        assert!(!drc_candidate_is_better(&before, &traded));
+
+        // Replacing findings with a different class/layer/net identity is not an
+        // authoritative improvement, even when the replacement is milder.
+        let substituted = [
+            clearance_violation(0.06, ("E", "F")),
+            clearance_violation(0.16, ("G", "H")),
+        ];
+        assert!(!drc_candidate_is_better(&before, &substituted));
+    }
+
+    #[test]
+    fn authoritative_drc_comparator_keeps_fewer_findings_primary() {
+        let before = [
+            clearance_violation(0.15, ("A", "B")),
+            clearance_violation(0.16, ("C", "D")),
+        ];
+
+        let new_identity = [clearance_violation(0.19, ("E", "F"))];
+        assert!(
+            drc_candidate_is_better(&before, &new_identity),
+            "a lower authoritative finding count remains the primary objective"
+        );
+
+        let more_severe = [clearance_violation(0.10, ("A", "B"))];
+        assert!(
+            drc_candidate_is_better(&before, &more_severe),
+            "count reduction wins before severity tie-breaking"
+        );
+    }
+
+    #[test]
+    fn authoritative_drc_comparator_quantises_float_jitter() {
+        let before = [clearance_violation(0.100_000_0, ("A", "B"))];
+        let sub_nanometre_change = [clearance_violation(0.100_000_4, ("A", "B"))];
+        assert!(!drc_candidate_is_better(&before, &sub_nanometre_change));
+
+        let material_change = [clearance_violation(0.100_002_0, ("A", "B"))];
+        assert!(drc_candidate_is_better(&before, &material_change));
+    }
 
     #[cfg(target_os = "macos")]
     use std::{
