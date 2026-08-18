@@ -29,9 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mr_core::LayerMap;
-use mr_drc::{
-    point_seg_dist, DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation, ViolationClass,
-};
+use mr_drc::{DrcBoard, DrcRules, LayerKind, Pad, Segment, Via, Violation, ViolationClass};
 use mr_srj::{BoardOutlineConstraint, PcbTrace, RoutePoint, SimpleRouteJson};
 
 use crate::{BOARD_EDGE_GEOMETRY_EPS_MM, BOARD_EDGE_NET, VIA_DRILL_MM, VIA_PAD_MM};
@@ -49,6 +47,56 @@ fn canonical_coordinate_bits(value: f64) -> u64 {
     } else {
         value.to_bits()
     }
+}
+
+type LayerPointKey = (u64, u64, u32);
+
+fn layer_point_key(point: (f64, f64), layer: u32) -> LayerPointKey {
+    (
+        canonical_coordinate_bits(point.0),
+        canonical_coordinate_bits(point.1),
+        layer,
+    )
+}
+
+fn record_max_cover_width(
+    coverage: &mut HashMap<LayerPointKey, f64>,
+    key: LayerPointKey,
+    width: f64,
+) {
+    coverage
+        .entry(key)
+        .and_modify(|covered| *covered = covered.max(width))
+        .or_insert(width);
+}
+
+fn push_segment_with_endpoint_coverage(
+    segments: &mut Vec<Segment>,
+    coverage: &mut HashMap<LayerPointKey, f64>,
+    segment: Segment,
+) {
+    record_max_cover_width(
+        coverage,
+        layer_point_key(segment.a, segment.layer),
+        segment.width,
+    );
+    record_max_cover_width(
+        coverage,
+        layer_point_key(segment.b, segment.layer),
+        segment.width,
+    );
+    segments.push(segment);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WIRE_DISK_COVERAGE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn keyed_cover_width(coverage: &HashMap<LayerPointKey, f64>, key: &LayerPointKey) -> Option<f64> {
+    #[cfg(test)]
+    WIRE_DISK_COVERAGE_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+    coverage.get(key).copied()
 }
 
 #[derive(Clone, Copy)]
@@ -333,10 +381,10 @@ pub fn solution_to_drc_board(
     // deterministic and same-net immunity holds within each net component.
     for (i, t) in traces.iter().enumerate() {
         let net = net_name[i].clone();
-        let trace_segment_start = segments.len();
-        let trace_via_start = vias.len();
         let mut wire_disks: Vec<(f64, f64, f64, u32)> = Vec::new();
-        let mut wire_disk_index: HashMap<(u64, u64, u32), usize> = HashMap::new();
+        let mut wire_disk_index: HashMap<LayerPointKey, usize> = HashMap::new();
+        let mut segment_cover_width: HashMap<LayerPointKey, f64> = HashMap::new();
+        let mut via_cover_width: HashMap<LayerPointKey, f64> = HashMap::new();
         // Only route terminals establish ownership for an unlabelled legacy pad.
         // The first/last coordinates are fixed by every geometry repair pass.
         for (point, side) in [
@@ -361,11 +409,7 @@ pub fn solution_to_drc_board(
             match rp {
                 RoutePoint::Wire { x, y, width, layer } => {
                     let l = named_layer(layer, &effective_layers);
-                    let disk_key = (
-                        canonical_coordinate_bits(*x),
-                        canonical_coordinate_bits(*y),
-                        l,
-                    );
+                    let disk_key = layer_point_key((*x, *y), l);
                     if let Some(&disk_index) = wire_disk_index.get(&disk_key) {
                         wire_disks[disk_index].2 = wire_disks[disk_index].2.max(*width);
                     } else {
@@ -374,25 +418,33 @@ pub fn solution_to_drc_board(
                     }
                     if let Some((px, py)) = pending_landing.take() {
                         if (px, py) != (*x, *y) {
-                            segments.push(Segment {
-                                net: net.clone(),
-                                layer: l,
-                                a: (px, py),
-                                b: (*x, *y),
-                                width: *width,
-                            });
+                            push_segment_with_endpoint_coverage(
+                                &mut segments,
+                                &mut segment_cover_width,
+                                Segment {
+                                    net: net.clone(),
+                                    layer: l,
+                                    a: (px, py),
+                                    b: (*x, *y),
+                                    width: *width,
+                                },
+                            );
                         }
                     } else if let Some((px, py, pw, pl)) = prev {
                         if pl == l && (px, py) != (*x, *y) {
-                            segments.push(Segment {
-                                net: net.clone(),
-                                layer: l,
-                                a: (px, py),
-                                b: (*x, *y),
-                                // Use the wider of the two endpoints' widths so a
-                                // tapering segment is checked at its fattest.
-                                width: pw.max(*width),
-                            });
+                            push_segment_with_endpoint_coverage(
+                                &mut segments,
+                                &mut segment_cover_width,
+                                Segment {
+                                    net: net.clone(),
+                                    layer: l,
+                                    a: (px, py),
+                                    b: (*x, *y),
+                                    // Use the wider of the two endpoints' widths so a
+                                    // tapering segment is checked at its fattest.
+                                    width: pw.max(*width),
+                                },
+                            );
                         }
                     }
                     prev = Some((*x, *y, *width, l));
@@ -411,14 +463,27 @@ pub fn solution_to_drc_board(
                     // no-op on canonical traces.
                     if let Some((px, py, pw, pl)) = prev.take() {
                         if pl == from && (px, py) != (*x, *y) {
-                            segments.push(Segment {
-                                net: net.clone(),
-                                layer: from,
-                                a: (px, py),
-                                b: (*x, *y),
-                                width: pw,
-                            });
+                            push_segment_with_endpoint_coverage(
+                                &mut segments,
+                                &mut segment_cover_width,
+                                Segment {
+                                    net: net.clone(),
+                                    layer: from,
+                                    a: (px, py),
+                                    b: (*x, *y),
+                                    width: pw,
+                                },
+                            );
                         }
+                    }
+                    let first_layer = from.min(to);
+                    let last_layer = from.max(to);
+                    for layer in first_layer..=last_layer {
+                        record_max_cover_width(
+                            &mut via_cover_width,
+                            layer_point_key((*x, *y), layer),
+                            via_pad_diameter,
+                        );
                     }
                     vias.push(Via {
                         net: net.clone(),
@@ -433,30 +498,25 @@ pub fn solution_to_drc_board(
                 }
             }
         }
-        // Preserve every distinct Wire disk that no emitted leg represents. A
-        // same-trace segment covers it only on the same layer, through its center,
-        // and at sufficient width. A via substitutes only when its coincident pad
-        // spans the layer and covers the disk. This includes isolated route nodes
-        // even when some unrelated leg was emitted elsewhere in the same trace.
-        let trace_segment_end = segments.len();
+        // Preserve every distinct Wire disk that no incident emitted leg or
+        // coincident layer-spanning via represents. Endpoint coverage is recorded
+        // while walking the trace, making these final decisions two O(1)-average
+        // key lookups per disk instead of a nested scan over all segments/vias.
+        // Radius containment allows exactly the shared geometry tolerance, hence
+        // the doubled epsilon after converting the inequality to diameters.
         for (x, y, width, layer) in wire_disks {
-            let covered_by_segment =
-                segments[trace_segment_start..trace_segment_end]
-                    .iter()
-                    .any(|segment| {
-                        segment.layer == layer
-                            && point_seg_dist((x, y), segment.a, segment.b)
-                                <= BOARD_EDGE_GEOMETRY_EPS_MM
-                            && segment.width + BOARD_EDGE_GEOMETRY_EPS_MM >= width
-                    });
-            let covered_by_via = vias[trace_via_start..].iter().any(|via| {
-                let first_layer = via.from_layer.min(via.to_layer);
-                let last_layer = via.from_layer.max(via.to_layer);
-                via.center == (x, y)
-                    && (first_layer..=last_layer).contains(&layer)
-                    && via.pad_diameter + BOARD_EDGE_GEOMETRY_EPS_MM >= width
-            });
-            if !covered_by_segment && !covered_by_via {
+            let key = layer_point_key((x, y), layer);
+            let segment_cover = keyed_cover_width(&segment_cover_width, &key);
+            let via_cover = keyed_cover_width(&via_cover_width, &key);
+            let cover_width = match (segment_cover, via_cover) {
+                (Some(segment), Some(via)) => Some(segment.max(via)),
+                (Some(segment), None) => Some(segment),
+                (None, Some(via)) => Some(via),
+                (None, None) => None,
+            };
+            let is_covered = cover_width
+                .is_some_and(|cover_width| width <= cover_width + 2.0 * BOARD_EDGE_GEOMETRY_EPS_MM);
+            if !is_covered {
                 segments.push(Segment {
                     net: net.clone(),
                     layer,
@@ -1054,6 +1114,74 @@ mod tests {
         assert_eq!(board.segments.len(), 1);
         assert_eq!(board.segments[0].a, board.segments[0].b);
         assert_eq!(board.segments[0].width, 0.6);
+    }
+
+    #[test]
+    fn wire_disk_cover_uses_exact_radius_geometry_tolerance() {
+        let srj = srj_with_narrow_via_and_wide_trace();
+        let project = |width| {
+            let trace = PcbTrace::new(vec![
+                RoutePoint::Wire {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    layer: "top".into(),
+                },
+                RoutePoint::Via {
+                    x: 0.0,
+                    y: 0.0,
+                    from_layer: "top".into(),
+                    to_layer: "bottom".into(),
+                },
+            ]);
+            solution_to_drc_board(
+                &srj,
+                &[trace],
+                DrcRules {
+                    clearance: 0.0,
+                    plane_antipad: 0.0,
+                    min_annular_ring: 0.0,
+                },
+                2,
+            )
+        };
+
+        let at_radius_tolerance = project(0.2 + 2.0 * BOARD_EDGE_GEOMETRY_EPS_MM);
+        assert!(at_radius_tolerance.segments.is_empty());
+
+        let outside_radius_tolerance = project(0.2 + 2.5 * BOARD_EDGE_GEOMETRY_EPS_MM);
+        assert_eq!(outside_radius_tolerance.segments.len(), 1);
+        assert_eq!(outside_radius_tolerance.segments[0].a, (0.0, 0.0));
+        assert_eq!(outside_radius_tolerance.segments[0].b, (0.0, 0.0));
+    }
+
+    #[test]
+    fn wire_disk_projection_uses_two_keyed_lookups_per_unique_node() {
+        const NODE_COUNT: usize = 2_048;
+        let srj = srj_no_obstacles();
+        let route = (0..NODE_COUNT)
+            .map(|i| RoutePoint::Wire {
+                x: i as f64 / 1_000.0,
+                y: 1.0,
+                width: 0.1,
+                layer: "top".into(),
+            })
+            .collect();
+        WIRE_DISK_COVERAGE_LOOKUPS.with(|lookups| lookups.set(0));
+        let board = solution_to_drc_board(
+            &srj,
+            &[PcbTrace::new(route)],
+            DrcRules {
+                clearance: 0.0,
+                plane_antipad: 0.0,
+                min_annular_ring: 0.0,
+            },
+            1,
+        );
+        let coverage_lookups = WIRE_DISK_COVERAGE_LOOKUPS.with(|lookups| lookups.get());
+
+        assert_eq!(board.segments.len(), NODE_COUNT - 1);
+        assert_eq!(coverage_lookups, 2 * NODE_COUNT);
     }
 
     #[test]
