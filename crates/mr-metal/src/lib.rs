@@ -221,10 +221,9 @@ impl MetalRouter {
 
 /// Bound temporary GPU working sets while leaving enough independent fields to
 /// saturate Apple GPUs. Each field needs a distance plane and, when pad costs
-/// differ, a cost plane. A batch is capped at 16M cells (64 MiB per such
-/// buffer); M4 also carries a hop-count plane. A single larger field runs alone
-/// and is separately checked against the device's reported maximum buffer
-/// length.
+/// differ, a cost plane. A batch is normally capped at 16M cells (64 MiB per
+/// such buffer); the ragged path API may plan one larger field only when its
+/// aggregate host + Metal working set also clears the explicit safety cap.
 const MAX_BATCH_CELLS: usize = 16 * 1024 * 1024;
 const MAX_FIELDS_PER_BATCH: usize = 256;
 /// The nested-vector API must retain every completed field at once. Bound that
@@ -244,6 +243,22 @@ fn validate_public_result_shape(cells_per_field: usize, fields: usize) -> Result
     if fields > MAX_PUBLIC_FIELDS || total > MAX_PUBLIC_RESULT_CELLS.max(cells_per_field) {
         return Err(RouterError::BackendUnavailable(format!(
             "Metal result would contain {fields} fields / {total} cells; use smaller source chunks"
+        )));
+    }
+    Ok(())
+}
+
+/// Bound the compact paths retained across every ragged chunk. A routed path is
+/// simple and cannot contain more cells than its submitted window, so the sum of
+/// window cells is a safe allocation-free upper bound for the call-wide result.
+/// Unlike [`validate_public_result_shape`], this contract is strict even for one
+/// large field: the ragged working-set preflight already decides whether that field
+/// is safe to execute, while this independently bounds the result kept until return.
+#[cfg(target_os = "macos")]
+fn validate_ragged_result_shape(fields: usize, max_path_cells: usize) -> Result<(), RouterError> {
+    if fields > MAX_PUBLIC_FIELDS || max_path_cells > MAX_PUBLIC_RESULT_CELLS {
+        return Err(RouterError::BackendUnavailable(format!(
+            "ragged Metal result could retain {fields} fields / {max_path_cells} path cells"
         )));
     }
     Ok(())
@@ -618,7 +633,7 @@ fn ragged_chunk_shape(
         };
         // Preserve the established single-large-field behavior. A field above
         // the normal working-set target runs alone, but only after the caller's
-        // device preflight approves its concrete buffers.
+        // aggregate and device preflight approve its concrete buffers.
         if batch_end > batch_start && combined.packed_cells > MAX_BATCH_CELLS {
             break;
         }
@@ -722,10 +737,21 @@ fn ragged_isolated_batch_impl(
         return Ok((Vec::new(), RaggedRouteStats::default()));
     }
 
+    // Results from completed chunks remain live in `output` until the whole call
+    // returns. Bound their worst-case total before reserving output or packing any
+    // chunk; per-chunk GPU caps alone cannot constrain this retained allocation.
+    let mut max_path_cells = 0usize;
+    for &window in windows {
+        max_path_cells = max_path_cells
+            .checked_add(ragged_window_shape(dims, window)?.packed_cells)
+            .ok_or_else(|| unavailable("ragged isolated retained paths are too large".into()))?;
+    }
+    validate_ragged_result_shape(nets.len(), max_path_cells)?;
+
     // Validate every chunk before allocating any derived edge/output vector or
     // packed cost plane. In particular, the normal working-set cap deliberately
     // admits one larger field; this pass makes that field conditional on the
-    // shader index domain and the selected device's actual buffer limit.
+    // aggregate safety cap, shader index domain, and selected device's buffer limit.
     let mut preflight_start = 0usize;
     while preflight_start < nets.len() {
         let (preflight_end, shape) = ragged_chunk_shape(dims, windows, preflight_start)?;
@@ -2057,6 +2083,29 @@ mod tests {
             err,
             RouterError::BackendUnavailable(message)
                 if message.contains("exceeds 32-bit shader indexing")
+        ));
+    }
+
+    #[test]
+    fn ragged_result_preflight_bounds_cross_chunk_retention_without_allocating() {
+        let cross_chunk_fields = MAX_FIELDS_PER_BATCH + 1;
+        assert!(validate_ragged_result_shape(cross_chunk_fields, MAX_PUBLIC_RESULT_CELLS).is_ok());
+
+        let too_many_cells =
+            validate_ragged_result_shape(cross_chunk_fields, MAX_PUBLIC_RESULT_CELLS + 1)
+                .unwrap_err();
+        assert!(matches!(
+            too_many_cells,
+            RouterError::BackendUnavailable(message)
+                if message.contains("could retain")
+        ));
+
+        let too_many_fields =
+            validate_ragged_result_shape(MAX_PUBLIC_FIELDS + 1, cross_chunk_fields).unwrap_err();
+        assert!(matches!(
+            too_many_fields,
+            RouterError::BackendUnavailable(message)
+                if message.contains("could retain")
         ));
     }
 

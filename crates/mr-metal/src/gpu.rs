@@ -785,6 +785,29 @@ pub(crate) struct RaggedBatchShape {
     pub(crate) max_field_cells: usize,
 }
 
+/// Conservative cap for one ragged chunk's simultaneous *additional* host and
+/// Metal allocations. This is deliberately independent of
+/// `MTLDevice::maxBufferLength`: that property limits one buffer, not the several
+/// packed planes and host mirrors which coexist during route reconstruction.
+const MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+// Peak allocation accounting used by `ragged_aggregate_working_set_bytes`:
+//
+// * 36 bytes / packed cell: host packed-cost, distance-init and hop-init planes;
+//   Metal cost, distance and hop planes; plus three conservative reconstruction /
+//   readback path planes.
+// * 32 bytes / row or column: one 16-byte descriptor on host and in Metal.
+// * 128 bytes / field: host + Metal field descriptors, length/cost/offset metadata,
+//   nested result bookkeeping, and alignment/headroom.
+// * x/y edges need one Metal u32 copy. Via prices and permissions have both the
+//   derived host vectors and Metal copies (four u32 words per layer gap total).
+const RAGGED_PACKED_CELL_PEAK_BYTES: usize = 9 * std::mem::size_of::<u32>();
+const RAGGED_LINE_PEAK_BYTES: usize = 2 * std::mem::size_of::<RaggedLine>();
+const RAGGED_FIELD_PEAK_BYTES: usize = 128;
+const RAGGED_EDGE_PEAK_BYTES: usize = std::mem::size_of::<u32>();
+const RAGGED_VIA_PEAK_BYTES: usize = 4 * std::mem::size_of::<u32>();
+const RAGGED_FIXED_OVERHEAD_BYTES: usize = 4096;
+
 /// A cached Metal context (device + queue + compiled pipelines).
 struct MetalCtx {
     device: Device,
@@ -1003,6 +1026,55 @@ fn validate_ragged_index_shape(shape: RaggedBatchShape) -> Result<(), RouterErro
     Ok(())
 }
 
+/// Allocation-free upper bound for all transient allocations that can coexist while
+/// one ragged chunk is solved and reconstructed. Checked arithmetic is mandatory at
+/// this boundary: an overflow is itself an unsafe resource request and must trigger
+/// the caller's CPU fallback before any derived vector or Metal buffer is allocated.
+fn ragged_aggregate_working_set_bytes(
+    shape: RaggedBatchShape,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+) -> Result<usize, RouterError> {
+    let too_large =
+        || RouterError::BackendUnavailable("ragged aggregate working set is too large".into());
+    let scaled = |count: usize, bytes: usize| count.checked_mul(bytes).ok_or_else(&too_large);
+
+    let line_count = shape
+        .row_lines
+        .checked_add(shape.col_lines)
+        .ok_or_else(&too_large)?;
+    let planar_edges = x_elements.checked_add(y_elements).ok_or_else(&too_large)?;
+
+    [
+        scaled(shape.packed_cells, RAGGED_PACKED_CELL_PEAK_BYTES)?,
+        scaled(line_count, RAGGED_LINE_PEAK_BYTES)?,
+        scaled(shape.fields, RAGGED_FIELD_PEAK_BYTES)?,
+        scaled(planar_edges, RAGGED_EDGE_PEAK_BYTES)?,
+        scaled(via_elements, RAGGED_VIA_PEAK_BYTES)?,
+    ]
+    .into_iter()
+    .try_fold(RAGGED_FIXED_OVERHEAD_BYTES, |total, bytes| {
+        total.checked_add(bytes).ok_or_else(&too_large)
+    })
+}
+
+fn validate_ragged_aggregate_working_set(
+    shape: RaggedBatchShape,
+    x_elements: usize,
+    y_elements: usize,
+    via_elements: usize,
+) -> Result<(), RouterError> {
+    let bytes = ragged_aggregate_working_set_bytes(shape, x_elements, y_elements, via_elements)?;
+    if bytes > MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES {
+        return Err(RouterError::BackendUnavailable(format!(
+            "ragged aggregate working set needs {bytes} bytes; safety cap is \
+             {MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_ragged_batch_buffers(
     device: &Device,
     shape: RaggedBatchShape,
@@ -1042,9 +1114,9 @@ fn validate_ragged_batch_buffers(
 }
 
 /// Validate an allocation-free cropped-batch plan against both the shader's
-/// 32-bit index domain and every Metal buffer it can create. Callers use this
-/// before reserving or packing the cost plane, so an oversized single field is
-/// still supported when the selected device can actually hold it.
+/// 32-bit index domain, the aggregate working-set cap, and every Metal buffer it
+/// can create. Callers use this before reserving or packing the cost plane, so an
+/// oversized single field is still supported when all resource checks approve it.
 pub(crate) fn preflight_ragged_edge_batch(
     grid: &Grid,
     shape: RaggedBatchShape,
@@ -1065,6 +1137,7 @@ pub(crate) fn preflight_ragged_edge_batch(
     if shape.fields == 0 {
         return Ok(());
     }
+    validate_ragged_aggregate_working_set(shape, x_elements, y_elements, via_elements)?;
     autoreleasepool(|| {
         with_metal_ctx(|ctx| {
             validate_ragged_batch_buffers(
@@ -1973,6 +2046,62 @@ pub fn sweep_field(grid: &Grid, src: CellIdx) -> Result<Vec<Cost>, RouterError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ragged_aggregate_cap_has_allocation_free_exact_boundary() {
+        let fixed =
+            RAGGED_FIXED_OVERHEAD_BYTES + 2 * RAGGED_LINE_PEAK_BYTES + RAGGED_FIELD_PEAK_BYTES;
+        let safe_cells =
+            (MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES - fixed) / RAGGED_PACKED_CELL_PEAK_BYTES;
+        let boundary_edge_elements = (MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES
+            - fixed
+            - safe_cells * RAGGED_PACKED_CELL_PEAK_BYTES)
+            / RAGGED_EDGE_PEAK_BYTES;
+        let shape = |packed_cells| RaggedBatchShape {
+            fields: 1,
+            packed_cells,
+            row_lines: 1,
+            col_lines: 1,
+            max_plane: packed_cells,
+            max_field_cells: packed_cells,
+        };
+
+        let safe = shape(safe_cells);
+        validate_ragged_index_shape(safe).unwrap();
+        assert_eq!(
+            ragged_aggregate_working_set_bytes(safe, boundary_edge_elements, 0, 0).unwrap(),
+            MAX_RAGGED_AGGREGATE_WORKING_SET_BYTES
+        );
+        assert!(validate_ragged_aggregate_working_set(safe, boundary_edge_elements, 0, 0).is_ok());
+
+        let over = shape(safe_cells + 1);
+        validate_ragged_index_shape(over).unwrap();
+        let error =
+            validate_ragged_aggregate_working_set(over, boundary_edge_elements, 0, 0).unwrap_err();
+        assert!(matches!(
+            error,
+            RouterError::BackendUnavailable(message)
+                if message.contains("aggregate working set needs")
+        ));
+    }
+
+    #[test]
+    fn ragged_aggregate_cap_preserves_extreme_normal_chunk_without_allocating() {
+        // The descriptor-heavy 1x1xN extreme has two line descriptors and one via
+        // gap per packed cell. Even this worst normal 16M-cell shape must continue
+        // to fit; only the formerly unbounded oversized-single-field path is gated.
+        let shape = RaggedBatchShape {
+            fields: 1,
+            packed_cells: super::super::MAX_BATCH_CELLS,
+            row_lines: super::super::MAX_BATCH_CELLS,
+            col_lines: super::super::MAX_BATCH_CELLS,
+            max_plane: 1,
+            max_field_cells: super::super::MAX_BATCH_CELLS,
+        };
+        validate_ragged_index_shape(shape).unwrap();
+        validate_ragged_aggregate_working_set(shape, 0, 0, super::super::MAX_BATCH_CELLS - 1)
+            .unwrap();
+    }
 
     #[test]
     fn command_status_requires_successful_completion() {
