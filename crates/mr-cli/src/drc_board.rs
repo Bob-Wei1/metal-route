@@ -502,8 +502,9 @@ pub fn solution_to_drc_board(
         // coincident layer-spanning via represents. Endpoint coverage is recorded
         // while walking the trace, making these final decisions two O(1)-average
         // key lookups per disk instead of a nested scan over all segments/vias.
-        // Radius containment allows exactly the shared geometry tolerance, hence
-        // the doubled epsilon after converting the inequality to diameters.
+        // Substitution requires exact physical containment: applying checker
+        // tolerance here as well could hide a Wire that independently fails the
+        // board-edge check by that additional radius.
         for (x, y, width, layer) in wire_disks {
             let key = layer_point_key((x, y), layer);
             let segment_cover = keyed_cover_width(&segment_cover_width, &key);
@@ -514,8 +515,7 @@ pub fn solution_to_drc_board(
                 (None, Some(via)) => Some(via),
                 (None, None) => None,
             };
-            let is_covered = cover_width
-                .is_some_and(|cover_width| width <= cover_width + 2.0 * BOARD_EDGE_GEOMETRY_EPS_MM);
+            let is_covered = cover_width.is_some_and(|cover_width| width <= cover_width);
             if !is_covered {
                 segments.push(Segment {
                     net: net.clone(),
@@ -1117,18 +1117,29 @@ mod tests {
     }
 
     #[test]
-    fn wire_disk_cover_uses_exact_radius_geometry_tolerance() {
+    fn wire_disk_cover_requires_exact_physical_containment() {
         let srj = srj_with_narrow_via_and_wide_trace();
-        let project = |width| {
+        let via_pad_diameter = srj
+            .uniform_physical_rules()
+            .expect("complete physical profile")
+            .via_pad_diameter_mm;
+        let edge_clearance = srj.physical_rules.min_board_edge_clearance.unwrap();
+        let distance_to_edge = edge_clearance + via_pad_diameter / 2.0 - BOARD_EDGE_GEOMETRY_EPS_MM;
+        let boundary_center_x = srj.bounds.max_x - distance_to_edge;
+        // Move one representable value inward so the checker's inclusive
+        // `measured + EPS >= required` realizes the mathematical boundary rather
+        // than falling below it by a final floating-point rounding bit.
+        let center_x = f64::from_bits(boundary_center_x.to_bits() - 1);
+        let project = |wire_width| {
             let trace = PcbTrace::new(vec![
                 RoutePoint::Wire {
-                    x: 0.0,
+                    x: center_x,
                     y: 0.0,
-                    width,
+                    width: wire_width,
                     layer: "top".into(),
                 },
                 RoutePoint::Via {
-                    x: 0.0,
+                    x: center_x,
                     y: 0.0,
                     from_layer: "top".into(),
                     to_layer: "bottom".into(),
@@ -1146,13 +1157,18 @@ mod tests {
             )
         };
 
-        let at_radius_tolerance = project(0.2 + 2.0 * BOARD_EDGE_GEOMETRY_EPS_MM);
-        assert!(at_radius_tolerance.segments.is_empty());
+        let equal_width = project(via_pad_diameter);
+        assert!(equal_width.segments.is_empty());
+        let equal_findings = check_with_srj_rules(&srj, &equal_width);
+        assert!(equal_findings.is_empty(), "{equal_findings:#?}");
 
-        let outside_radius_tolerance = project(0.2 + 2.5 * BOARD_EDGE_GEOMETRY_EPS_MM);
-        assert_eq!(outside_radius_tolerance.segments.len(), 1);
-        assert_eq!(outside_radius_tolerance.segments[0].a, (0.0, 0.0));
-        assert_eq!(outside_radius_tolerance.segments[0].b, (0.0, 0.0));
+        let wider_wire = project(via_pad_diameter + 2.0 * BOARD_EDGE_GEOMETRY_EPS_MM);
+        assert_eq!(wider_wire.segments.len(), 1);
+        assert_eq!(wider_wire.segments[0].a, (center_x, 0.0));
+        assert_eq!(wider_wire.segments[0].b, (center_x, 0.0));
+        let findings = check_with_srj_rules(&srj, &wider_wire);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].nets.1, BOARD_EDGE_NET);
     }
 
     #[test]
