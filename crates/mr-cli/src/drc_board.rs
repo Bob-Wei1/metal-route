@@ -176,14 +176,27 @@ pub fn solution_to_drc_board(
             };
             tagged_vertices.push((x, y, net.clone()));
         }
-        // Walk the route, emitting one Segment per consecutive Wire pair on the
-        // same layer, and one Via per Via point.
+        // Walk the route, emitting every physical wire leg and one Via per Via
+        // point. `to_solution_layered` compresses a vertical run into a Via and
+        // intentionally omits the coincident destination-layer landing Wire, so
+        // `pending_landing` carries the via center to the next emitted Wire.
         let mut prev: Option<(f64, f64, f64, u32)> = None; // x, y, width, layer
+        let mut pending_landing: Option<(f64, f64)> = None;
         for rp in &t.route {
             match rp {
                 RoutePoint::Wire { x, y, width, layer } => {
                     let l = idx.intern(layer);
-                    if let Some((px, py, pw, pl)) = prev {
+                    if let Some((px, py)) = pending_landing.take() {
+                        if (px, py) != (*x, *y) {
+                            segments.push(Segment {
+                                net: net.clone(),
+                                layer: l,
+                                a: (px, py),
+                                b: (*x, *y),
+                                width: *width,
+                            });
+                        }
+                    } else if let Some((px, py, pw, pl)) = prev {
                         if pl == l && (px, py) != (*x, *y) {
                             segments.push(Segment {
                                 net: net.clone(),
@@ -206,6 +219,21 @@ pub fn solution_to_drc_board(
                 } => {
                     let from = idx.intern(from_layer);
                     let to = idx.intern(to_layer);
+                    // Hand-built/external soups may omit the source landing as well.
+                    // Materialize that leg using the last known wire width; normal
+                    // metalroute output has a coincident source Wire, so this is a
+                    // no-op on canonical traces.
+                    if let Some((px, py, pw, pl)) = prev.take() {
+                        if pl == from && (px, py) != (*x, *y) {
+                            segments.push(Segment {
+                                net: net.clone(),
+                                layer: from,
+                                a: (px, py),
+                                b: (*x, *y),
+                                width: pw,
+                            });
+                        }
+                    }
                     vias.push(Via {
                         net: net.clone(),
                         center: (*x, *y),
@@ -215,9 +243,7 @@ pub fn solution_to_drc_board(
                         to_layer: to,
                         antipad_radius: None,
                     });
-                    // A via does not break the wire polyline's layer continuity in
-                    // the SRJ soup (the next Wire carries its own layer), so we do
-                    // NOT update `prev` from a via.
+                    pending_landing = Some((*x, *y));
                 }
             }
         }
@@ -571,5 +597,71 @@ mod tests {
         assert_eq!(board.vias[0].drill_diameter, VIA_DRILL_MM);
         // 0.45/0.2 via → annular ring 0.125 > 0.05, so no annular violation.
         assert!(board.check().is_empty());
+    }
+
+    /// `to_solution_layered` intentionally omits the wire vertex coincident with a
+    /// via's destination landing. The DRC bridge must still materialize the copper
+    /// leg from the via center to the first destination-layer wire.
+    #[test]
+    fn compressed_via_destination_leg_is_drc_checked() {
+        let srj = srj_no_obstacles();
+        let routed = PcbTrace::new(vec![
+            RoutePoint::Wire {
+                x: 0.0,
+                y: 0.0,
+                width: 0.1,
+                layer: "top".into(),
+            },
+            RoutePoint::Via {
+                x: 0.0,
+                y: 0.0,
+                from_layer: "top".into(),
+                to_layer: "bottom".into(),
+            },
+            RoutePoint::Wire {
+                x: 2.0,
+                y: 0.0,
+                width: 0.1,
+                layer: "bottom".into(),
+            },
+        ])
+        .with_net("A");
+        let crossing = PcbTrace::new(vec![
+            RoutePoint::Wire {
+                x: 1.0,
+                y: -0.1,
+                width: 0.1,
+                layer: "bottom".into(),
+            },
+            RoutePoint::Wire {
+                x: 1.0,
+                y: 0.1,
+                width: 0.1,
+                layer: "bottom".into(),
+            },
+        ])
+        .with_net("B");
+        let rules = DrcRules {
+            clearance: 0.2,
+            plane_antipad: 0.25,
+            min_annular_ring: 0.05,
+        };
+
+        let board = solution_to_drc_board(&srj, &[routed, crossing], rules, 2);
+        assert!(
+            board.segments.iter().any(|segment| {
+                segment.net == "A" && segment.a == (0.0, 0.0) && segment.b == (2.0, 0.0)
+            }),
+            "destination-layer copper from the compressed via landing was omitted"
+        );
+        assert_eq!(
+            board
+                .check()
+                .iter()
+                .filter(|violation| violation.class == ViolationClass::Clearance)
+                .count(),
+            1,
+            "the omitted destination leg crosses foreign bottom-layer copper"
+        );
     }
 }
