@@ -4,6 +4,7 @@
 //! module owns the continuous polygon semantics used to build those masks and to
 //! validate emitted trace capsules / via disks, keeping the two decisions identical.
 
+use mr_core::Grid;
 use mr_drc::{point_seg_dist, seg_seg_dist};
 
 use crate::{Bounds, OutlinePoint, SimpleRouteJson};
@@ -213,6 +214,271 @@ impl BoardOutlineConstraint {
         finite_point(point)
             && point_in_polygon(point, &self.vertices)
             && min_point_edge_distance(point, &self.vertices) + GEOMETRY_EPS >= required
+    }
+
+    /// Rasterise the layer-invariant board mask once.
+    ///
+    /// The public continuous predicates above deliberately remain the simple,
+    /// authoritative reference implementation used by DRC. Routing grids can
+    /// contain hundreds of thousands of planar nodes, though, so rescanning every
+    /// polygon edge for every node and planar step is prohibitively expensive for
+    /// detailed mechanical outlines. This projection keeps the exact predicates
+    /// for every final candidate while a deterministic row/column index excludes
+    /// only edges whose axis-aligned separation already exceeds the largest
+    /// possible keepout. The index is therefore a conservative superset of every
+    /// edge that could change an answer.
+    pub(crate) fn raster_mask_plane(&self, x_lines: &[f64], y_lines: &[f64]) -> Vec<u8> {
+        OutlineRasterIndex::new(self, x_lines, y_lines).raster_mask()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexedOutlineEdge {
+    a: Point,
+    b: Point,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+impl IndexedOutlineEdge {
+    fn new(a: Point, b: Point) -> Self {
+        Self {
+            a,
+            b,
+            min_x: a.0.min(b.0),
+            max_x: a.0.max(b.0),
+            min_y: a.1.min(b.1),
+            max_y: a.1.max(b.1),
+        }
+    }
+}
+
+/// Deterministic scanline index used only by board-mask projection.
+///
+/// Edge ids are appended in polygon order, so every exact predicate visits its
+/// conservative candidate set in the same order as [`polygon_edges`]. `rows[y]`
+/// contains every edge whose y-range lies within `query_radius` of `y_lines[y]`;
+/// `columns[x]` is the analogous x-range index. A second axis-separation check at
+/// query time turns these scanline buckets into a small spatial candidate set.
+struct OutlineRasterIndex<'a> {
+    outline: &'a BoardOutlineConstraint,
+    x_lines: &'a [f64],
+    y_lines: &'a [f64],
+    edges: Vec<IndexedOutlineEdge>,
+    rows: Vec<Vec<usize>>,
+    columns: Vec<Vec<usize>>,
+    query_radius: f64,
+}
+
+impl<'a> OutlineRasterIndex<'a> {
+    fn new(outline: &'a BoardOutlineConstraint, x_lines: &'a [f64], y_lines: &'a [f64]) -> Self {
+        let edges: Vec<_> = polygon_edges(&outline.vertices)
+            .map(|(a, b)| IndexedOutlineEdge::new(a, b))
+            .collect();
+        let query_radius = outline
+            .trace_keepout_mm()
+            .max(outline.via_keepout_mm())
+            .max(GEOMETRY_EPS);
+        let mut rows = vec![Vec::new(); y_lines.len()];
+        let mut columns = vec![Vec::new(); x_lines.len()];
+
+        // Build by ascending edge id so candidate iteration is stable and mirrors
+        // the naive polygon scan. The extra epsilon makes range admission robust at
+        // the exact clearance boundary; final acceptance still uses the original
+        // distance + GEOMETRY_EPS comparison.
+        let indexed_radius = query_radius + GEOMETRY_EPS;
+        for (edge_id, edge) in edges.iter().enumerate() {
+            for (row, &y) in y_lines.iter().enumerate() {
+                if axis_interval_distance(y, edge.min_y, edge.max_y) <= indexed_radius {
+                    rows[row].push(edge_id);
+                }
+            }
+            for (column, &x) in x_lines.iter().enumerate() {
+                if axis_interval_distance(x, edge.min_x, edge.max_x) <= indexed_radius {
+                    columns[column].push(edge_id);
+                }
+            }
+        }
+
+        Self {
+            outline,
+            x_lines,
+            y_lines,
+            edges,
+            rows,
+            columns,
+            query_radius,
+        }
+    }
+
+    fn raster_mask(&self) -> Vec<u8> {
+        let width = self.x_lines.len();
+        let height = self.y_lines.len();
+        let mut mask = vec![0u8; width.saturating_mul(height)];
+        let mut inside = vec![false; mask.len()];
+
+        for (y, &physical_y) in self.y_lines.iter().enumerate() {
+            for (x, &physical_x) in self.x_lines.iter().enumerate() {
+                let index = y * width + x;
+                let point = (physical_x, physical_y);
+                let legality = self.point_legality(point, y);
+                inside[index] = legality.inside;
+                if !legality.trace {
+                    mask[index] |= Grid::BOARD_TRACE_NODE;
+                }
+                if !legality.via {
+                    mask[index] |= Grid::BOARD_VIA_NODE;
+                }
+
+                if x > 0 {
+                    let left = index - 1;
+                    let left_point = (self.x_lines[x - 1], physical_y);
+                    if !inside[left]
+                        || !legality.inside
+                        || !self.horizontal_segment_is_legal(left_point, point, y)
+                    {
+                        mask[left] |= Grid::BOARD_EDGE_POS_X;
+                        mask[index] |= Grid::BOARD_EDGE_NEG_X;
+                    }
+                }
+                if y > 0 {
+                    let above = index - width;
+                    let above_point = (physical_x, self.y_lines[y - 1]);
+                    if !inside[above]
+                        || !legality.inside
+                        || !self.vertical_segment_is_legal(above_point, point, x)
+                    {
+                        mask[above] |= Grid::BOARD_EDGE_POS_Y;
+                        mask[index] |= Grid::BOARD_EDGE_NEG_Y;
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// Resolve containment, trace-centre clearance, and via-centre clearance in
+    /// one candidate scan. The old projection recomputed containment and the
+    /// minimum edge distance independently for both feature radii.
+    fn point_legality(&self, point: Point, row: usize) -> PointLegality {
+        let candidates = &self.rows[row];
+        let inside = self.point_in_polygon(point, candidates);
+        if !inside {
+            return PointLegality {
+                inside: false,
+                trace: false,
+                via: false,
+            };
+        }
+
+        let trace_required = self.outline.trace_keepout_mm();
+        let via_required = self.outline.via_keepout_mm();
+        let mut trace = true;
+        let mut via = true;
+        let axis_limit = self.query_radius + GEOMETRY_EPS;
+        for &edge_id in candidates {
+            let edge = self.edges[edge_id];
+            if axis_interval_distance(point.0, edge.min_x, edge.max_x) > axis_limit {
+                continue;
+            }
+            let distance = point_seg_dist(point, edge.a, edge.b);
+            if distance + GEOMETRY_EPS < trace_required {
+                trace = false;
+            }
+            if distance + GEOMETRY_EPS < via_required {
+                via = false;
+            }
+            if !trace && !via {
+                break;
+            }
+        }
+        PointLegality { inside, trace, via }
+    }
+
+    /// Exact point-in-polygon semantics over a conservative row bucket.
+    fn point_in_polygon(&self, point: Point, candidates: &[usize]) -> bool {
+        if !finite_point(point) {
+            return false;
+        }
+        if candidates.iter().copied().any(|edge_id| {
+            let edge = self.edges[edge_id];
+            point_seg_dist(point, edge.a, edge.b) <= GEOMETRY_EPS
+        }) {
+            return true;
+        }
+
+        let mut inside = false;
+        for &edge_id in candidates {
+            let edge = self.edges[edge_id];
+            let crosses_y = (edge.a.1 > point.1) != (edge.b.1 > point.1);
+            if crosses_y {
+                let x_cross =
+                    edge.a.0 + (point.1 - edge.a.1) * (edge.b.0 - edge.a.0) / (edge.b.1 - edge.a.1);
+                if x_cross > point.0 {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    fn horizontal_segment_is_legal(&self, a: Point, b: Point, row: usize) -> bool {
+        self.segment_is_legal(a, b, &self.rows[row])
+    }
+
+    fn vertical_segment_is_legal(&self, a: Point, b: Point, column: usize) -> bool {
+        self.segment_is_legal(a, b, &self.columns[column])
+    }
+
+    /// Check only edges whose AABB is close enough to the segment AABB to
+    /// possibly violate clearance, then apply the authoritative exact distance.
+    fn segment_is_legal(&self, a: Point, b: Point, candidates: &[usize]) -> bool {
+        let required = self.outline.trace_keepout_mm();
+        let candidate_limit = required + GEOMETRY_EPS;
+        let min_x = a.0.min(b.0);
+        let max_x = a.0.max(b.0);
+        let min_y = a.1.min(b.1);
+        let max_y = a.1.max(b.1);
+        candidates.iter().copied().all(|edge_id| {
+            let edge = self.edges[edge_id];
+            if interval_distance(min_x, max_x, edge.min_x, edge.max_x) > candidate_limit
+                || interval_distance(min_y, max_y, edge.min_y, edge.max_y) > candidate_limit
+            {
+                return true;
+            }
+            seg_seg_dist(a, b, edge.a, edge.b) + GEOMETRY_EPS >= required
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PointLegality {
+    inside: bool,
+    trace: bool,
+    via: bool,
+}
+
+#[inline]
+fn axis_interval_distance(value: f64, min: f64, max: f64) -> f64 {
+    if value < min {
+        min - value
+    } else if value > max {
+        value - max
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn interval_distance(a_min: f64, a_max: f64, b_min: f64, b_max: f64) -> f64 {
+    if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        0.0
     }
 }
 

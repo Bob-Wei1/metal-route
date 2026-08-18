@@ -1796,36 +1796,10 @@ fn apply_board_outline_constraint(
     };
 
     let dims = mapping.dims;
-    let mut mask = vec![0u8; dims.len()];
-    for layer in 0..dims.layers {
-        for y in 0..dims.h {
-            for x in 0..dims.w {
-                let cell = dims.idx3(x, y, layer);
-                let point = (mapping.x_lines[x as usize], mapping.y_lines[y as usize]);
-                if !constraint.trace_point_is_legal(point) {
-                    mask[cell as usize] |= Grid::BOARD_TRACE_NODE;
-                }
-                if !constraint.via_point_is_legal(point) {
-                    mask[cell as usize] |= Grid::BOARD_VIA_NODE;
-                }
-                if x + 1 < dims.w {
-                    let right = dims.idx3(x + 1, y, layer);
-                    let right_point = (mapping.x_lines[x as usize + 1], point.1);
-                    if !constraint.trace_segment_is_legal(point, right_point) {
-                        mask[cell as usize] |= Grid::BOARD_EDGE_POS_X;
-                        mask[right as usize] |= Grid::BOARD_EDGE_NEG_X;
-                    }
-                }
-                if y + 1 < dims.h {
-                    let down = dims.idx3(x, y + 1, layer);
-                    let down_point = (point.0, mapping.y_lines[y as usize + 1]);
-                    if !constraint.trace_segment_is_legal(point, down_point) {
-                        mask[cell as usize] |= Grid::BOARD_EDGE_POS_Y;
-                        mask[down as usize] |= Grid::BOARD_EDGE_NEG_Y;
-                    }
-                }
-            }
-        }
+    let plane = constraint.raster_mask_plane(&mapping.x_lines, &mapping.y_lines);
+    let mut mask = Vec::with_capacity(dims.len());
+    for _ in 0..dims.layers {
+        mask.extend_from_slice(&plane);
     }
     grid.board_constraint = mask;
 }
@@ -5551,6 +5525,294 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The exact pre-index projection retained as a test oracle. Keep this visibly
+    /// literal: equivalence tests should fail if an indexed candidate filter ever
+    /// drops an edge that can change the authoritative continuous result.
+    fn naive_board_outline_mask(mapping: &Mapping, constraint: &BoardOutlineConstraint) -> Vec<u8> {
+        let dims = mapping.dims;
+        let mut mask = vec![0u8; dims.len()];
+        for layer in 0..dims.layers {
+            for y in 0..dims.h {
+                for x in 0..dims.w {
+                    let cell = dims.idx3(x, y, layer);
+                    let point = (mapping.x_lines[x as usize], mapping.y_lines[y as usize]);
+                    if !constraint.trace_point_is_legal(point) {
+                        mask[cell as usize] |= Grid::BOARD_TRACE_NODE;
+                    }
+                    if !constraint.via_point_is_legal(point) {
+                        mask[cell as usize] |= Grid::BOARD_VIA_NODE;
+                    }
+                    if x + 1 < dims.w {
+                        let right = dims.idx3(x + 1, y, layer);
+                        let right_point = (mapping.x_lines[x as usize + 1], point.1);
+                        if !constraint.trace_segment_is_legal(point, right_point) {
+                            mask[cell as usize] |= Grid::BOARD_EDGE_POS_X;
+                            mask[right as usize] |= Grid::BOARD_EDGE_NEG_X;
+                        }
+                    }
+                    if y + 1 < dims.h {
+                        let down = dims.idx3(x, y + 1, layer);
+                        let down_point = (point.0, mapping.y_lines[y as usize + 1]);
+                        if !constraint.trace_segment_is_legal(point, down_point) {
+                            mask[cell as usize] |= Grid::BOARD_EDGE_POS_Y;
+                            mask[down as usize] |= Grid::BOARD_EDGE_NEG_Y;
+                        }
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    fn indexed_board_outline_mask(
+        mapping: &Mapping,
+        constraint: &BoardOutlineConstraint,
+    ) -> Vec<u8> {
+        let mut grid = Grid::filled(mapping.dims, 1);
+        apply_board_outline_constraint(&mut grid, mapping, Ok(Some(constraint.clone())));
+        grid.board_constraint
+    }
+
+    #[derive(Clone, Copy)]
+    struct DeterministicRng(u64);
+
+    impl DeterministicRng {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+        }
+
+        fn range(&mut self, min: f64, max: f64) -> f64 {
+            min + (max - min) * self.next_f64()
+        }
+    }
+
+    fn sorted_unique(mut values: Vec<f64>) -> Vec<f64> {
+        values.sort_by(f64::total_cmp);
+        values.dedup_by(|a, b| *a == *b);
+        values
+    }
+
+    fn add_probe(lines_x: &mut Vec<f64>, lines_y: &mut Vec<f64>, point: (f64, f64)) {
+        lines_x.push(point.0);
+        lines_y.push(point.1);
+    }
+
+    #[test]
+    fn indexed_board_outline_mask_matches_naive_random_concave_polygons() {
+        let mut rng = DeterministicRng(0x4d45_5441_4c52_4f55);
+        for case in 0..32usize {
+            let vertex_count = 6 + case % 13;
+            let rotation = rng.range(-0.4, 0.4);
+            let mut vertices = Vec::with_capacity(vertex_count);
+            for vertex in 0..vertex_count {
+                let angle = rotation + std::f64::consts::TAU * vertex as f64 / vertex_count as f64;
+                // Alternating inner/outer radii make every case concave. Angular
+                // order keeps the polygon simple while the jitter supplies a wide
+                // set of non-orthogonal edge slopes.
+                let base_radius = if vertex % 2 == 0 { 8.0 } else { 3.5 };
+                let radius = base_radius + rng.range(-0.45, 0.45);
+                vertices.push((radius * angle.cos(), radius * angle.sin()));
+            }
+            let outline: Vec<_> = vertices
+                .iter()
+                .map(|&(x, y)| serde_json::json!({"x": x, "y": y}))
+                .collect();
+            let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+                "layerCount": 1 + case % 4,
+                "minTraceWidth": 0.18,
+                "minBoardEdgeClearance": 0.21,
+                "bounds": {"minX": -10.0, "maxX": 10.0, "minY": -10.0, "maxY": 10.0},
+                "outline": outline
+            }))
+            .unwrap();
+            let constraint = BoardOutlineConstraint::from_srj(&srj, 0.18, 0.46)
+                .unwrap()
+                .unwrap();
+
+            let mut x_lines = vec![-10.0, 0.0, 10.0];
+            let mut y_lines = vec![-10.0, 0.0, 10.0];
+            for _ in 0..18 {
+                x_lines.push(rng.range(-9.8, 9.8));
+                y_lines.push(rng.range(-9.8, 9.8));
+            }
+            for &(x, y) in &vertices {
+                add_probe(&mut x_lines, &mut y_lines, (x, y));
+            }
+
+            // Put exact, epsilon-adjacent, and clearance-adjacent points from a
+            // sloped edge onto the Cartesian grid. The polygon is CCW, so its left
+            // normal points inward.
+            let a = vertices[case % vertex_count];
+            let b = vertices[(case + 1) % vertex_count];
+            let midpoint = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            let edge = (b.0 - a.0, b.1 - a.1);
+            let length = (edge.0 * edge.0 + edge.1 * edge.1).sqrt();
+            let inward = (-edge.1 / length, edge.0 / length);
+            for distance in [
+                0.0,
+                0.5e-9,
+                1.0e-9,
+                2.0e-9,
+                constraint.trace_keepout_mm() - 2.0e-9,
+                constraint.trace_keepout_mm() - 1.0e-9,
+                constraint.trace_keepout_mm(),
+                constraint.trace_keepout_mm() + 1.0e-9,
+                constraint.via_keepout_mm() - 1.0e-9,
+                constraint.via_keepout_mm(),
+                constraint.via_keepout_mm() + 1.0e-9,
+            ] {
+                for sign in [-1.0, 1.0] {
+                    add_probe(
+                        &mut x_lines,
+                        &mut y_lines,
+                        (
+                            midpoint.0 + inward.0 * distance * sign,
+                            midpoint.1 + inward.1 * distance * sign,
+                        ),
+                    );
+                }
+            }
+
+            let mapping = Mapping::from_lines(
+                sorted_unique(x_lines),
+                sorted_unique(y_lines),
+                srj.layer_count,
+            );
+            let naive = naive_board_outline_mask(&mapping, &constraint);
+            let indexed = indexed_board_outline_mask(&mapping, &constraint);
+            assert_eq!(indexed, naive, "mask mismatch in deterministic case {case}");
+            for layer in indexed.chunks_exact(mapping.dims.plane()).skip(1) {
+                assert_eq!(layer, &indexed[..mapping.dims.plane()]);
+            }
+        }
+    }
+
+    fn board_outline_benchmark_fixture(
+        label: &str,
+        fixture: &str,
+        indexed_cold_ceiling: Option<std::time::Duration>,
+    ) {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let srj: SimpleRouteJson = serde_json::from_str(fixture).unwrap();
+        let trace_width = srj.min_trace_width.unwrap_or(0.15).max(0.15);
+        // Construct the production Hanan mapping directly so the first timed
+        // indexed projection is genuinely cold. These are the same track,
+        // selected-clearance, and escape-clearance values used by the legacy
+        // one-cell compatibility projection exercised by this resource gate.
+        let (x_lines, y_lines) =
+            build_grid_lines(&srj, srj.layer_count, trace_width, trace_width, trace_width);
+        let mapping = Mapping::from_lines(x_lines, y_lines, srj.layer_count);
+        let constraint = BoardOutlineConstraint::from_srj(&srj, trace_width, 0.45)
+            .unwrap()
+            .unwrap();
+
+        let indexed_cold_started = Instant::now();
+        let indexed = black_box(indexed_board_outline_mask(&mapping, &constraint));
+        let indexed_cold = indexed_cold_started.elapsed();
+        let mut indexed_warm = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let started = Instant::now();
+            let repeat = black_box(indexed_board_outline_mask(&mapping, &constraint));
+            indexed_warm.push(started.elapsed());
+            assert_eq!(repeat, indexed);
+        }
+        indexed_warm.sort_unstable();
+        let indexed_warm_median = indexed_warm[indexed_warm.len() / 2];
+
+        let naive_started = Instant::now();
+        let naive = black_box(naive_board_outline_mask(&mapping, &constraint));
+        let naive_elapsed = naive_started.elapsed();
+        assert_eq!(
+            indexed, naive,
+            "{label} indexed mask differs from naive oracle"
+        );
+        if let Some(ceiling) = indexed_cold_ceiling {
+            assert!(
+                indexed_cold < ceiling,
+                "{label} indexed cold raster {indexed_cold:?} exceeded {ceiling:?}"
+            );
+        }
+        assert!(
+            indexed_cold.as_secs_f64() <= naive_elapsed.as_secs_f64() * 2.0,
+            "{label} indexed cold raster regressed more than 2x: indexed={indexed_cold:?}, naive={naive_elapsed:?}"
+        );
+        eprintln!(
+            "outline-raster {label}: {}x{}x{}, {} edges, naive={naive_elapsed:?}, indexed-cold={indexed_cold:?}, indexed-warm-median={indexed_warm_median:?}, cold-speedup={:.2}x",
+            mapping.dims.w,
+            mapping.dims.h,
+            mapping.dims.layers,
+            constraint.vertices().len(),
+            naive_elapsed.as_secs_f64() / indexed_cold.as_secs_f64()
+        );
+    }
+
+    /// Release-only manual timing probe for the detailed-outline resource gate.
+    #[test]
+    #[ignore = "manual board-outline raster performance benchmark"]
+    fn board_outline_raster_index_benchmark() {
+        board_outline_benchmark_fixture(
+            "bug42",
+            include_str!("../../../benchmarks/corpus/bug-reports/bugreport42-70db68.srj.json"),
+            Some(std::time::Duration::from_millis(100)),
+        );
+        board_outline_benchmark_fixture(
+            "bug35",
+            include_str!("../../../benchmarks/corpus/bug-reports/bugreport35-191db9.srj.json"),
+            None,
+        );
+        board_outline_benchmark_fixture(
+            "bug21-small",
+            include_str!(
+                "../../../benchmarks/corpus/bug-reports/bugreport21-board-outline.srj.json"
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn board_outline_projection_preserves_empty_dims_and_malformed_fail_closed_mask() {
+        let srj: SimpleRouteJson = serde_json::from_value(serde_json::json!({
+            "layerCount": 3,
+            "minTraceWidth": 0.2,
+            "minBoardEdgeClearance": 0.2,
+            "bounds": {"minX": 0.0, "maxX": 10.0, "minY": 0.0, "maxY": 10.0}
+        }))
+        .unwrap();
+        let constraint = BoardOutlineConstraint::from_srj(&srj, 0.2, 0.4)
+            .unwrap()
+            .unwrap();
+        let empty_mapping = Mapping {
+            x_lines: Vec::new(),
+            y_lines: Vec::new(),
+            dims: Dims::with_layers(0, 0, 3),
+        };
+        let mut empty_grid = Grid::filled(empty_mapping.dims, 1);
+        apply_board_outline_constraint(&mut empty_grid, &empty_mapping, Ok(Some(constraint)));
+        assert!(empty_grid.board_constraint.is_empty());
+
+        let minimal_mapping = Mapping::from_lines(Vec::new(), Vec::new(), 0);
+        assert_eq!(minimal_mapping.dims, Dims::with_layers(1, 1, 1));
+        let mut malformed_grid = Grid::filled(minimal_mapping.dims, 1);
+        apply_board_outline_constraint(
+            &mut malformed_grid,
+            &minimal_mapping,
+            Err(BoardOutlineError::TooFewVertices),
+        );
+        let all_forbidden = Grid::BOARD_TRACE_NODE
+            | Grid::BOARD_VIA_NODE
+            | Grid::BOARD_EDGE_NEG_Y
+            | Grid::BOARD_EDGE_NEG_X
+            | Grid::BOARD_EDGE_POS_X
+            | Grid::BOARD_EDGE_POS_Y;
+        assert_eq!(malformed_grid.board_constraint, vec![all_forbidden]);
     }
 
     #[test]
