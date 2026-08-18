@@ -399,15 +399,29 @@ pub struct Grid {
     /// representation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub via_forbidden: Vec<bool>,
+    /// Dependency-inverted board-geometry mask. Empty means no board-outline
+    /// contract. Each byte uses [`Grid::BOARD_*`] bits to distinguish trace-node,
+    /// via-centre, and directed planar-edge exclusions from ordinary pad obstacles;
+    /// own-pad exemptions can therefore never reopen the physical board boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub board_constraint: Vec<u8>,
 }
 
 impl Grid {
+    pub const BOARD_TRACE_NODE: u8 = 1 << 0;
+    pub const BOARD_VIA_NODE: u8 = 1 << 1;
+    pub const BOARD_EDGE_NEG_Y: u8 = 1 << 2;
+    pub const BOARD_EDGE_NEG_X: u8 = 1 << 3;
+    pub const BOARD_EDGE_POS_X: u8 = 1 << 4;
+    pub const BOARD_EDGE_POS_Y: u8 = 1 << 5;
+
     /// A grid of `dims` with every cell initialised to `fill`.
     pub fn filled(dims: Dims, fill: Cost) -> Self {
         Self {
             cost: vec![fill; dims.len()],
             dims,
             via_forbidden: Vec::new(),
+            board_constraint: Vec::new(),
         }
     }
 
@@ -428,6 +442,57 @@ impl Grid {
         self.via_forbidden.get(i as usize).copied().unwrap_or(false)
     }
 
+    /// Whether the board polygon forbids a trace centre at `i`. Unlike a base
+    /// obstacle this is never exempted for an own-pad cell.
+    #[inline]
+    pub fn is_board_forbidden(&self, i: CellIdx) -> bool {
+        self.board_constraint
+            .get(i as usize)
+            .is_some_and(|mask| mask & Self::BOARD_TRACE_NODE != 0)
+    }
+
+    /// Whether the board polygon forbids a via annulus centred at `i`.
+    #[inline]
+    pub fn is_board_via_forbidden(&self, i: CellIdx) -> bool {
+        self.board_constraint
+            .get(i as usize)
+            .is_some_and(|mask| mask & Self::BOARD_VIA_NODE != 0)
+    }
+
+    /// Whether the exact continuous board polygon forbids the adjacent planar
+    /// step `u -> v`. Non-planar/non-adjacent pairs conservatively return `true`
+    /// when a board mask is active; callers should only ask about planar neighbours.
+    #[inline]
+    pub fn is_board_planar_step_forbidden(&self, u: CellIdx, v: CellIdx) -> bool {
+        if self.board_constraint.is_empty() {
+            return false;
+        }
+        if !self.dims.contains(u) || !self.dims.contains(v) {
+            return true;
+        }
+        let (ux, uy, ul) = self.dims.xyz(u);
+        let (vx, vy, vl) = self.dims.xyz(v);
+        if ul != vl {
+            return true;
+        }
+        let bit = if ux == vx && uy == vy + 1 {
+            Self::BOARD_EDGE_NEG_Y
+        } else if uy == vy && ux == vx + 1 {
+            Self::BOARD_EDGE_NEG_X
+        } else if uy == vy && ux + 1 == vx {
+            Self::BOARD_EDGE_POS_X
+        } else if ux == vx && uy + 1 == vy {
+            Self::BOARD_EDGE_POS_Y
+        } else {
+            return true;
+        };
+        self.board_constraint[u as usize] & bit != 0
+    }
+
+    pub fn has_board_constraints(&self) -> bool {
+        !self.board_constraint.is_empty()
+    }
+
     #[inline]
     pub fn set(&mut self, i: CellIdx, c: Cost) {
         self.cost[i as usize] = c;
@@ -437,6 +502,7 @@ impl Grid {
     pub fn is_well_formed(&self) -> bool {
         self.cost.len() == self.dims.len()
             && (self.via_forbidden.is_empty() || self.via_forbidden.len() == self.dims.len())
+            && (self.board_constraint.is_empty() || self.board_constraint.len() == self.dims.len())
     }
 }
 
@@ -917,11 +983,18 @@ mod tests {
             dims: Dims::new(2, 1),
             cost: vec![1, 1],
             via_forbidden: vec![false, true],
+            board_constraint: vec![
+                Grid::BOARD_EDGE_POS_X,
+                Grid::BOARD_EDGE_NEG_X | Grid::BOARD_VIA_NODE,
+            ],
         };
         assert_eq!(
             serde_json::from_str::<Grid>(&serde_json::to_string(&grid).unwrap()).unwrap(),
             grid
         );
+        assert!(grid.is_board_planar_step_forbidden(0, 1));
+        assert!(grid.is_board_planar_step_forbidden(1, 0));
+        assert!(grid.is_board_via_forbidden(1));
 
         let board: BoardRoute =
             serde_json::from_str(r#"{"results":[],"unrouted":[],"congestion":[0,0]}"#).unwrap();

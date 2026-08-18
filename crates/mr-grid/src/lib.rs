@@ -193,6 +193,7 @@ impl GridBuilder {
             dims: self.dims,
             cost,
             via_forbidden: Vec::new(),
+            board_constraint: Vec::new(),
         }
     }
 }

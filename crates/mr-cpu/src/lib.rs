@@ -161,6 +161,7 @@ mod contract_tests {
             dims,
             cost: vec![1],
             via_forbidden: Vec::new(),
+            board_constraint: Vec::new(),
         };
         let n = net("n", 999, 1000);
         for (name, router) in routers() {
@@ -179,6 +180,7 @@ mod contract_tests {
             dims,
             cost: vec![1; dims.len()],
             via_forbidden: vec![false; dims.len() - 1],
+            board_constraint: Vec::new(),
         };
         let n = net("n", 0, 1);
         for (name, router) in routers() {
